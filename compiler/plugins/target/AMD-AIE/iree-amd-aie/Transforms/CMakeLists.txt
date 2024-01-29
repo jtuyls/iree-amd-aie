@@ -32,6 +32,53 @@ iree_cc_library(
 
 iree_cc_library(
   NAME
+    KernelDispatch
+  HDRC
+    "KernelDispatch.h"
+  SRCS
+    "KernelDispatch.cpp"
+  DEPS
+    ::PassHeaders
+    ::PassesIncGen
+    MLIRSupport
+    iree::compiler::Codegen::Common::TransformDialectInterpreterPass
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
+    iree::compiler::Dialect::HAL::IR
+    iree::compiler::Utils
+    #iree::target::amd-aie::aie::AIETransformPasses
+    #iree::target::amd-aie::air::AIRConversionPasses
+    #iree::target::amd-aie::air::AIRTransformPasses
+    IREELinalgExtDialect
+    IREELinalgExtPasses
+    IREELinalgExtTransforms
+    IREELinalgTransformDialectPasses
+    MLIRLinalgDialect
+    MLIRLinalgTransforms
+    MLIRLLVMCommonConversion
+    MLIRLLVMDialect
+    MLIRMemRefDialect
+    MLIRPDLDialect
+    MLIRPDLInterpDialect
+    MLIRPass
+    MLIRSCFDialect
+    MLIRSCFToControlFlow
+    MLIRSCFTransforms
+    MLIRSCFUtils
+    MLIRTensorDialect
+    MLIRTensorTransforms
+    MLIRTransforms
+    MLIRVectorDialect
+    MLIRVectorToLLVM
+    MLIRVectorToSCF
+    MLIRVectorTransforms
+    flexml_metadata
+  COPTS
+    "-std=c++20"
+  PUBLIC
+)
+
+iree_cc_library(
+  NAME
     Transforms
   HDRS
     "Passes.h"
@@ -49,10 +96,11 @@ iree_cc_library(
     "BridgeToAIRPass.cpp"
     "DecomposeLinalgExtPackUnPackToAIR.cpp"
     "Cleanup.cpp"
-    "KernelDispatch.cpp"
+    # "KernelDispatch.cpp"
   DEPS
     ::PassHeaders
     ::PassesIncGen
+    ::KernelDispatch
     MLIRSupport
     iree::compiler::Codegen::Common::TransformDialectInterpreterPass
     iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
@@ -84,5 +132,8 @@ iree_cc_library(
     MLIRVectorToLLVM
     MLIRVectorToSCF
     MLIRVectorTransforms
+    # flexml_metadata
+  COPTS
+    # "-std=c++20, -Werror, -Wdeprecated-this-capture"
   PUBLIC
 )

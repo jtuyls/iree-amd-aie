@@ -11,6 +11,12 @@
 #include "mlir/Dialect/MemRef/Transforms/Transforms.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
+#include "flexmlMetadata/yamlUtils/YamlLoader.h"
+#include "flexmlMetadata/abstraction/Kernel.h"
+#include <iostream>
+#include <fstream>
+#include <sstream>
+
 #define DEBUG_TYPE "kernel-dispatch"
 
 namespace mlir::iree_compiler::AMDAIE {
@@ -32,13 +38,34 @@ static LogicalResult setRootConfig(func::FuncOp entryPointFn,
           "dim");
     }
   }
+  std::cout << "Before loadYaml" << std::endl;
+  std::ifstream in("/proj/rdi/staff/jornt/versal/iree-amd-aie/tests/samples/GemmFill.yaml");
+  std::ostringstream sstr;
+  sstr << in.rdbuf();
+  auto yaml_str = sstr.str();
+
+  // std::string path = "/proj/rdi/staff/jornt/versal/iree-amd-aie/tests/samples/GemmFill.yaml";
+  auto yaml_node = flexmlMetadata::utils::loadYaml(yaml_str);
+  std::unordered_map<std::string, flexmlMetadata::abstraction::Kernel> db;
+  auto kernel = flexmlMetadata::abstraction::Kernel(yaml_str, db);
+  auto m_defined = kernel.getMemberAs<flexmlMetadata::abstraction::Defined>("tiling_recipes.spatial_N.aie_tiling.iteration_domains.M.size");
+  auto m_value = m_defined.value();
+  auto n_value = kernel.getMemberAs<flexmlMetadata::abstraction::Defined>("tiling_recipes.spatial_N.aie_tiling.iteration_domains.N.size").value();
+  auto k_value = kernel.getMemberAs<flexmlMetadata::abstraction::Defined>("tiling_recipes.spatial_N.aie_tiling.iteration_domains.K.size").value();
+  std::cout << "After Kernel: " << m_value.index() << std::endl;
+  std::cout << "After Kernel: " << m_defined << std::endl;
+  std::cout << "After Kernel: " << std::get<uint64_t>(m_value) << std::endl;
+  std::cout << "After loadYaml" << std::endl;
   // TODO (nmeshram) : This needs to be moved in a separate more generalized
   // logic. Also, need a flag to experiment between pad based and pack based
   // approach which will have different tile sizes and pass pipelines
   TileSizesListType tileSizes;
   if (tilingStrategy == "ukernel") {
-    SmallVector<int64_t> TileSizeLevel0 = {16, 64};
-    SmallVector<int64_t> TileSizeLevel1 = {0, 0, 64};
+    SmallVector<int64_t> TileSizeLevel0 = {
+      (int64_t) std::get<std::uint64_t>(m_value),
+      (int64_t) std::get<std::uint64_t>(n_value)
+    };
+    SmallVector<int64_t> TileSizeLevel1 = {0, 0, (int64_t) std::get<std::uint64_t>(k_value)};
     SmallVector<int64_t> TileSizeLevel2 = {1, 1};
     tileSizes = {TileSizeLevel0, TileSizeLevel1, TileSizeLevel2};
   } else {
