@@ -59,15 +59,30 @@ std::unique_ptr<Pass> createAMDAIECleanupPass();
 /// dialect.
 std::unique_ptr<Pass> createAMDAIEDecomposeLinalgExtPackUnPackToAIRPass();
 
+/// TODO
+std::unique_ptr<Pass> createAMDAIEFuseDmaCpyIntoAieRegionPass();
+
 /// Create a pass to fuse the linalg.fill into the forall loops.
 std::unique_ptr<Pass> createAMDAIEFuseFillIntoForallPass();
+
+/// TODO
+std::unique_ptr<Pass> createAMDAIEFuseFromMemrefIntoAieRegionPass();
 
 /// Create a pass to fuse the pack operations into the for loops.
 std::unique_ptr<Pass> createAMDAIEFusePackIntoForLoopPass();
 
+/// TODO
+std::unique_ptr<Pass> createAMDAIEFuseSCFForIntoAieCorePass();
+
+/// TODO
+std::unique_ptr<Pass> createAMDAIEFuseSCFForIntoAieRegionPass();
+
 /// Create pass calling the dynamic pipeline for AMDAIE.
 std::unique_ptr<Pass> createAMDAIELowerExecutableTargetPass(
     AMDAIELowerExecutableTargetOptions options = {});
+
+/// TODO
+std::unique_ptr<Pass> createAMDAIELogicalObjectfifoFromMemrefCleanupPass();
 
 /// Create pass for adding lowering strategy configurations.
 std::unique_ptr<Pass> createAMDAIELoweringStrategyPass(
@@ -100,6 +115,12 @@ std::unique_ptr<Pass> createAMDAIETilePass(AMDAIETileOptions options = {});
 /// Create pass to tile and fuse TilingInterface operations.
 std::unique_ptr<Pass> createAMDAIETileAndFusePass(
     AMDAIETileAndFuseOptions options = {});
+
+/// Create pass to lower to objectfifos.
+std::unique_ptr<Pass> createAMDAIEToObjectfifoPass();
+
+/// Create pass to lower to objectfifos.
+std::unique_ptr<Pass> createAMDAIEDmaToObjectfifoPass();
 
 /// Create pass to propagate pack/unpack ops using upstream patterns.
 std::unique_ptr<Pass> createAMDAIEPropagateDataLayoutPass();

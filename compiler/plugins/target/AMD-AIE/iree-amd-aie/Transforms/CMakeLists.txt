@@ -41,6 +41,8 @@ iree_cc_library(
   SRCS
     "Passes.cpp"
     "AMDAIEBufferizeToAllocation.cpp"
+    "AMDAIEFuseIntoAieCore.cpp"
+    "AMDAIEFuseIntoAieRegion.cpp"
     "AMDAIEFuseFillIntoForall.cpp"
     "AMDAIEFusePackIntoForLoop.cpp"
     "AMDAIEAddLoweringStrategy.cpp"
@@ -55,6 +57,7 @@ iree_cc_library(
     "AMDAIEPropagateDataLayout.cpp"
     "AMDAIETile.cpp"
     "AMDAIETileAndFuse.cpp"
+    "AMDAIEToObjectfifo.cpp"
     "BridgeToAIRPass.cpp"
     "DecomposeLinalgExtPackUnPackToAIR.cpp"
     "Cleanup.cpp"

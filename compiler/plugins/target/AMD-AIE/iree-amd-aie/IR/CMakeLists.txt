@@ -14,6 +14,7 @@ iree_cc_library(
   HDRS
     "AMDAIEAttrs.h"
     "AMDAIEDialect.h"
+    "AMDAIEOps.h"
   TEXTUAL_HDRS
     "AMDAIEAttrs.cpp.inc"
     "AMDAIEAttrs.h.inc"
@@ -21,11 +22,18 @@ iree_cc_library(
     "AMDAIEDialect.h.inc"
     "AMDAIEEnums.cpp.inc"
     "AMDAIEEnums.h.inc"
+    "AMDAIETypes.cpp.inc"
+    "AMDAIETypes.h.inc"
+    "AMDAIEOps.cpp.inc"
+    "AMDAIEOps.h.inc"
   SRCS
     "AMDAIEAttrs.cpp"
     "AMDAIEDialect.cpp"
+    "AMDAIEOps.cpp"
   DEPS
     ::AMDAIEDialectGen
+    ::AMDAIEOpsGen
+    # ::AMDAIETypesGen
     ::PackingConfigGen
     LLVMSupport
     MLIRIR
@@ -55,3 +63,28 @@ iree_tablegen_library(
     --gen-enum-decls AMDAIEEnums.h.inc
     --gen-enum-defs AMDAIEEnums.cpp.inc
 )
+
+iree_tablegen_library(
+  NAME
+    AMDAIETypesGen
+  TD_FILE
+    "AMDAIETypes.td"
+  OUTS
+    # -gen-typedef-decls -typedefs-dialect=AMDAIE AMDAIETypes.h.inc
+    # -gen-typedef-defs -typedefs-dialect=AMDAIE AMDAIETypes.cpp.inc
+    -gen-typedef-decls AMDAIETypes.h.inc
+    -gen-typedef-defs AMDAIETypes.cpp.inc
+)
+
+iree_tablegen_library(
+  NAME
+    AMDAIEOpsGen
+  TD_FILE
+    "AMDAIEOps.td"
+  OUTS
+    -gen-op-decls AMDAIEOps.h.inc
+    -gen-op-defs AMDAIEOps.cpp.inc
+    # -gen-typedef-decls AMDAIETypes.h.inc
+    # -gen-typedef-defs AMDAIETypes.cpp.inc
+)
+

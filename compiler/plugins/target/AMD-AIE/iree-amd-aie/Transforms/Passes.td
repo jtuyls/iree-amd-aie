@@ -41,16 +41,40 @@ def AMDAIEDecomposeLinalgExtPackUnPackToAIR :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEDecomposeLinalgExtPackUnPackToAIRPass()";
 }
 
+def AMDAIEFuseDmaCpyIntoAieRegion :
+    Pass<"iree-amdaie-fuse-dma-copy-into-aie-region", "ModuleOp"> {
+  let summary = "TODO.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFuseDmaCpyIntoAieRegionPass()";
+}
+
 def AMDAIEFuseFillIntoForall :
     Pass<"iree-amdaie-fuse-fill-into-forall", "func::FuncOp"> {
   let summary = "Fuse the linalg.fill into the forall loops.";
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFuseFillIntoForallPass()";
 }
 
+def AMDAIEFuseFromMemrefIntoAieRegion :
+    Pass<"iree-amdaie-fuse-from-memref-into-aie-region", "ModuleOp"> {
+  let summary = "TODO.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFuseFromMemrefIntoAieRegionPass()";
+}
+
 def AMDAIEFusePackIntoForLoop :
     Pass<"iree-amdaie-fuse-pack-into-for", "func::FuncOp"> {
   let summary = "Fuse the pack operations into the for loops.";
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFusePackIntoForLoopPass()";
+}
+
+def AMDAIEFuseSCFForIntoAieCore :
+    Pass<"iree-amdaie-fuse-scf-for-into-aie-core", "ModuleOp"> {
+  let summary = "TODO.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFuseSCFForIntoAieCorePass()";
+}
+
+def AMDAIEFuseSCFForIntoAieRegion :
+    Pass<"iree-amdaie-fuse-scf-for-into-aie-region", "ModuleOp"> {
+  let summary = "TODO.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFuseSCFForIntoAieRegionPass()";
 }
 
 def AMDAIELowerExecutableTarget :
@@ -73,6 +97,12 @@ def AMDAIELowerExecutableTarget :
                    "Use the pad-pack based lowering strategy.")
       )}]>
   ];
+}
+
+def AMDAIELogicalObjectfifoFromMemrefCleanup :
+    Pass<"iree-amdaie-logical-objectfifo-from-memref-cleanup", "ModuleOp"> {
+  let summary = "TODO";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIELogicalObjectfifoFromMemrefCleanupPass()";
 }
 
 def AMDAIELoweringStrategy :
@@ -186,6 +216,18 @@ def AMDAIETileAndFuse :
     Option<"tilingLevel", "tiling-level", "int64_t", /*default=*/"-1",
       "Use default tiling level used to retrieve the configuration from lowering_config">
   ];
+}
+
+def AMDAIEToObjectfifo : 
+  Pass<"iree-amdaie-to-objectfifo", ""> {
+  let summary = "Convert pack/unpack ops air.dma_memcpy_nd op's";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEToObjectfifoPass()";
+}
+
+def AMDAIEDmaToObjectfifo : 
+  Pass<"iree-amdaie-dma-to-objectfifo", ""> {
+  let summary = "";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEDmaToObjectfifoPass()";
 }
 
 def AMDAIEPropagateDataLayout :
