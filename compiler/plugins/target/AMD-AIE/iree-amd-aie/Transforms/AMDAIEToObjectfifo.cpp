@@ -53,7 +53,7 @@ class DmaMemcpyNdToLogicalObjectfifo : public OpRewritePattern<xilinx::air::DmaM
     // AMDAIE::DmaCpyNdOp dmaCopy = 
     rewriter.create<AMDAIE::DmaCpyNdOp>(
       op.getLoc(),
-      SmallVector<Type, 1>{}, // rewriter.getIndexType(),
+      rewriter.getIndexType(), // SmallVector<Type, 1>{}, // rewriter.getIndexType(),
       dst,
       op.getDstOffsets(),
       op.getDstSizes(),
@@ -114,7 +114,7 @@ class SCFForAllToLogicalObjectfifo : public OpRewritePattern<scf::ForallOp> {
       // AMDAIE::DmaCpyNdOp dmaCopy = 
       rewriter.create<AMDAIE::DmaCpyNdOp>(
         op.getLoc(),
-        SmallVector<Type, 1>{}, // rewriter.getIndexType(),
+        rewriter.getIndexType(), // rewriter.getIndexType(), // SmallVector<Type, 1>{}, // rewriter.getIndexType(),
         dst,
         op.getDstOffsets(),
         op.getDstSizes(),
@@ -173,7 +173,7 @@ class SCFForAllToStructural : public OpRewritePattern<scf::ForallOp> {
                                  Block *controlCodeEndBlock,
                                  xilinx::AIE::TileOp& tileOp,
                                  DenseMap<Value, OpFoldResult> &symbolTable,
-                                 DenseMap<Operation *, SmallVector<SmallVector<int64_t>>>& constructedOps) const {
+                                 DenseMap<Operation *, SmallVector<std::tuple<SmallVector<int64_t>, AMDAIE::DmaCpyNdOp>>>& constructedOps) const {
     std::cout << "resolveWorkGroup" << std::endl;
     rewriter.setInsertionPointToEnd(newBlock);
     // Block::iterator it = newBlock->begin();
@@ -193,22 +193,22 @@ class SCFForAllToStructural : public OpRewritePattern<scf::ForallOp> {
         // rewriter.setInsertionPoint(dmaOp);
         rewriter.setInsertionPointToEnd(newBlock);
         if (!constructedOps.contains(op)) {
-          SmallVector<SmallVector<int64_t>> values;
+          SmallVector<std::tuple<SmallVector<int64_t>, AMDAIE::DmaCpyNdOp>> values;
           constructedOps[op] = values;
         }
         SmallVector<OpFoldResult> emptyDst(dmaOp.getDstOffsets().size(), rewriter.getI64IntegerAttr(0));
         SmallVector<OpFoldResult> emptySrc(dmaOp.getSrcOffsets().size(), rewriter.getI64IntegerAttr(0));
         auto newDmaOp = rewriter.create<AMDAIE::DmaCpyNdOp>(
           loc,
-          SmallVector<Type, 1>{}, // rewriter.getIndexType(),
+          rewriter.getIndexType(), // SmallVector<Type, 1>{}, // rewriter.getIndexType(),
           dmaOp.getDst(),
-          getValueOrCreateConstantIndexOp(rewriter, loc, emptyDst), // dmaOp.getDstOffsets(),
-          getValueOrCreateConstantIndexOp(rewriter, loc, emptyDst), // dmaOp.getDstSizes(),
-          getValueOrCreateConstantIndexOp(rewriter, loc, emptyDst), // dmaOp.getDstStrides(),
+          getValueOrCreateConstantIndexOp(rewriter, loc, emptyDst),
+          getValueOrCreateConstantIndexOp(rewriter, loc, emptyDst),
+          getValueOrCreateConstantIndexOp(rewriter, loc, emptyDst),
           dmaOp.getSrc(),
-          getValueOrCreateConstantIndexOp(rewriter, loc, emptySrc), // dmaOp.getSrcOffsets(),
-          getValueOrCreateConstantIndexOp(rewriter, loc, emptySrc), // dmaOp.getSrcSizes(),
-          getValueOrCreateConstantIndexOp(rewriter, loc, emptySrc) // dmaOp.getSrcStrides()
+          getValueOrCreateConstantIndexOp(rewriter, loc, emptySrc),
+          getValueOrCreateConstantIndexOp(rewriter, loc, emptySrc),
+          getValueOrCreateConstantIndexOp(rewriter, loc, emptySrc)
         );
         std::cout << "AMDAIE::DmaCpyNdOp" << std::endl;
         SmallVector<int64_t> valueResults;
@@ -224,59 +224,71 @@ class SCFForAllToStructural : public OpRewritePattern<scf::ForallOp> {
             newDmaOp->setOperand(opOperand.getOperandNumber(), operand);
           }
         }
-        if (std::find(constructedOps[op].begin(), constructedOps[op].end(), valueResults) != constructedOps[op].end()) {
+        // if (std::find(constructedOps[op].begin(), constructedOps[op].end(), valueResults) != constructedOps[op].end()) {
+        auto it = std::find_if(
+          constructedOps[op].begin(), constructedOps[op].end(), 
+          [&](std::tuple<SmallVector<int64_t>, AMDAIE::DmaCpyNdOp> &elem) { return std::get<0>(elem) == valueResults; }
+        );
+        if (it != constructedOps[op].end()) {
           // DMA op with broadcast capability, but we still need to add the consumer/producer to the AIE core
-          auto srcType = newDmaOp.getSrcType().cast<AMDAIEObjectFifoType>().getElementType();
+          AMDAIE::DmaCpyNdOp broadcastDmaOp = std::get<1>(*it);
+          llvm::outs() << "BROADCAST DMA OP: " << broadcastDmaOp << "\n";
+          // auto srcType = newDmaOp.getSrcType().cast<AMDAIEObjectFifoType>().getElementType();
+          auto srcType = broadcastDmaOp.getSrcType().cast<AMDAIEObjectFifoType>().getElementType();
           rewriter.setInsertionPointToEnd(coreBlock);
           if (dyn_cast<IntegerAttr>(srcType.getMemorySpace()).getInt() == 1) {
             // To core
             rewriter.create<AMDAIE::LogicalObjectFifoConsume>(
               rewriter.getUnknownLoc(),
               SmallVector<Type, 1>{},
-              newDmaOp.getDst()
+              broadcastDmaOp // newDmaOp.getDst()
             );
           } else if (dyn_cast<IntegerAttr>(srcType.getMemorySpace()).getInt() == 2) {
             // From core
             rewriter.create<AMDAIE::LogicalObjectFifoProduce>(
               rewriter.getUnknownLoc(),
               SmallVector<Type, 1>{},
-              newDmaOp.getSrc()
+              broadcastDmaOp // newDmaOp.getSrc()
             );
           } else {
             dmaOp->emitError("found unsupported source memory space");
             return WalkResult::interrupt();
           }
+          rewriter.moveOpAfter(core, broadcastDmaOp);
+          llvm::outs() << "erase op\n";
           rewriter.eraseOp(newDmaOp);
         } else {
-          constructedOps[op].push_back(valueResults);
+          constructedOps[op].push_back(std::make_tuple(valueResults, newDmaOp));
 
           auto srcType = newDmaOp.getSrcType().cast<AMDAIEObjectFifoType>().getElementType();
           // auto dstType = newDmaOp.getDst().getType().cast<MemRefType>();
           if (dyn_cast<IntegerAttr>(srcType.getMemorySpace()).getInt() == 1) {
             rewriter.setInsertionPointToEnd(newBlock);
-            rewriter.create<AMDAIE::LogicalObjectFifoProduce>(
+            auto produceOp = rewriter.create<AMDAIE::LogicalObjectFifoProduce>(
               rewriter.getUnknownLoc(),
               SmallVector<Type, 1>{},
-              newDmaOp.getSrc()
+              newDmaOp // newDmaOp.getSrc()
             );
             rewriter.setInsertionPointToEnd(coreBlock);
             rewriter.create<AMDAIE::LogicalObjectFifoConsume>(
               rewriter.getUnknownLoc(),
               SmallVector<Type, 1>{},
-              newDmaOp.getDst()
+              newDmaOp // newDmaOp.getDst()
             );
+            rewriter.moveOpAfter(core, produceOp);
           } else if (dyn_cast<IntegerAttr>(srcType.getMemorySpace()).getInt() == 2) {
             rewriter.setInsertionPointToEnd(newBlock);
-            rewriter.create<AMDAIE::LogicalObjectFifoConsume>(
+            auto consumeOp = rewriter.create<AMDAIE::LogicalObjectFifoConsume>(
               rewriter.getUnknownLoc(),
               SmallVector<Type, 1>{},
-              newDmaOp.getDst()
+              newDmaOp // newDmaOp.getDst()
             );
+            rewriter.moveOpAfter(core, consumeOp);
             rewriter.setInsertionPointToEnd(coreBlock);
             rewriter.create<AMDAIE::LogicalObjectFifoProduce>(
               rewriter.getUnknownLoc(),
               SmallVector<Type, 1>{},
-              newDmaOp.getSrc()
+              newDmaOp // newDmaOp.getSrc()
             );
             // TODO(jornt): this feels too hardcoded, we assume here that we're always waiting on
             // L2 consumption. It might be better to wait on every produce/consume op and then later
@@ -352,7 +364,7 @@ class SCFForAllToStructural : public OpRewritePattern<scf::ForallOp> {
     auto steps = getConstantIntValues(forallOp.getMixedStep()).value();
 
     DenseMap<Value, OpFoldResult> symbolTable;
-    DenseMap<Operation *, SmallVector<SmallVector<int64_t>>> constructedOps;
+    DenseMap<Operation *, SmallVector<std::tuple<SmallVector<int64_t>, AMDAIE::DmaCpyNdOp>>> constructedOps;
     for (auto y = lowerBounds[0]; y < upperBounds[0]; y+=steps[0]) {
       for (auto x = lowerBounds[1]; x < upperBounds[1]; x+=steps[1]) {
         std::cout << "y: " << y << std::endl;
@@ -477,6 +489,8 @@ void AMDAIELogicalObjectfifoFromMemrefCleanupPass::runOnOperation() {
   DenseSet<AMDAIE::LogicalObjectFifoFromMemref> toBeErased;
   moduleOp->walk([&](AMDAIE::LogicalObjectFifoFromMemref op) {
     if (toBeErased.contains(op)) {
+      // llvm::outs() << "To be erased: " << op << "\n";
+      rewriter.eraseOp(op);
       WalkResult::advance();
     }
     auto memref = op.getMemref();
@@ -489,17 +503,18 @@ void AMDAIELogicalObjectfifoFromMemrefCleanupPass::runOnOperation() {
         llvm::outs() << "op.getOutput(): " << op.getOutput() << "\n";
         rewriter.replaceAllUsesWith(userOp.getOutput(), op.getOutput());
         toBeErased.insert(userOp);
+        // rewriter.eraseOp(userOp);
       }
     }
     return WalkResult::advance();
   });
   // TODO some still used?? Something wrong here. To be debugged, but ok for now.
-  for (auto op : toBeErased) {
-    if (op->use_empty())
-      rewriter.eraseOp(op);
-    else
-      llvm::outs() << "Still used: " << op << "\n";
-  }
+  // for (auto op : toBeErased) {
+  //   if (op->use_empty())
+  //     rewriter.eraseOp(op);
+  //   else
+  //     llvm::outs() << "Still used: " << op << "\n";
+  // }
 }
 
 

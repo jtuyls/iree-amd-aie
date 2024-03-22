@@ -26,7 +26,6 @@ class DmaMemcpyNdIntoSubsequentAieRegion: public OpRewritePattern<AMDAIE::DmaCpy
       return failure();
     }
     llvm::outs() << "DMA OP: " << dmaOp << "\n";
-    // auto dstMemref = dyn_cast<LogicalObjectFifoFromMemref>(dmaOp.getDst().getDefiningOp()).getMemref();
     auto dstLogicalObjectFifo = dyn_cast<LogicalObjectFifoFromMemref>(dmaOp.getDst().getDefiningOp());
     auto dstType = dmaOp.getDstType().cast<AMDAIEObjectFifoType>().getElementType();
     llvm::outs() << dstType << "\n";
@@ -36,32 +35,9 @@ class DmaMemcpyNdIntoSubsequentAieRegion: public OpRewritePattern<AMDAIE::DmaCpy
     }
     // llvm::outs() << dstMemref << "\n";
 
-    // How to best guarantee first usage? Right now first one is assumed to be correct. Can we check relative location of uses?
-    // SmallVector<DmaCpyNdOp> dmaUserOps;
-    // llvm::for_each(dstMemref.getUsers(), [&](Operation *user) {
-    //   // Operation *user = use.getOwner();
-    //   if (auto userOp = dyn_cast<LogicalObjectFifoFromMemref>(user)) {
-    //     llvm::outs() << "userOp: " << userOp << "\n";
-    //     DmaCpyNdOp consumerDmaOp;
-    //     llvm::find_if(userOp->getUses(), [&](OpOperand &use) {
-    //       Operation *op = use.getOwner();
-    //       auto userDmaOp = dyn_cast<DmaCpyNdOp>(op);
-    //       if (userDmaOp && userDmaOp.getSrc() == use.get()) {
-    //         consumerDmaOp = userDmaOp;
-    //         return true;
-    //       }
-    //       return false;
-    //     });
-    //     if (!consumerDmaOp) return;
-    //     llvm::outs() << consumerDmaOp << "\n";
-    //     if (dmaOp->getParentRegion()->isProperAncestor(consumerDmaOp->getParentRegion())) {
-    //       dmaUserOps.push_back(consumerDmaOp);
-    //     }
-    //   }
-    // });
-
     AMDAIE::AIERegionOp firstRegionOp;
     Operation *firstDmaUserOp = nullptr;
+    SmallVector<AMDAIE::DmaCpyNdOp> dmaUserOps;
     for (Operation *userOp : dstLogicalObjectFifo->getUsers()) {
       if (auto parentRegion = dyn_cast<AMDAIE::AIERegionOp>(userOp->getParentOp())) { // userOp->getParentOfType<AMDAIE::AIERegionOp>()) {
         if (parentRegion->getBlock() != dmaOp->getBlock() || parentRegion->isBeforeInBlock(dmaOp)) {
@@ -73,13 +49,24 @@ class DmaMemcpyNdIntoSubsequentAieRegion: public OpRewritePattern<AMDAIE::DmaCpy
         } else if (parentRegion == firstRegionOp && userOp->isBeforeInBlock(firstDmaUserOp)) {
           firstDmaUserOp = userOp;
         }
+        // Keep track of all dma user ops
+        if (auto userDmaOp = dyn_cast<AMDAIE::DmaCpyNdOp>(userOp)) {
+          dmaUserOps.push_back(userDmaOp);
+        }
       }
     }
 
-    // if (dmaUserOps.size() == 0) {
-    //   LLVM_DEBUG(llvm::dbgs() << "TODO.\n");
-    //   return failure();
-    // }
+    // Remove produce users of all dma users as dma ops are now linked through the objectfifo
+    // TODO(jornt): Is this too implicit/unclear? Can we improve consume/produce outside cores?
+    for (auto dmaUserOp : dmaUserOps) {
+      for (Operation *userOp : dmaUserOp->getUsers()) {
+        if (auto produceUserOp = dyn_cast<LogicalObjectFifoProduce>(userOp)) {
+          // llvm::outs() << "delete produce: " << produceUserOp << "\n";
+          rewriter.eraseOp(produceUserOp);
+        }
+      }
+    }
+
     // auto firstDmaUserOp = dmaUserOps[0];
     llvm::outs() << "First DMA op: " << firstRegionOp << "\n";
     llvm::outs() << "First DMA op: " << firstDmaUserOp << "\n";
@@ -104,7 +91,7 @@ class DmaMemcpyNdIntoSubsequentAieRegion: public OpRewritePattern<AMDAIE::DmaCpy
     SmallVector<OpFoldResult> empty;
     rewriter.create<AMDAIE::DmaCpyNdOp>(
       rewriter.getUnknownLoc(),
-      SmallVector<Type, 1>{}, // rewriter.getIndexType(),
+      rewriter.getIndexType(), // SmallVector<Type, 1>{}, // rewriter.getIndexType(),
       dmaOp.getDst(),
       getValueOrCreateConstantIndexOp(rewriter, loc, empty), // dmaOp.getDstOffsets(),
       getValueOrCreateConstantIndexOp(rewriter, loc, empty), // dmaOp.getDstSizes(),
@@ -157,12 +144,9 @@ class DmaMemcpyNdIntoPrecedingAieRegion: public OpRewritePattern<AMDAIE::DmaCpyN
 
     AMDAIE::AIERegionOp lastRegionOp;
     Operation *lastUserOp = nullptr;
+    SmallVector<AMDAIE::DmaCpyNdOp> dmaUserOps;
     for (OpOperand &opOperand : srcLogicalObjectFifo->getUses()) {
       auto op = opOperand.getOwner();
-      // if (lastUserOp != nullptr)
-      //   llvm::outs() << "For lastUserOp: " << lastUserOp << "\n";
-      // else
-      //   llvm::outs() << "No lastUserOp" << "\n";
       auto regionOp = dyn_cast<AMDAIE::AIERegionOp>(op->getParentOp());
       if (regionOp && regionOp->getBlock() == dmaOp->getBlock() && regionOp->isBeforeInBlock(dmaOp)) {
         if (auto userDmaOp = dyn_cast<DmaCpyNdOp>(op)) {
@@ -173,8 +157,10 @@ class DmaMemcpyNdIntoPrecedingAieRegion: public OpRewritePattern<AMDAIE::DmaCpyN
             } else if (lastUserOp->isBeforeInBlock(userDmaOp)) {
               lastUserOp = userDmaOp;
             }
+            dmaUserOps.push_back(userDmaOp);
           }
         } else if (auto consumeOp = dyn_cast<LogicalObjectFifoConsume>(op)) {
+          // TODO(jornt): this block can be removed, no?
           // llvm::outs() << "Consume op: " << consumeOp << "\n";
           // if (lastUserOp)
           //   llvm::outs() << "lastUserOp: " << lastUserOp << "\n";
@@ -186,6 +172,17 @@ class DmaMemcpyNdIntoPrecedingAieRegion: public OpRewritePattern<AMDAIE::DmaCpyN
               lastUserOp = consumeOp;
             }
           }
+        }
+      }
+    }
+
+    // Remove consume users of all dma users as dma ops are now linked through the objectfifo
+    // TODO(jornt): Is this too implicit/unclear? Can we improve consume/produce outside cores?
+    for (auto dmaUserOp : dmaUserOps) {
+      for (Operation *userOp : dmaUserOp->getUsers()) {
+        if (auto consumeUserOp = dyn_cast<LogicalObjectFifoConsume>(userOp)) {
+          // llvm::outs() << "delete consume: " << consumeUserOp << "\n";
+          rewriter.eraseOp(consumeUserOp);
         }
       }
     }
@@ -217,7 +214,7 @@ class DmaMemcpyNdIntoPrecedingAieRegion: public OpRewritePattern<AMDAIE::DmaCpyN
     SmallVector<OpFoldResult> empty;
     rewriter.create<AMDAIE::DmaCpyNdOp>(
       rewriter.getUnknownLoc(),
-      SmallVector<Type, 1>{}, // rewriter.getIndexType(),
+      rewriter.getIndexType(), // SmallVector<Type, 1>{}, // rewriter.getIndexType(),
       dmaOp.getDst(),
       getValueOrCreateConstantIndexOp(rewriter, loc, empty), // dmaOp.getDstOffsets(),
       getValueOrCreateConstantIndexOp(rewriter, loc, empty), // dmaOp.getDstSizes(),

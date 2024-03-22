@@ -12,6 +12,7 @@ include "mlir/IR/SymbolInterfaces.td"
 include "iree-amd-aie/IR/AMDAIEDialect.td"
 include "iree-amd-aie/IR/AMDAIETypes.td"
 
+
 //===----------------------------------------------------------------------===//
 // IREE Codegen dialect
 //===----------------------------------------------------------------------===//
@@ -82,7 +83,7 @@ def LogicalObjectFifoFromMemref : AMDAIE_Op<"logicalobjectfifo.from_memref", []>
 }
 
 
-def DmaCpyNdOp: AMDAIE_Op<"dma_cpy_nd", [AttrSizedOperandSegments]>{ //, Results<(outs Index)> {
+def DmaCpyNdOp: AMDAIE_Op<"dma_cpy_nd", [AttrSizedOperandSegments]>, Results<(outs Index)> {
   let summary = "dma operator";
   let arguments = (
     ins AnyAMDAIEObjectFifoType:$dst,
@@ -123,12 +124,16 @@ def DmaCpyNdOp: AMDAIE_Op<"dma_cpy_nd", [AttrSizedOperandSegments]>{ //, Results
 }
 
 def LogicalObjectFifoConsume: AMDAIE_Op<"logicalobjectfifo.consume", []> {
-  let summary = "acquire logical objectfifo";
+  let summary = "Consume dma result";
   let arguments = (
-    ins AnyAMDAIEObjectFifoType:$objectfifo
+    // ins AnyAMDAIEObjectFifoType:$objectfifo
+    ins Index:$dma
   );
   let assemblyFormat = [{
-    `(` $objectfifo `)`  attr-dict `:` `(` type($objectfifo) `)`
+    `(` $dma `)`  attr-dict
+  }];
+  let extraClassDeclaration = [{
+    Value getObjectfifo() { return dyn_cast<DmaCpyNdOp>(getDma().getDefiningOp()).getDst(); }
   }];
   let description = [{
     acquire logical objectfifo
@@ -139,10 +144,14 @@ def LogicalObjectFifoConsume: AMDAIE_Op<"logicalobjectfifo.consume", []> {
 def LogicalObjectFifoProduce: AMDAIE_Op<"logicalobjectfifo.produce", []> {
   let summary = "release logical objectfifo";
   let arguments = (
-    ins AnyAMDAIEObjectFifoType:$objectfifo
+    // ins AnyAMDAIEObjectFifoType:$objectfifo
+    ins Index:$dma
   );
   let assemblyFormat = [{
-    `(` $objectfifo `)`  attr-dict `:` `(` type($objectfifo) `)`
+    `(` $dma `)`  attr-dict
+  }];
+  let extraClassDeclaration = [{
+    Value getObjectfifo() { return dyn_cast<DmaCpyNdOp>(getDma().getDefiningOp()).getSrc(); }
   }];
   let description = [{
     release logical objectfifo
@@ -161,6 +170,52 @@ def LogicalObjectFifoWait: AMDAIE_Op<"logicalobjectfifo.wait", []> {
   let description = [{
     Wait until all queued operations on this objectfifo are done.
   }];
+  let cppNamespace = "mlir::iree_compiler::AMDAIE";
+}
+
+// Experimental to debug an issue with xilinx::AIE::CoreOp
+def TileOp: AMDAIE_Op<"tile", []>, Results<(outs Index)> {
+  let summary = "AIE tile";
+  let arguments = (
+    ins ConfinedAttr<I32Attr, [IntMinValue<0>]>:$col,
+        ConfinedAttr<I32Attr, [IntMinValue<0>]>:$row
+  );
+  let assemblyFormat = [{
+    `(` $col `,` $row `)` attr-dict
+  }];
+  let description = [{
+    AIE tile
+  }];
+  let extraClassDeclaration = [{
+    int colIndex() { return getCol(); }
+    int rowIndex() { return getRow(); }
+  }];
+  let builders = [
+    OpBuilder<(ins "long":$col, "long":$row), [{
+      build($_builder, $_state, $_builder.getIndexType(), col, row);
+    }]>
+  ];
+  let cppNamespace = "mlir::iree_compiler::AMDAIE";
+}
+// Experimental to debug an issue with xilinx::AIE::CoreOp
+def CoreOp: AMDAIE_Op<"core", []>, Results<(outs Index)> {
+  let summary = "AIE core";
+  let arguments = (
+    ins Index:$tile
+  );
+  let regions = (region AnyRegion:$body);
+  let assemblyFormat = [{ `(` $tile `)` regions attr-dict }];
+  let description = [{
+    AIE core
+  }];
+  let extraClassDeclaration = [{
+    TileOp getTileOp();
+  }];
+  let builders = [
+    OpBuilder<(ins "mlir::Value":$tile), [{
+      build($_builder, $_state, $_builder.getIndexType(), tile);
+    }]>
+  ];
   let cppNamespace = "mlir::iree_compiler::AMDAIE";
 }
 

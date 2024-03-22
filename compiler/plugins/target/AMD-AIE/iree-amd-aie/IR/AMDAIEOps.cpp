@@ -32,4 +32,6 @@ void AMDAIEDialect::initializeAMDAIEOps() {
       >();
 }
 
+TileOp CoreOp::getTileOp() { return dyn_cast<TileOp>(getTile().getDefiningOp()); }
+
 } // mlir::iree_compiler::AMDAIE

@@ -7,6 +7,7 @@
 #ifndef IREE_AMD_AIE_TRANSFORMS_PASSES_H_
 #define IREE_AMD_AIE_TRANSFORMS_PASSES_H_
 
+#include "iree-amd-aie/IR/AMDAIEDialect.h"
 #include "iree-amd-aie/Transforms/PassDetail.h"
 #include "iree/compiler/Codegen/Common/TileSizeSelection.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
@@ -60,6 +61,9 @@ std::unique_ptr<Pass> createAMDAIECleanupPass();
 std::unique_ptr<Pass> createAMDAIEDecomposeLinalgExtPackUnPackToAIRPass();
 
 /// TODO
+std::unique_ptr<Pass> createAMDAIEFuseAieRegionsPass();
+
+/// TODO
 std::unique_ptr<Pass> createAMDAIEFuseDmaCpyIntoAieRegionPass();
 
 /// Create a pass to fuse the linalg.fill into the forall loops.
@@ -108,6 +112,9 @@ std::unique_ptr<Pass> createAMDAIEPadPass(AMDAIEPadOptions options = {});
 
 /// Create a pass to peel the first iteration out of the scf.for loop.
 std::unique_ptr<Pass> createAMDAIEPeelForLoopPass();
+
+/// TODO
+std::unique_ptr<Pass> createAMDAIESimplifyAieRegionsPass();
 
 /// Create pass to tile TilingInterface operations.
 std::unique_ptr<Pass> createAMDAIETilePass(AMDAIETileOptions options = {});

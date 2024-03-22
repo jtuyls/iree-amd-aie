@@ -41,6 +41,12 @@ def AMDAIEDecomposeLinalgExtPackUnPackToAIR :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEDecomposeLinalgExtPackUnPackToAIRPass()";
 }
 
+def AMDAIEFuseAieRegions :
+    Pass<"iree-amdaie-fuse-aie-regions", "ModuleOp"> {
+  let summary = "TODO.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFuseAieRegionsPass()";
+}
+
 def AMDAIEFuseDmaCpyIntoAieRegion :
     Pass<"iree-amdaie-fuse-dma-copy-into-aie-region", "ModuleOp"> {
   let summary = "TODO.";
@@ -194,6 +200,12 @@ def AMDAIEPeelForLoop :
   let summary = "Pass to peel the first iteration out of the scf.for loop.";
   let constructor =
       "mlir::iree_compiler::AMDAIE::createAMDAIEPeelForLoopPass()";
+}
+
+def AMDAIESimplifyAieRegions :
+    Pass<"iree-amdaie-simplify-aie-regions", "ModuleOp"> {
+  let summary = "TODO.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIESimplifyAieRegionsPass()";
 }
 
 def AMDAIETile :

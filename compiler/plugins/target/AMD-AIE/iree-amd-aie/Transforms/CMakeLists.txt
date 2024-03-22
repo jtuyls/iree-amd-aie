@@ -41,6 +41,7 @@ iree_cc_library(
   SRCS
     "Passes.cpp"
     "AMDAIEBufferizeToAllocation.cpp"
+    "AMDAIEFuseAieRegions.cpp"
     "AMDAIEFuseIntoAieCore.cpp"
     "AMDAIEFuseIntoAieRegion.cpp"
     "AMDAIEFuseFillIntoForall.cpp"
