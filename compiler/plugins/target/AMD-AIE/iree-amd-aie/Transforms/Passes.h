@@ -61,6 +61,9 @@ std::unique_ptr<Pass> createAMDAIECleanupPass();
 std::unique_ptr<Pass> createAMDAIEDecomposeLinalgExtPackUnPackToAIRPass();
 
 /// TODO
+std::unique_ptr<Pass> createAMDAIEDmaToControlCodePass();
+
+/// TODO
 std::unique_ptr<Pass> createAMDAIEFuseAieRegionsPass();
 
 /// TODO
@@ -118,6 +121,9 @@ std::unique_ptr<Pass> createAMDAIESimplifyAieRegionsPass();
 
 /// Create pass to tile TilingInterface operations.
 std::unique_ptr<Pass> createAMDAIETilePass(AMDAIETileOptions options = {});
+
+/// TODO
+std::unique_ptr<Pass> createAMDAIEToAIEPass();
 
 /// Create pass to tile and fuse TilingInterface operations.
 std::unique_ptr<Pass> createAMDAIETileAndFusePass(

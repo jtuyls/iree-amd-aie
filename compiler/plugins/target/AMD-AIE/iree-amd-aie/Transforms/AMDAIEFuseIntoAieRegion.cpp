@@ -33,13 +33,12 @@ class DmaMemcpyNdIntoSubsequentAieRegion: public OpRewritePattern<AMDAIE::DmaCpy
     if (!dstType.getMemorySpace() || dyn_cast<IntegerAttr>(dstType.getMemorySpace()).getInt() != 1) {
       return failure();
     }
-    // llvm::outs() << dstMemref << "\n";
 
     AMDAIE::AIERegionOp firstRegionOp;
     Operation *firstDmaUserOp = nullptr;
     SmallVector<AMDAIE::DmaCpyNdOp> dmaUserOps;
     for (Operation *userOp : dstLogicalObjectFifo->getUsers()) {
-      if (auto parentRegion = dyn_cast<AMDAIE::AIERegionOp>(userOp->getParentOp())) { // userOp->getParentOfType<AMDAIE::AIERegionOp>()) {
+      if (auto parentRegion = dyn_cast<AMDAIE::AIERegionOp>(userOp->getParentOp())) {
         if (parentRegion->getBlock() != dmaOp->getBlock() || parentRegion->isBeforeInBlock(dmaOp)) {
           // Skip aie regions which are not in the same context
           continue;
@@ -67,7 +66,6 @@ class DmaMemcpyNdIntoSubsequentAieRegion: public OpRewritePattern<AMDAIE::DmaCpy
       }
     }
 
-    // auto firstDmaUserOp = dmaUserOps[0];
     llvm::outs() << "First DMA op: " << firstRegionOp << "\n";
     llvm::outs() << "First DMA op: " << firstDmaUserOp << "\n";
     auto regionOp = firstDmaUserOp->getParentOfType<AMDAIE::AIERegionOp>();
@@ -161,9 +159,6 @@ class DmaMemcpyNdIntoPrecedingAieRegion: public OpRewritePattern<AMDAIE::DmaCpyN
           }
         } else if (auto consumeOp = dyn_cast<LogicalObjectFifoConsume>(op)) {
           // TODO(jornt): this block can be removed, no?
-          // llvm::outs() << "Consume op: " << consumeOp << "\n";
-          // if (lastUserOp)
-          //   llvm::outs() << "lastUserOp: " << lastUserOp << "\n";
           if (consumeOp.getObjectfifo() == srcLogicalObjectFifo.getOutput()) {
             if (!lastUserOp || (regionOp != lastRegionOp && lastRegionOp->isBeforeInBlock(regionOp))) {
               lastUserOp = consumeOp;
@@ -284,26 +279,21 @@ class LogicalObjectfifoFromMemrefIntoAieRegion: public OpRewritePattern<AMDAIE::
     }
 
     AMDAIE::AIERegionOp regionOp;
-    for (OpOperand &opOperand : op->getUses()) {
-      auto parentOp = opOperand.getOwner()->getParentOfType<AMDAIE::AIERegionOp>();
+    for (Operation *userOp : op->getUsers()) {
+      auto parentOp = userOp->getParentOfType<AMDAIE::AIERegionOp>();
       if (!parentOp) {
-        // llvm::outs() << "Found use of LogicalObjectfifoFromMemref in non-AieRegion" << "\n";
         op.emitError("Found use of LogicalObjectfifoFromMemref in non-AieRegion");
         return failure();
       }
       if (!regionOp) {
         regionOp = parentOp;
       } else if (regionOp != parentOp) {
-        // llvm::outs() << "Found use of LogicalObjectfifoFromMemref multiple different AieRegion ops" << "\n";
         op.emitError("Found use of LogicalObjectfifoFromMemref multiple different AieRegion ops");
         return failure();
       }
     }
-    // llvm::outs() << "regionOp: " << regionOp << "\n";
     auto &block = regionOp.getRegion().front();
     rewriter.moveOpBefore(op, &block, block.begin());
-    // llvm::outs() << "AFTER MOVE AFTER\n";
-    // rewriter.eraseOp(dmaOp);
     return success();
   }
 };
@@ -350,24 +340,10 @@ class SCFForIntoAieRegion: public OpRewritePattern<AMDAIE::AIERegionOp> {
       return WalkResult::interrupt();
     });
 
-    // rewriter.setInsertionPointToStart(&(controlCodeOp.getRegion().front()));
     rewriter.setInsertionPoint(controlCodeOp);
     auto newForOp = rewriter.create<scf::ForOp>(
       rewriter.getUnknownLoc(), forOp.getLowerBound(),
       forOp.getUpperBound(), forOp.getStep());
-    // Block* splitBlock = rewriter.splitBlock(&(controlCodeOp.getRegion().front()), ++controlCodeOp.getRegion().front().begin());
-    // llvm::outs() << "splitBlock: " << splitBlock << "\n";
-    // rewriter.setInsertionPointToStart(newForOp.getBody());
-    // auto yieldOp = cast<scf::YieldOp>(newForOp.getBody()->getTerminator());
-    // auto endOp = rewriter.create<AMDAIE::EndOp>(rewriter.getUnknownLoc());
-    // for (auto &op : controlCodeOp.getRegion().front().getOperations()) {
-    //   llvm::outs() << "op: " << op << "\n";
-    //   if (!(isa<scf::ForOp>(op) && dyn_cast<scf::ForOp>(op) == newForOp) && !isa<AMDAIE::EndOp>(op)) {
-    //     llvm::outs() << "moveOpBefore: " << op << "\n";
-    //     // rewriter.moveOpBefore(&op, newForOp.getBody(), newForOp.getBody()->end());
-    //     rewriter.moveOpBefore(&op, yieldOp);
-    //   }
-    // }
     auto begin = controlCodeOp.getRegion().front().begin();
     auto end = --controlCodeOp.getRegion().front().end();
     newForOp.getBody()->getOperations().splice(
@@ -375,18 +351,9 @@ class SCFForIntoAieRegion: public OpRewritePattern<AMDAIE::AIERegionOp> {
     llvm::outs() << "newForOp: " << newForOp << "\n";
     auto newIvs = newForOp.getInductionVar();
     rewriter.replaceAllUsesWith(iv, newIvs);
-
     rewriter.moveOpBefore(newForOp, &(controlCodeOp.getRegion().front()), controlCodeOp.getRegion().front().begin());
-
     rewriter.moveOpBefore(regionOp, forOp);
     rewriter.eraseOp(forOp);
-
-    // return failure();
-    // llvm::outs() << "regionOp: " << regionOp << "\n";
-    // auto &block = regionOp.getRegion().front();
-    // rewriter.moveOpBefore(op, &block, block.begin());
-    // llvm::outs() << "AFTER MOVE AFTER\n";
-    // rewriter.eraseOp(dmaOp);
     return success();
   }
 };

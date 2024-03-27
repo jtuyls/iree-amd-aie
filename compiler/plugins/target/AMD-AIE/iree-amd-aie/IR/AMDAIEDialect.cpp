@@ -11,6 +11,8 @@
 #include "iree-amd-aie/IR/AMDAIETypes.cpp.inc"
 #include "mlir/IR/DialectImplementation.h"
 
+#include <numeric>
+
 namespace mlir::iree_compiler::AMDAIE {
 
 struct AMDAIEDialectOpAsmInterface : public OpAsmDialectInterface {
@@ -140,6 +142,11 @@ AMDAIEObjectFifoType::verify(function_ref<InFlightDiagnostic()> emitError,
 mlir::MemRefType AMDAIEObjectFifoType::getElementType() {
   // 'getImpl' returns a pointer to the internal storage instance.
   return getImpl()->elementType;
+}
+
+size_t AMDAIEObjectFifoType::getStaticSize() {
+  auto shape = getElementType().getShape();
+  return std::accumulate(shape.begin(), shape.begin(), 1, std::multiplies<size_t>());
 }
 
 }  // namespace mlir::iree_compiler::AMDAIE

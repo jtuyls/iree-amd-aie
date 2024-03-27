@@ -34,4 +34,13 @@ void AMDAIEDialect::initializeAMDAIEOps() {
 
 TileOp CoreOp::getTileOp() { return dyn_cast<TileOp>(getTile().getDefiningOp()); }
 
+
+LogicalObjectFifoFromMemref DmaCpyNdOp::getSrcObjectFifo() {
+  return dyn_cast<LogicalObjectFifoFromMemref>(getSrc().getDefiningOp());
+};
+
+LogicalObjectFifoFromMemref DmaCpyNdOp::getDstObjectFifo() {
+  return dyn_cast<LogicalObjectFifoFromMemref>(getDst().getDefiningOp());
+};
+
 } // mlir::iree_compiler::AMDAIE

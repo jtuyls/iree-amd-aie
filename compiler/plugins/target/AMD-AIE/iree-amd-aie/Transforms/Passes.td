@@ -41,6 +41,12 @@ def AMDAIEDecomposeLinalgExtPackUnPackToAIR :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEDecomposeLinalgExtPackUnPackToAIRPass()";
 }
 
+def AMDAIEDmaToControlCode :
+    Pass<"iree-amdaie-dma-to-control-code", "ModuleOp"> {
+  let summary = "TODO.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEDmaToControlCodePass()";
+}
+
 def AMDAIEFuseAieRegions :
     Pass<"iree-amdaie-fuse-aie-regions", "ModuleOp"> {
   let summary = "TODO.";
@@ -230,8 +236,14 @@ def AMDAIETileAndFuse :
   ];
 }
 
+def AMDAIEToAIE :
+    Pass<"iree-amdaie-to-aie", "ModuleOp"> {
+  let summary = "TODO.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEToAIEPass()";
+}
+
 def AMDAIEToObjectfifo : 
-  Pass<"iree-amdaie-to-objectfifo", ""> {
+  Pass<"iree-amdaie-to-objectfifo", "ModuleOp"> {
   let summary = "Convert pack/unpack ops air.dma_memcpy_nd op's";
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEToObjectfifoPass()";
 }

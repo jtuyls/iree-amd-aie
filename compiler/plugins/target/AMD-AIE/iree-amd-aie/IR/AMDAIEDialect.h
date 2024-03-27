@@ -48,6 +48,8 @@ public:
   static constexpr llvm::StringLiteral name = "amdaieobjectfifo";
   /// Returns the element type of this ObjectFifoType.
   mlir::MemRefType getElementType();
+  /// 
+  size_t getStaticSize();
 };
 
 }  // namespace mlir::iree_compiler::AMDAIE

@@ -100,4 +100,15 @@ def AMDAIE_PackingConfigAttr :
   }];
 }
 
+// Duplicate of xilinx::AIE::ObjectFifoPort 
+def ObjectFifoPort: I32EnumAttr<"ObjectFifoPort",
+  "Ports of an object FIFO",
+  [
+    I32EnumAttrCase<"Produce", 0>,
+    I32EnumAttrCase<"Consume", 1>
+  ]
+  > {
+  let cppNamespace = "mlir::iree_compiler::AMDAIE";
+}
+
 #endif // IREE_COMPILER_AMDAIE_DIALECT_IREEAMDAIEATTRS

@@ -98,27 +98,10 @@ LogicalResult mergeCores(mlir::ModuleOp moduleOp) {
   auto walkResult = moduleOp.walk([&](AMDAIE::AIERegionOp regionOp) {
     // 1) Merge the core ops and update uses
     DenseMap<xilinx::AIE::TileOp, xilinx::AIE::CoreOp> coreMap;
-    regionOp->walk([&](xilinx::AIE::CoreOp op) {
+    auto res = regionOp->walk([&](xilinx::AIE::CoreOp op) {
       if (!coreMap.contains(op.getTileOp())) {
-        // llvm::outs() << "NOT CONTAINS: " << op.getTileOp() << "\n";
         coreMap[op.getTileOp()] = op;
       } else {
-        // llvm::outs() << "CONTAINS: " << op.getTileOp() << "\n";
-        // auto &coreBlock = op.getBody().front();
-        // auto prevCoreOp = coreMap[op.getTileOp()];
-        // auto &prevCoreBlock = prevCoreOp.getBody().front();
-        // auto insertIt = --prevCoreBlock.end();
-        // auto begin = coreBlock.begin();
-        // auto end = --coreBlock.end();
-        // coreBlock.getOperations().splice(insertIt, coreBlock.getOperations(), begin, end);
-        // rewriter.replaceAllUsesWith(op.getResult(), prevCoreOp.getResult());
-        // // Move the preceding core to make sure all values are defined 
-        // // rewriter.moveOpBefore(prevCoreOp, op);
-        // // rewriter.eraseOp(op);
-        // // 
-        // // opsToBeErased.insert(op);
-        // // return WalkResult::interrupt();
-
         auto &coreBlock = op.getBody().front();
         auto &prevCoreOp = coreMap[op.getTileOp()];
         auto &prevCoreBlock = prevCoreOp.getBody().front();
@@ -129,6 +112,10 @@ LogicalResult mergeCores(mlir::ModuleOp moduleOp) {
       }
       return WalkResult::advance();
     });
+    if (res.wasInterrupted()) {
+      regionOp.emitError("Could not merge cores in this AIE region");
+      return WalkResult::interrupt();
+    }
 
     AMDAIE::ControlCodeRegionOp controlCodeOp;
     regionOp->walk([&](AMDAIE::ControlCodeRegionOp op) {
@@ -167,6 +154,133 @@ LogicalResult mergeCores(mlir::ModuleOp moduleOp) {
   return success();
 }
 
+SmallVector<AMDAIE::DmaCpyNdOp> getSrcDmaCopies(AMDAIE::LogicalObjectFifoFromMemref op) {
+  // llvm::outs() << "getSrcDmaCopies" << "\n";
+  SmallVector<AMDAIE::DmaCpyNdOp> res;
+  for (auto userOp : op->getUsers()) {
+    // llvm::outs() << "userOp: " << userOp << "\n";
+    if (auto dmaOp = dyn_cast<AMDAIE::DmaCpyNdOp>(userOp); dmaOp && dmaOp.getSrcObjectFifo() == op) {
+      // llvm::outs() << "--: " << dmaOp << "\n";
+      res.push_back(dmaOp);
+    }
+  }
+  return res;
+}
+
+SmallVector<AMDAIE::DmaCpyNdOp> getDstDmaCopies(AMDAIE::LogicalObjectFifoFromMemref op) {
+  SmallVector<AMDAIE::DmaCpyNdOp> res;
+  for (auto userOp : op->getUsers())
+    if (auto dmaOp = dyn_cast<AMDAIE::DmaCpyNdOp>(userOp); dmaOp && dmaOp.getDstObjectFifo() == op)
+      res.push_back(dmaOp);
+  return res;
+}
+
+/// TODO
+bool sameAddressing(AMDAIE::DmaCpyNdOp a, AMDAIE::DmaCpyNdOp b) {
+  return llvm::equal(a.getDstOffsets(), b.getDstOffsets()) &&
+   llvm::equal(a.getDstSizes(), b.getDstSizes()) &&
+   llvm::equal(a.getDstStrides(),  b.getDstStrides()) &&
+   llvm::equal(a.getSrcOffsets(),  b.getSrcOffsets()) &&
+   llvm::equal(a.getSrcSizes(),  b.getSrcSizes()) &&
+   llvm::equal(a.getSrcStrides(),  b.getSrcStrides());
+}
+
+/// TODO
+bool sameExceptSrc(AMDAIE::DmaCpyNdOp a, AMDAIE::DmaCpyNdOp b) {
+  return sameAddressing(a, b) && a.getDst() == b.getDst();
+}
+
+/// TODO
+bool sameExceptDst(AMDAIE::DmaCpyNdOp a, AMDAIE::DmaCpyNdOp b) {
+  return sameAddressing(a, b) && a.getSrc() == b.getSrc();
+}
+
+bool containSameOpsExceptDst(SmallVector<AMDAIE::DmaCpyNdOp> a, SmallVector<AMDAIE::DmaCpyNdOp> b) {
+  for (auto &dmaA : a) {
+    // llvm::outs() << "dmaA: " << dmaA << "\n";
+    if (!llvm::any_of(b, [&](AMDAIE::DmaCpyNdOp &dmaB) {
+          // llvm::outs() << "dmaB: " << dmaB << "\n";
+          return sameExceptDst(dmaA, dmaB);
+        })) {
+      return false;
+    }
+  }
+  return true;
+}
+
+DenseSet<xilinx::AIE::CoreOp> getCoreUsers(AMDAIE::DmaCpyNdOp &dmaOp) {
+  DenseSet<xilinx::AIE::CoreOp> users;
+  for (auto userOp : dmaOp->getUsers())
+    if (auto coreOp = userOp->getParentOfType<xilinx::AIE::CoreOp>())
+      users.insert(coreOp);
+  return users;
+}
+
+/// TODO(jornt): the need for this function is quite bad :(. Once we distribute the L1 memrefs (no reuse), this
+/// should not be needed anymore.
+bool containSameOpsExceptSrcAndCoreUsage(SmallVector<AMDAIE::DmaCpyNdOp> a, SmallVector<AMDAIE::DmaCpyNdOp> b) {
+  for (auto &dmaA : a) {
+    // llvm::outs() << "dmaA: " << dmaA << "\n";
+    DenseSet<xilinx::AIE::CoreOp> coreUsageA = getCoreUsers(dmaA);
+    // If no core usage, this check is not valid as destinations are not on core side
+    if (coreUsageA.empty())
+      return false;
+    if (!llvm::any_of(b, [&](AMDAIE::DmaCpyNdOp &dmaB) {
+          // llvm::outs() << "dmaB: " << dmaB << "\n";
+          DenseSet<xilinx::AIE::CoreOp> coreUsageB = getCoreUsers(dmaB);
+          return sameExceptSrc(dmaB, dmaA) && coreUsageA == coreUsageB;
+        })) {
+      return false;
+    }
+  }
+  return true;
+}
+
+LogicalResult mergeLogicalObjectFifoFromMemref(mlir::ModuleOp moduleOp) {
+  llvm::outs() << "Before mergeLogicalObjectFifoFromMemref: " << moduleOp << "\n";
+  IRRewriter rewriter(moduleOp.getContext());
+  auto res = moduleOp.walk([&](AMDAIE::AIERegionOp regionOp) {
+    // 1) 
+    SmallVector<AMDAIE::LogicalObjectFifoFromMemref> uniqueLogicalObjectFifos;
+    regionOp->walk([&](AMDAIE::LogicalObjectFifoFromMemref op) {
+      // Just consider L2
+      auto memSpace = op.getMemrefType().getMemorySpace();
+      if (!memSpace || dyn_cast<IntegerAttr>(memSpace).getInt() != 1) {
+        return WalkResult::advance();
+      }
+      llvm::outs() << "OP: " << op << "\n";
+      for (auto src : getSrcDmaCopies(op))
+        llvm::outs() << "--src dma: " << src << "\n";
+      bool replaced = false;
+      for (auto &other : uniqueLogicalObjectFifos) {
+        llvm::outs() << "OTHER: " << other << "\n";
+        for (auto src : getSrcDmaCopies(other))
+          llvm::outs() << "--src dma: " << src << "\n";
+        llvm::outs() << "--src bool: " << containSameOpsExceptDst(getDstDmaCopies(op), getDstDmaCopies(other)) << "\n";
+        llvm::outs() << "--dst bool: " << containSameOpsExceptSrcAndCoreUsage(getSrcDmaCopies(op), getSrcDmaCopies(other)) << "\n";
+        // TODO(jornt): refactor + simplify checks
+        // TODO(jornt): checks to handle output side (L1 -> L2 -> L3) still need to be added
+        if (containSameOpsExceptDst(getDstDmaCopies(op), getDstDmaCopies(other)) &&
+            containSameOpsExceptSrcAndCoreUsage(getSrcDmaCopies(op), getSrcDmaCopies(other))) {
+          llvm::outs() << "SAME: " << op << " AND " << other << "\n";
+          rewriter.replaceAllUsesWith(op, other);
+          rewriter.eraseOp(op);
+          replaced = true;
+          break;
+        }
+      }
+      if (!replaced) {
+        uniqueLogicalObjectFifos.push_back(op);
+      }
+      return WalkResult::advance();
+    });
+    return WalkResult::advance();
+  });
+  if (res.wasInterrupted())
+    return failure();
+  return success();
+}
+
 class MergeDmaMemCpyNds: public OpRewritePattern<AMDAIE::DmaCpyNdOp> {
   using OpRewritePattern<AMDAIE::DmaCpyNdOp>::OpRewritePattern;
 
@@ -193,7 +307,6 @@ class MergeDmaMemCpyNds: public OpRewritePattern<AMDAIE::DmaCpyNdOp> {
 };
 
 LogicalResult removeUnusedCores(mlir::ModuleOp moduleOp) {
-  // llvm::outs() << "Before removeUnusedCores: " << moduleOp << "\n";
   llvm::outs() << "removeUnusedCores\n";
   IRRewriter rewriter(moduleOp.getContext());
   moduleOp.walk([&](xilinx::AIE::CoreOp coreOp) {
@@ -245,7 +358,6 @@ void AMDAIEFuseAieRegionsPass::runOnOperation() {
   // if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns2)))) {
   //   return signalPassFailure();
   // }
-  
   // if (failed(removeUnusedCores(getOperation()))) {
   //   return signalPassFailure();
   // }
@@ -273,6 +385,10 @@ void AMDAIESimplifyAieRegionsPass::runOnOperation() {
   if (failed(mergeCores(getOperation()))) {
     return signalPassFailure();
   }
+  if (failed(mergeLogicalObjectFifoFromMemref(getOperation()))) {
+    return signalPassFailure();
+  }
+  llvm::outs() << "Before MergeDmaMemCpyNds: " << getOperation() << "\n";
   RewritePatternSet patterns(context);
   patterns.insert<MergeDmaMemCpyNds>(context);
   if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns)))) {

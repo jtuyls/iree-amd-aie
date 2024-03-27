@@ -9,6 +9,7 @@
 #include "iree-amd-aie/IR/AMDAIEDialect.h"
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Passes.h"
+#include "iree/compiler/Codegen/Transforms/Transforms.h"
 #include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtDialect.h"
 #include "iree-dialects/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree-dialects/Dialect/LinalgExt/Transforms/Transforms.h"
@@ -107,10 +108,15 @@ class SCFForAllToLogicalObjectfifo : public OpRewritePattern<scf::ForallOp> {
       AMDAIE::LogicalObjectFifoFromMemref dst = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
         forallOp.getLoc(), AMDAIEObjectFifoType::get(dstType), op.getDst()
       );
-
-      rewriter.setInsertionPoint(forallOp);
+      // rewriter.setInsertionPoint(forallOp);
 
       rewriter.setInsertionPoint(op);
+      // AMDAIE::LogicalObjectFifoFromMemref src = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
+      //   forallOp.getLoc(), AMDAIEObjectFifoType::get(srcType), op.getSrc()
+      // );
+      // AMDAIE::LogicalObjectFifoFromMemref dst = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
+      //   forallOp.getLoc(), AMDAIEObjectFifoType::get(dstType), op.getDst()
+      // );
       // AMDAIE::DmaCpyNdOp dmaCopy = 
       rewriter.create<AMDAIE::DmaCpyNdOp>(
         op.getLoc(),
@@ -157,16 +163,16 @@ class SCFForAllToStructural : public OpRewritePattern<scf::ForallOp> {
     return success();
   }
 
-
   void eraseDmaCpyNds(PatternRewriter &rewriter,
-                                   scf::ForallOp forallOp) const {
+                      scf::ForallOp forallOp) const {
     forallOp->walk([&](AMDAIE::DmaCpyNdOp op) {
       rewriter.eraseOp(op);
       return WalkResult::advance();
     });
   }
 
-  LogicalResult resolveWorkGroup(PatternRewriter &rewriter,
+  LogicalResult resolveWorkGroup(int workGroupId,
+                                 PatternRewriter &rewriter,
                                  scf::ForallOp forallOp,
                                  Block *newBlock,
                                  Block *controlCodeBlock,
@@ -176,21 +182,22 @@ class SCFForAllToStructural : public OpRewritePattern<scf::ForallOp> {
                                  DenseMap<Operation *, SmallVector<std::tuple<SmallVector<int64_t>, AMDAIE::DmaCpyNdOp>>>& constructedOps) const {
     std::cout << "resolveWorkGroup" << std::endl;
     rewriter.setInsertionPointToEnd(newBlock);
-    // Block::iterator it = newBlock->begin();
     // Create AIE core op + block for inserting L1 ops
     auto core = rewriter.create<xilinx::AIE::CoreOp>(rewriter.getUnknownLoc(), tileOp);
     Region &coreRegion = core.getBody();
     auto coreBlock = rewriter.createBlock(&coreRegion);
 
-    // Add core to func block
+    // Add core to control code block
     rewriter.setInsertionPointToEnd(controlCodeBlock);
     rewriter.create<AMDAIE::LoadCoreOp>(rewriter.getUnknownLoc(), core);
     rewriter.setInsertionPointToEnd(newBlock);
 
+    // TODO(jornt): we're now using both `constructedOps` and `updatedMemrefs` to figure out broadcasting.
+    // We should be able to somplify this logic.
+    DenseSet<Operation *> updatedMemrefs;
     Location loc = forallOp.getLoc();
     forallOp->walk([&](Operation *op) {
       if (auto dmaOp = dyn_cast<AMDAIE::DmaCpyNdOp>(op)) {
-        // rewriter.setInsertionPoint(dmaOp);
         rewriter.setInsertionPointToEnd(newBlock);
         if (!constructedOps.contains(op)) {
           SmallVector<std::tuple<SmallVector<int64_t>, AMDAIE::DmaCpyNdOp>> values;
@@ -200,7 +207,7 @@ class SCFForAllToStructural : public OpRewritePattern<scf::ForallOp> {
         SmallVector<OpFoldResult> emptySrc(dmaOp.getSrcOffsets().size(), rewriter.getI64IntegerAttr(0));
         auto newDmaOp = rewriter.create<AMDAIE::DmaCpyNdOp>(
           loc,
-          rewriter.getIndexType(), // SmallVector<Type, 1>{}, // rewriter.getIndexType(),
+          rewriter.getIndexType(),
           dmaOp.getDst(),
           getValueOrCreateConstantIndexOp(rewriter, loc, emptyDst),
           getValueOrCreateConstantIndexOp(rewriter, loc, emptyDst),
@@ -210,13 +217,13 @@ class SCFForAllToStructural : public OpRewritePattern<scf::ForallOp> {
           getValueOrCreateConstantIndexOp(rewriter, loc, emptySrc),
           getValueOrCreateConstantIndexOp(rewriter, loc, emptySrc)
         );
-        std::cout << "AMDAIE::DmaCpyNdOp" << std::endl;
+        llvm::outs() << "AMDAIE::DmaCpyNdOp: " << dmaOp << "\n";
+        // Check wether dmaOp operands depend on the induction variables and whether the evaluated values
+        // haven't been seen before.
         SmallVector<int64_t> valueResults;
         for (OpOperand &opOperand : dmaOp->getOpOperands()) {
           Value operand = opOperand.get();
-          // llvm::outs() << "Operand: " << operand << "\n";
           if (symbolTable.contains(operand)) {
-            // llvm::outs() << "Found operand in symbol table: " << operand << ": " << getConstantIntValue(symbolTable[operand]) << "\n";
             newDmaOp->setOperand(opOperand.getOperandNumber(),
                                  getValueOrCreateConstantIndexOp(rewriter, loc, symbolTable[operand]));
             valueResults.push_back(getConstantIntValue(symbolTable[operand]).value());
@@ -224,99 +231,100 @@ class SCFForAllToStructural : public OpRewritePattern<scf::ForallOp> {
             newDmaOp->setOperand(opOperand.getOperandNumber(), operand);
           }
         }
-        // if (std::find(constructedOps[op].begin(), constructedOps[op].end(), valueResults) != constructedOps[op].end()) {
+        llvm::outs() << "AMDAIE::DmaCpyNdOp after resolve\n";
+
+        // Outputs can't be broadcasted on source. TODO(jornt): can we improve this check?
+        auto srcMemSpace = dmaOp.getSrcObjectFifo().getMemrefType().getMemorySpace();
         auto it = std::find_if(
           constructedOps[op].begin(), constructedOps[op].end(), 
           [&](std::tuple<SmallVector<int64_t>, AMDAIE::DmaCpyNdOp> &elem) { return std::get<0>(elem) == valueResults; }
         );
-        if (it != constructedOps[op].end()) {
+        if (it != constructedOps[op].end() && 
+            !updatedMemrefs.contains(dmaOp.getSrcObjectFifo().getMemref().getDefiningOp()) &&
+            (!srcMemSpace || dyn_cast<IntegerAttr>(srcMemSpace).getInt() != 2)) {
           // DMA op with broadcast capability, but we still need to add the consumer/producer to the AIE core
           AMDAIE::DmaCpyNdOp broadcastDmaOp = std::get<1>(*it);
           llvm::outs() << "BROADCAST DMA OP: " << broadcastDmaOp << "\n";
-          // auto srcType = newDmaOp.getSrcType().cast<AMDAIEObjectFifoType>().getElementType();
           auto srcType = broadcastDmaOp.getSrcType().cast<AMDAIEObjectFifoType>().getElementType();
           rewriter.setInsertionPointToEnd(coreBlock);
-          if (dyn_cast<IntegerAttr>(srcType.getMemorySpace()).getInt() == 1) {
+          auto memSpace = srcType.getMemorySpace();
+          if (memSpace && dyn_cast<IntegerAttr>(memSpace).getInt() == 1) {
             // To core
             rewriter.create<AMDAIE::LogicalObjectFifoConsume>(
               rewriter.getUnknownLoc(),
               SmallVector<Type, 1>{},
               broadcastDmaOp // newDmaOp.getDst()
             );
-          } else if (dyn_cast<IntegerAttr>(srcType.getMemorySpace()).getInt() == 2) {
+          } else if (memSpace && dyn_cast<IntegerAttr>(memSpace).getInt() == 2) {
             // From core
             rewriter.create<AMDAIE::LogicalObjectFifoProduce>(
               rewriter.getUnknownLoc(),
               SmallVector<Type, 1>{},
               broadcastDmaOp // newDmaOp.getSrc()
             );
-          } else {
-            dmaOp->emitError("found unsupported source memory space");
-            return WalkResult::interrupt();
           }
           rewriter.moveOpAfter(core, broadcastDmaOp);
           llvm::outs() << "erase op\n";
           rewriter.eraseOp(newDmaOp);
         } else {
+          llvm::outs() << "UNICAST DMA OP: " << newDmaOp << "\n";
           constructedOps[op].push_back(std::make_tuple(valueResults, newDmaOp));
+          // In case of unicast, the dst memref is updated and we keep track of this in case another
+          // dma op uses it.
+          updatedMemrefs.insert(newDmaOp.getDstObjectFifo().getMemref().getDefiningOp());
 
           auto srcType = newDmaOp.getSrcType().cast<AMDAIEObjectFifoType>().getElementType();
-          // auto dstType = newDmaOp.getDst().getType().cast<MemRefType>();
-          if (dyn_cast<IntegerAttr>(srcType.getMemorySpace()).getInt() == 1) {
-            rewriter.setInsertionPointToEnd(newBlock);
-            auto produceOp = rewriter.create<AMDAIE::LogicalObjectFifoProduce>(
-              rewriter.getUnknownLoc(),
-              SmallVector<Type, 1>{},
-              newDmaOp // newDmaOp.getSrc()
-            );
+          auto srcMemSpace = srcType.getMemorySpace();
+          auto dstType = newDmaOp.getDstType().cast<AMDAIEObjectFifoType>().getElementType();
+          auto dstMemSpace = dstType.getMemorySpace();
+          if (srcMemSpace && dyn_cast<IntegerAttr>(srcMemSpace).getInt() == 1 &&
+              dstMemSpace && dyn_cast<IntegerAttr>(dstMemSpace).getInt() == 2) {
+            // rewriter.setInsertionPointToEnd(newBlock);
+            // auto produceOp = rewriter.create<AMDAIE::LogicalObjectFifoProduce>(
+            //   rewriter.getUnknownLoc(),
+            //   SmallVector<Type, 1>{},
+            //   newDmaOp // newDmaOp.getSrc()
+            // );
             rewriter.setInsertionPointToEnd(coreBlock);
             rewriter.create<AMDAIE::LogicalObjectFifoConsume>(
               rewriter.getUnknownLoc(),
               SmallVector<Type, 1>{},
               newDmaOp // newDmaOp.getDst()
             );
-            rewriter.moveOpAfter(core, produceOp);
-          } else if (dyn_cast<IntegerAttr>(srcType.getMemorySpace()).getInt() == 2) {
-            rewriter.setInsertionPointToEnd(newBlock);
-            auto consumeOp = rewriter.create<AMDAIE::LogicalObjectFifoConsume>(
-              rewriter.getUnknownLoc(),
-              SmallVector<Type, 1>{},
-              newDmaOp // newDmaOp.getDst()
-            );
-            rewriter.moveOpAfter(core, consumeOp);
+            // rewriter.moveOpAfter(core, produceOp);
+            // rewriter.moveOpAfter(core, newDmaOp);
+          } else if (srcMemSpace && dyn_cast<IntegerAttr>(srcMemSpace).getInt() == 2 &&
+                     dstMemSpace && dyn_cast<IntegerAttr>(dstMemSpace).getInt() == 1) {
+            // rewriter.setInsertionPointToEnd(newBlock);
+            // auto consumeOp = rewriter.create<AMDAIE::LogicalObjectFifoConsume>(
+            //   rewriter.getUnknownLoc(),
+            //   SmallVector<Type, 1>{},
+            //   newDmaOp // newDmaOp.getDst()
+            // );
+            // rewriter.moveOpAfter(core, consumeOp);
             rewriter.setInsertionPointToEnd(coreBlock);
             rewriter.create<AMDAIE::LogicalObjectFifoProduce>(
               rewriter.getUnknownLoc(),
               SmallVector<Type, 1>{},
               newDmaOp // newDmaOp.getSrc()
             );
+            
             // TODO(jornt): this feels too hardcoded, we assume here that we're always waiting on
             // L2 consumption. It might be better to wait on every produce/consume op and then later
             // optimize unnecessary ones out.
-            rewriter.setInsertionPointToEnd(controlCodeEndBlock);
-            rewriter.create<AMDAIE::LogicalObjectFifoWait>(
-              rewriter.getUnknownLoc(),
-              SmallVector<Type, 1>{},
-              newDmaOp.getDst()
-            );
-          } else {
-            dmaOp->emitError("found unsupported source memory space");
-            return WalkResult::interrupt();
+            // TODO(jornt): commented for now as waits are assumed on L3 side. In general, this is not a good assumption.
+            // rewriter.setInsertionPointToEnd(controlCodeEndBlock);
+            // rewriter.create<AMDAIE::LogicalObjectFifoWait>(
+            //   rewriter.getUnknownLoc(),
+            //   SmallVector<Type, 1>{},
+            //   newDmaOp.getDst()
+            // );
           }
-          // llvm::outs() << "Constructed ops push: ";
-          // for (auto value : valueResults) {
-          //   llvm::outs() << value << ", ";
-          // }
-          // llvm::outs() << "\n";
-          
+          rewriter.moveOpAfter(core, newDmaOp);
         }
       } else if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
-        // rewriter.setInsertionPointToEnd(coreBlock);
-        std::cout << "Linalg op" << std::endl;
         OpBuilder builder = OpBuilder::atBlockEnd(coreBlock);
-        auto clonedOp = mlir::clone(builder, linalgOp, linalgOp->getResultTypes(), linalgOp->getOperands());
-        llvm::outs() << "ClonedOp: " << clonedOp << "\n";
-        // rewriter.moveOpBefore(clonedOp, coreBlock, coreBlock->end());
+        mlir::clone(builder, linalgOp, linalgOp->getResultTypes(), linalgOp->getOperands());
       }
       return WalkResult::advance();
     });
@@ -365,6 +373,7 @@ class SCFForAllToStructural : public OpRewritePattern<scf::ForallOp> {
 
     DenseMap<Value, OpFoldResult> symbolTable;
     DenseMap<Operation *, SmallVector<std::tuple<SmallVector<int64_t>, AMDAIE::DmaCpyNdOp>>> constructedOps;
+    int workGroupId = 0;
     for (auto y = lowerBounds[0]; y < upperBounds[0]; y+=steps[0]) {
       for (auto x = lowerBounds[1]; x < upperBounds[1]; x+=steps[1]) {
         std::cout << "y: " << y << std::endl;
@@ -377,7 +386,7 @@ class SCFForAllToStructural : public OpRewritePattern<scf::ForallOp> {
         if (failed(resolveAffineApply(rewriter, forallOp, symbolTable))) {
           return failure();
         }
-        if (failed(resolveWorkGroup(rewriter, forallOp, newBlock, controlCodeBlock, controlCodeEndBlock, tileOp, symbolTable, constructedOps))) {
+        if (failed(resolveWorkGroup(workGroupId++, rewriter, forallOp, newBlock, controlCodeBlock, controlCodeEndBlock, tileOp, symbolTable, constructedOps))) {
           return failure();
         }
       }
@@ -397,6 +406,168 @@ class SCFForAllToStructural : public OpRewritePattern<scf::ForallOp> {
   }
 };
 
+LogicalResult cleanupLogicalObjectFifoFromMemref(mlir::ModuleOp moduleOp) {
+  IRRewriter rewriter(moduleOp.getContext());
+  DenseSet<AMDAIE::LogicalObjectFifoFromMemref> toBeErased;
+  moduleOp->walk([&](AMDAIE::LogicalObjectFifoFromMemref op) {
+    if (op->use_empty()) {
+      rewriter.eraseOp(op);
+      return WalkResult::advance();
+    }
+    if (toBeErased.contains(op)) {
+      // llvm::outs() << "To be erased: " << op << "\n";
+      rewriter.eraseOp(op);
+      return WalkResult::advance();
+    }
+    auto memref = op.getMemref();
+    llvm::outs() << "---------------------\n";
+    llvm::outs() << "Memref: " << memref << "\n";
+    for (auto user : memref.getUsers()) {
+      if (auto userOp = dyn_cast<LogicalObjectFifoFromMemref>(user)) {
+        if (userOp == op || userOp->getParentRegion() != op->getParentRegion()) continue;
+        llvm::outs() << "userOp.getOutput(): " << userOp.getOutput() << "\n";
+        llvm::outs() << "op.getOutput(): " << op.getOutput() << "\n";
+        rewriter.replaceAllUsesWith(userOp.getOutput(), op.getOutput());
+        toBeErased.insert(userOp);
+        // rewriter.eraseOp(userOp);
+      }
+    }
+    return WalkResult::advance();
+  });
+  // TODO some still used?? Something wrong here. To be debugged, but ok for now.
+  // for (auto op : toBeErased) {
+  //   if (op->use_empty())
+  //     rewriter.eraseOp(op);
+  //   else
+  //     llvm::outs() << "Still used: " << op << "\n";
+  // }
+  return success();
+}
+
+LogicalResult distributeLogicalObjectFifos(mlir::ModuleOp moduleOp) {
+  auto isBeforeInBlock = [](Operation *a, Operation *b) -> bool {
+    return a->isBeforeInBlock(b);
+  };
+  IRRewriter rewriter(moduleOp.getContext());
+  auto res = moduleOp.walk([&](AMDAIE::LogicalObjectFifoFromMemref logicalObjectFifo) {
+    // Focus just on L2 for now
+    auto memSpace = logicalObjectFifo.getMemrefType().getMemorySpace();
+    if (!memSpace || dyn_cast<IntegerAttr>(memSpace).getInt() != 1) {
+      return WalkResult::advance();
+    }
+    llvm::outs() << "Walk: " << logicalObjectFifo << "\n";
+    // Find regions in which this logicalObjectFifo is used
+    DenseSet<AMDAIE::AIERegionOp> regions;
+    for (auto userOp : logicalObjectFifo->getUsers()) {
+      auto regionOp = userOp->getParentOfType<AMDAIE::AIERegionOp>();
+      if (!regionOp) {
+        logicalObjectFifo.emitError("used in non-AIERegion op");
+      }
+      regions.insert(regionOp);
+    }
+    // Check for parallel channels/dma_cpy_nd to L1 and distribute onto multiple
+    // logical objectfifos. 
+    // TODO(jornt): Right now, only the case where `dma size == logicalObjectFifo size`,
+    // is handled and this will need to be extended.
+    // TODO(jornt): simplify this nested logic
+    for (auto regionOp : regions) {
+      llvm::outs() << "REGION: " << &regionOp << "\n";
+      // Sort dma users
+      SmallVector<AMDAIE::DmaCpyNdOp> users;
+      for (auto userOp : logicalObjectFifo->getUsers()) {
+        if (auto dmaOp = dyn_cast<AMDAIE::DmaCpyNdOp>(userOp);
+            dmaOp->getParentOfType<AMDAIE::AIERegionOp>() == regionOp) {
+          users.push_back(dmaOp);
+        }
+      }
+      llvm::sort(users, isBeforeInBlock);
+      // Keep track of producers into this logicalObjectFifo until a consumer is found. TODO(jornt): robust?
+      SmallVector<AMDAIE::DmaCpyNdOp> producers;
+      for (auto dmaOp : users) {
+        // if (auto dmaOp = dyn_cast<AMDAIE::DmaCpyNdOp>(userOp);
+        //     dmaOp->getParentOfType<AMDAIE::AIERegionOp>() == regionOp) {
+        if (logicalObjectFifo == dmaOp.getDstObjectFifo()) {
+          producers.push_back(dmaOp);
+        } else if (logicalObjectFifo == dmaOp.getSrcObjectFifo() &&
+            logicalObjectFifo.getType().cast<AMDAIEObjectFifoType>().getStaticSize() ==
+            dmaOp.getDstObjectFifo().getType().cast<AMDAIEObjectFifoType>().getStaticSize()) {
+          llvm::outs() << "--parallel op: " << dmaOp << "\n";
+          
+          rewriter.setInsertionPoint(logicalObjectFifo);
+          auto newAlloc = rewriter.create<memref::AllocOp>(rewriter.getUnknownLoc(), logicalObjectFifo.getMemrefType());
+          llvm::outs() << "--new alloc op: " << newAlloc << "\n";
+          auto *parentBlock = newAlloc->getBlock();
+          newAlloc->moveBefore(&parentBlock->front());
+          auto newLogicalObjectFifo = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
+            rewriter.getUnknownLoc(), logicalObjectFifo.getType().cast<AMDAIEObjectFifoType>(), newAlloc.getResult()
+          );
+          rewriter.setInsertionPoint(dmaOp);
+          // TODO(jornt): use setOperand instead?
+          auto newDmaOp = rewriter.create<AMDAIE::DmaCpyNdOp>(
+            rewriter.getUnknownLoc(),
+            rewriter.getIndexType(),
+            dmaOp.getDst(),
+            dmaOp.getDstOffsets(),
+            dmaOp.getDstSizes(),
+            dmaOp.getDstStrides(),
+            newLogicalObjectFifo,
+            dmaOp.getSrcOffsets(),
+            dmaOp.getSrcSizes(),
+            dmaOp.getSrcStrides()
+          );
+          rewriter.replaceAllUsesWith(dmaOp, newDmaOp);
+          rewriter.eraseOp(dmaOp);
+
+          for (auto &producerDmaOp : producers) {
+            rewriter.setInsertionPoint(producerDmaOp);
+            // TODO(jornt): use setOperand instead?
+            auto newProducerDmaOp = rewriter.create<AMDAIE::DmaCpyNdOp>(
+              rewriter.getUnknownLoc(),
+              rewriter.getIndexType(),
+              newLogicalObjectFifo,
+              producerDmaOp.getDstOffsets(),
+              producerDmaOp.getDstSizes(),
+              producerDmaOp.getDstStrides(),
+              producerDmaOp.getSrc(),
+              producerDmaOp.getSrcOffsets(),
+              producerDmaOp.getSrcSizes(),
+              producerDmaOp.getSrcStrides()
+            );
+            rewriter.replaceAllUsesWith(producerDmaOp, newProducerDmaOp);
+            rewriter.eraseOp(producerDmaOp);
+          }
+          producers.clear();
+
+          rewriter.setInsertionPoint(logicalObjectFifo);
+          auto dealloc = rewriter.create<memref::DeallocOp>(rewriter.getUnknownLoc(), newAlloc);
+          dealloc->moveBefore(&parentBlock->back());
+        }
+        // }   
+      }
+    }
+    // TODO(jornt): not sure why this is necessary?
+    // logicalObjectFifo->dropAllUses();
+    // llvm::outs() << "--uses: " << logicalObjectFifo->use_empty() << "\n";
+    // if (!logicalObjectFifo->use_empty()) {
+    //   for (auto user : logicalObjectFifo->getUsers())
+    //     llvm::outs() << "--user: " << user << "\n";
+    // }
+    return WalkResult::advance();
+  });
+  if (res.wasInterrupted())
+    return failure();
+  return success();
+}
+
+LogicalResult hoistStaticallyBoundAllocationsInModule(mlir::ModuleOp moduleOp) {
+  IRRewriter rewriter(moduleOp.getContext());
+  for (auto funcOp : moduleOp.getOps<func::FuncOp>()) {
+    hoistStaticallyBoundAllocationsInFunc<memref::AllocaOp>(rewriter, funcOp);
+    hoistStaticallyBoundAllocationsInFunc<memref::AllocOp>(rewriter, funcOp);
+  }
+  return success();
+}
+
 class AMDAIEToObjectfifoPass
     : public impl::AMDAIEToObjectfifoBase<AMDAIEToObjectfifoPass> {
  public:
@@ -413,14 +584,22 @@ class AMDAIEToObjectfifoPass
 void AMDAIEToObjectfifoPass::runOnOperation() {
   MLIRContext *context = &getContext();
   RewritePatternSet patterns(context);
-  //patterns.insert<IREE::LinalgExt::ForallOpToAsyncRewriter>(context);
   patterns.insert<SCFForAllToLogicalObjectfifo>(context);
   patterns.insert<SCFForAllToStructural>(context);
-  // patterns.insert<DmaMemcpyNdToLogicalObjectfifo>(context);
-  
-  // patterns.insert<SCFForAllUnroll>(context);
   if (failed(
           applyPatternsAndFoldGreedily(getOperation(), std::move(patterns)))) {
+    return signalPassFailure();
+  }
+  if (failed(cleanupLogicalObjectFifoFromMemref(getOperation()))) {
+    return signalPassFailure();
+  }
+  if (failed(distributeLogicalObjectFifos(getOperation()))) {
+    return signalPassFailure();
+  }
+  if (failed(cleanupLogicalObjectFifoFromMemref(getOperation()))) {
+    return signalPassFailure();
+  }
+  if (failed(hoistStaticallyBoundAllocationsInModule(getOperation()))) {
     return signalPassFailure();
   }
 }
@@ -442,7 +621,6 @@ void AMDAIEDmaToObjectfifoPass::runOnOperation() {
   MLIRContext *context = &getContext();
   RewritePatternSet patterns(context);
   patterns.insert<DmaMemcpyNdToLogicalObjectfifo>(context);
-  // patterns.insert<LogicalObjectfifoFromMemrefCleanup>(context);
   if (failed(
           applyPatternsAndFoldGreedily(getOperation(), std::move(patterns)))) {
     return signalPassFailure();
@@ -483,38 +661,9 @@ class AMDAIELogicalObjectfifoFromMemrefCleanupPass
 };
 
 void AMDAIELogicalObjectfifoFromMemrefCleanupPass::runOnOperation() {
-  MLIRContext *context = &getContext();
-  ModuleOp moduleOp = getOperation();
-  IRRewriter rewriter(context);
-  DenseSet<AMDAIE::LogicalObjectFifoFromMemref> toBeErased;
-  moduleOp->walk([&](AMDAIE::LogicalObjectFifoFromMemref op) {
-    if (toBeErased.contains(op)) {
-      // llvm::outs() << "To be erased: " << op << "\n";
-      rewriter.eraseOp(op);
-      WalkResult::advance();
-    }
-    auto memref = op.getMemref();
-    llvm::outs() << "---------------------\n";
-    llvm::outs() << "Memref: " << memref << "\n";
-    for (auto user : memref.getUsers()) {
-      if (auto userOp = dyn_cast<LogicalObjectFifoFromMemref>(user)) {
-        if (userOp == op || userOp->getParentRegion() != op->getParentRegion()) continue;
-        llvm::outs() << "userOp.getOutput(): " << userOp.getOutput() << "\n";
-        llvm::outs() << "op.getOutput(): " << op.getOutput() << "\n";
-        rewriter.replaceAllUsesWith(userOp.getOutput(), op.getOutput());
-        toBeErased.insert(userOp);
-        // rewriter.eraseOp(userOp);
-      }
-    }
-    return WalkResult::advance();
-  });
-  // TODO some still used?? Something wrong here. To be debugged, but ok for now.
-  // for (auto op : toBeErased) {
-  //   if (op->use_empty())
-  //     rewriter.eraseOp(op);
-  //   else
-  //     llvm::outs() << "Still used: " << op << "\n";
-  // }
+  if (failed(cleanupLogicalObjectFifoFromMemref(getOperation()))) {
+    return signalPassFailure();
+  }
 }
 
 
