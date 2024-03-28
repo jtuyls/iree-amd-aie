@@ -208,6 +208,12 @@ def AMDAIEPeelForLoop :
       "mlir::iree_compiler::AMDAIE::createAMDAIEPeelForLoopPass()";
 }
 
+def AMDAIEPrepareForAIE :
+    Pass<"iree-amdaie-prepare-for-aie", "ModuleOp"> {
+  let summary = "TODO.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEPrepareForAIEPass()";
+}
+
 def AMDAIESimplifyAieRegions :
     Pass<"iree-amdaie-simplify-aie-regions", "ModuleOp"> {
   let summary = "TODO.";

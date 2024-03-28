@@ -295,35 +295,54 @@ def LoadCoreOp: AMDAIE_Op<"ipu.load", []> {
   let cppNamespace = "mlir::iree_compiler::AMDAIE";
 }
 
-def IpuDmaCpyNdOp: AMDAIE_Op<"ipu.dma_cpy_nd", [AttrSizedOperandSegments]> {
+def IpuDmaCpyNdOp: AMDAIE_Op<"ipu.dma_cpy_nd", [AttrSizedOperandSegments]>, Results<(outs Index)> {
   let summary = "ipu dma operator";
   let arguments = (
-    ins AnyAMDAIEObjectFifoType:$dst,
+    ins Index:$dma,
+        // AnyAMDAIEObjectFifoType:$dst,
         Variadic<Index>:$dst_offsets,
         Variadic<Index>:$dst_sizes,
         Variadic<Index>:$dst_strides,
-        AnyAMDAIEObjectFifoType:$src,
+        // AnyAMDAIEObjectFifoType:$src,
         Variadic<Index>:$src_offsets,
         Variadic<Index>:$src_sizes,
         Variadic<Index>:$src_strides
   );
   // let results = (outs Optional<air_AsyncToken>:$async_token);
   let assemblyFormat = [{
-    `(` $dst `[` ($dst_offsets^)? `]``[` ($dst_sizes^)? `]``[` ($dst_strides^)? `]` `,`
-        $src `[` ($src_offsets^)? `]``[` ($src_sizes^)? `]``[` ($src_strides^)? `]` `)`  attr-dict `:`
-    `(` type($dst) `,` type($src) `)`
+    $dma `(``[` ($dst_offsets^)? `]``[` ($dst_sizes^)? `]``[` ($dst_strides^)? `]` `,`
+            `[` ($src_offsets^)? `]``[` ($src_sizes^)? `]``[` ($src_strides^)? `]` `)`  attr-dict
   }];
+  // `(` type($dst) `,` type($src) `)`
   let description = [{
     ipu dma operator
   }];
   let extraClassDeclaration = [{
-    Value getSrcMemref() { return getSrc(); }
-    Value getDstMemref() { return getDst(); }
-    Type getSrcType() { return getSrc().getType(); }
-    Type getDstType() { return getDst().getType(); }
+    DmaCpyNdOp getDmaCpyNd() { return dyn_cast<DmaCpyNdOp>(getDma().getDefiningOp()); }
+    bool hasDstAddressing() { return !getDstOffsets().empty() || !getDstSizes().empty() || !getDstStrides().empty(); }
+    bool hasSrcAddressing() { return !getSrcOffsets().empty() || !getSrcSizes().empty() || !getSrcStrides().empty(); }
+    // Value getSrcMemref() { return getSrc(); }
+    // Value getDstMemref() { return getDst(); }
+    // Type getSrcType() { return getSrc().getType(); }
+    // Type getDstType() { return getDst().getType(); }
     // Type getSrcMemrefType() { return getSrcType().cast<AMDAIEObjectFifoType>().getElementType(); }
   }];
 
+  let cppNamespace = "mlir::iree_compiler::AMDAIE";
+}
+
+def IpuDmaWaitOp: AMDAIE_Op<"ipu.dma_wait", []> {
+  let summary = "Ipu synchronization point";
+  let description = [{
+    TODO
+  }];
+  let arguments = (
+    ins Index:$dma,
+        AnyAMDAIEObjectFifoType:$objectfifo
+  );
+  let assemblyFormat = [{
+    `(` $dma `,` $objectfifo `)`  attr-dict `:` `(` type($objectfifo) `)`
+  }];
   let cppNamespace = "mlir::iree_compiler::AMDAIE";
 }
 

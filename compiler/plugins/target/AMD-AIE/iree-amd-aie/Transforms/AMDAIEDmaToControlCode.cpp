@@ -42,27 +42,38 @@ LogicalResult dmaToControlCode(mlir::ModuleOp moduleOp) {
         // L3 -> L2 or L2 -> L3
         auto loc = rewriter.getUnknownLoc();
         rewriter.setInsertionPointToEnd(newMainBlock);
+        // auto ipuDmaCpy = 
         auto ipuDmaCpy = rewriter.create<AMDAIE::IpuDmaCpyNdOp>(
           loc,
-          SmallVector<Type, 1>{},
-          dmaOp.getDst(),
+          rewriter.getIndexType(), // SmallVector<Type, 1>{},
+          dmaOp.getResult(),
+          // dmaOp.getDst(),
           dmaOp.getDstOffsets(),
           dmaOp.getDstSizes(),
           dmaOp.getDstStrides(),
-          dmaOp.getSrc(),
+          // dmaOp.getSrc(),
           dmaOp.getSrcOffsets(),
           dmaOp.getSrcSizes(),
           dmaOp.getSrcStrides()
         );
-        if (!dstMemSpace) {
-          // L2 -> L3
-          rewriter.setInsertionPointToEnd(newEndBlock);
-          rewriter.create<AMDAIE::LogicalObjectFifoWait>(
-            rewriter.getUnknownLoc(),
-            SmallVector<Type, 1>{},
-            ipuDmaCpy.getDst()
-          );
-        }
+        rewriter.setInsertionPointToEnd(newEndBlock);
+        rewriter.create<AMDAIE::IpuDmaWaitOp>(
+          rewriter.getUnknownLoc(),
+          SmallVector<Type, 1>{},
+          ipuDmaCpy.getResult(),
+          // ipuDmaCpy.getDst()
+          dmaOp.getDst()
+        );
+        // if (!dstMemSpace) {
+        //   // L2 -> L3
+        //   rewriter.setInsertionPointToEnd(newEndBlock);
+        //   // rewriter.create<AMDAIE::LogicalObjectFifoWait>(
+        //   //   rewriter.getUnknownLoc(),
+        //   //   SmallVector<Type, 1>{},
+        //   //   // ipuDmaCpy.getDst()
+        //   //   dmaOp.getDst()
+        //   // );
+        // }
 
         rewriter.setInsertionPoint(dmaOp);
         SmallVector<OpFoldResult> empty;

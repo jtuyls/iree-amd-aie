@@ -21,7 +21,7 @@ module {
     %alloc_2 = memref.alloc() : memref<32x32xi32, 1>
     %alloc_3 = memref.alloc() : memref<64x32xi32, 1>
     %alloc_4 = memref.alloc() : memref<32x64xi32, 1>
-    %alloca = memref.alloca() {alignment = 64 : i64} : memref<32x64xi32>
+    // %alloca = memref.alloca() {alignment = 64 : i64} : memref<32x64xi32>
     scf.forall (%arg2, %arg3) in (1, 1) {
       %3 = affine.apply #map(%arg2)
       %4 = affine.apply #map1(%arg3)
@@ -97,7 +97,7 @@ module {
           linalg.yield %8 : i32
         }
         iree_linalg_ext.unpack %alloc_1 outer_dims_perm = [1, 0] inner_dims_pos = [0, 1] inner_tiles = [4, 8] into %subview_11 : (memref<4x8x4x8xi32, 2> memref<32x32xi32, strided<[32, 1]>, 1>)
-        %subview = memref.subview %alloca[%5, %6] [32, 32] [1, 1] : memref<32x64xi32> to memref<32x32xi32, strided<[64, 1], offset: ?>>
+        %subview = memref.subview %2[%5, %6] [32, 32] [1, 1] : memref<32x64xi32> to memref<32x32xi32, strided<[64, 1], offset: ?>>
         linalg.copy ins(%alloc_2 : memref<32x32xi32, 1>) outs(%subview : memref<32x32xi32, strided<[64, 1], offset: ?>>)
       } {mapping = [#gpu.thread<y>, #gpu.thread<x>]}
       // linalg.copy ins(%alloc_2 : memref<32x64xi32, 1>) outs(%subview : memref<32x64xi32, strided<[64, 1], offset: ?>>)

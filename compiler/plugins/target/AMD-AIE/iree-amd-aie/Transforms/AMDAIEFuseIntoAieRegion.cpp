@@ -87,7 +87,7 @@ class DmaMemcpyNdIntoSubsequentAieRegion: public OpRewritePattern<AMDAIE::DmaCpy
     rewriter.setInsertionPoint(firstDmaUserOp);
     auto loc = rewriter.getUnknownLoc();
     SmallVector<OpFoldResult> empty;
-    rewriter.create<AMDAIE::DmaCpyNdOp>(
+    auto newDmaOp = rewriter.create<AMDAIE::DmaCpyNdOp>(
       rewriter.getUnknownLoc(),
       rewriter.getIndexType(), // SmallVector<Type, 1>{}, // rewriter.getIndexType(),
       dmaOp.getDst(),
@@ -104,12 +104,13 @@ class DmaMemcpyNdIntoSubsequentAieRegion: public OpRewritePattern<AMDAIE::DmaCpy
     rewriter.setInsertionPointAfter(lastLoadCoreOp);
     rewriter.create<AMDAIE::IpuDmaCpyNdOp>(
       loc,
-      SmallVector<Type, 1>{},
-      dmaOp.getDst(),
+      rewriter.getIndexType(), // SmallVector<Type, 1>{},
+      newDmaOp.getResult(),
+      // dmaOp.getDst(),
       dmaOp.getDstOffsets(),
       dmaOp.getDstSizes(),
       dmaOp.getDstStrides(),
-      dmaOp.getSrc(),
+      // dmaOp.getSrc(),
       dmaOp.getSrcOffsets(),
       dmaOp.getSrcSizes(),
       dmaOp.getSrcStrides()
@@ -207,7 +208,7 @@ class DmaMemcpyNdIntoPrecedingAieRegion: public OpRewritePattern<AMDAIE::DmaCpyN
     rewriter.setInsertionPointAfter(lastUserOp);
     auto loc = rewriter.getUnknownLoc();
     SmallVector<OpFoldResult> empty;
-    rewriter.create<AMDAIE::DmaCpyNdOp>(
+    auto newDmaOp = rewriter.create<AMDAIE::DmaCpyNdOp>(
       rewriter.getUnknownLoc(),
       rewriter.getIndexType(), // SmallVector<Type, 1>{}, // rewriter.getIndexType(),
       dmaOp.getDst(),
@@ -222,14 +223,16 @@ class DmaMemcpyNdIntoPrecedingAieRegion: public OpRewritePattern<AMDAIE::DmaCpyN
 
     // IPU instructions take care of addressing
     rewriter.setInsertionPoint(endOp);
-    auto ipuDmaCpy = rewriter.create<AMDAIE::IpuDmaCpyNdOp>(
+    // auto ipuDmaCpy = 
+    rewriter.create<AMDAIE::IpuDmaCpyNdOp>(
       loc,
-      SmallVector<Type, 1>{},
-      dmaOp.getDst(),
+      rewriter.getIndexType(), //SmallVector<Type, 1>{},
+      newDmaOp.getResult(),
+      // dmaOp.getDst(),
       dmaOp.getDstOffsets(),
       dmaOp.getDstSizes(),
       dmaOp.getDstStrides(),
-      dmaOp.getSrc(),
+      // dmaOp.getSrc(),
       dmaOp.getSrcOffsets(),
       dmaOp.getSrcSizes(),
       dmaOp.getSrcStrides()
@@ -237,7 +240,8 @@ class DmaMemcpyNdIntoPrecedingAieRegion: public OpRewritePattern<AMDAIE::DmaCpyN
     rewriter.create<AMDAIE::LogicalObjectFifoWait>(
       rewriter.getUnknownLoc(),
       SmallVector<Type, 1>{},
-      ipuDmaCpy.getDst()
+      // ipuDmaCpy.getDst()
+      newDmaOp.getDst()
     );
 
     rewriter.eraseOp(dmaOp);
