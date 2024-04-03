@@ -100,7 +100,7 @@ def AMDAIE_PackingConfigAttr :
   }];
 }
 
-// Duplicate of xilinx::AIE::ObjectFifoPort 
+// TODO(jornt): Duplicate of xilinx::AIE::ObjectFifoPort. Can this be consolidated?
 def ObjectFifoPort: I32EnumAttr<"ObjectFifoPort",
   "Ports of an object FIFO",
   [
@@ -108,6 +108,16 @@ def ObjectFifoPort: I32EnumAttr<"ObjectFifoPort",
     I32EnumAttrCase<"Consume", 1>
   ]
   > {
+  let cppNamespace = "mlir::iree_compiler::AMDAIE";
+}
+
+// TODO(jornt): Duplicate of xilinx::AIE::DMAChannelDir. Can this be consolidated?
+def DMAChannelDir: I32EnumAttr<"DMAChannelDir",
+  "DMA Channel direction",
+  [
+    I32EnumAttrCase<"S2MM", 0>,
+    I32EnumAttrCase<"MM2S", 1>
+  ]> {
   let cppNamespace = "mlir::iree_compiler::AMDAIE";
 }
 

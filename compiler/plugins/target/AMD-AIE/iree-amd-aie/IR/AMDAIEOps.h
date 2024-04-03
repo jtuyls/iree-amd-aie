@@ -12,6 +12,9 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 
+#include "iree-amd-aie/IR/AMDAIEAttrs.h"
+#include "iree-amd-aie/IR/AMDAIEDmaOpInterface.h"
+
 // clang-format off
 #include "iree-amd-aie/IR/AMDAIEAttrs.h"
 #define GET_OP_CLASSES

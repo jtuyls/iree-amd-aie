@@ -42,6 +42,7 @@ iree_cc_library(
     "Passes.cpp"
     "AMDAIEBufferizeToAllocation.cpp"
     "AMDAIEDmaToControlCode.cpp"
+    "AMDAIEDmaUtils.cpp"
     "AMDAIEFuseAieRegions.cpp"
     "AMDAIEFuseIntoAieCore.cpp"
     "AMDAIEFuseIntoAieRegion.cpp"

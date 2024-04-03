@@ -220,6 +220,12 @@ def AMDAIESimplifyAieRegions :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIESimplifyAieRegionsPass()";
 }
 
+def AMDAIESimplifyDmaAddressing :
+    Pass<"iree-amdaie-simplify-dma-addressing", "ModuleOp"> {
+  let summary = "TODO.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIESimplifyDmaAddressingPass()";
+}
+
 def AMDAIETile :
     Pass<"iree-amdaie-tile", "func::FuncOp"> {
   let summary = "Pass to tile TilingInterface operations.";

@@ -122,6 +122,9 @@ std::unique_ptr<Pass> createAMDAIEPrepareForAIEPass();
 /// TODO
 std::unique_ptr<Pass> createAMDAIESimplifyAieRegionsPass();
 
+/// TODO
+std::unique_ptr<Pass> createAMDAIESimplifyDmaAddressingPass();
+
 /// Create pass to tile TilingInterface operations.
 std::unique_ptr<Pass> createAMDAIETilePass(AMDAIETileOptions options = {});
 

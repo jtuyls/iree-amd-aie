@@ -26,6 +26,8 @@ iree_cc_library(
     "AMDAIETypes.h.inc"
     "AMDAIEOps.cpp.inc"
     "AMDAIEOps.h.inc"
+    "AMDAIEDmaOpInterface.cpp.inc"
+    "AMDAIEDmaOpInterface.h.inc"
   SRCS
     "AMDAIEAttrs.cpp"
     "AMDAIEDialect.cpp"
@@ -33,6 +35,7 @@ iree_cc_library(
   DEPS
     ::AMDAIEDialectGen
     ::AMDAIEOpsGen
+    ::AMDAIEDmaOpInterfaceGen
     # ::AMDAIETypesGen
     ::PackingConfigGen
     LLVMSupport
@@ -86,5 +89,19 @@ iree_tablegen_library(
     -gen-op-defs AMDAIEOps.cpp.inc
     # -gen-typedef-decls AMDAIETypes.h.inc
     # -gen-typedef-defs AMDAIETypes.cpp.inc
+)
+
+iree_tablegen_library(
+  NAME
+    AMDAIEDmaOpInterfaceGen
+  TD_FILE
+    "AMDAIEDmaOpInterface.td"
+  OUTS
+    # --gen-attr-interface-decls UtilAttrInterfaces.h.inc
+    # --gen-attr-interface-defs UtilAttrInterfaces.cpp.inc
+    --gen-op-interface-decls AMDAIEDmaOpInterface.h.inc
+    --gen-op-interface-defs AMDAIEDmaOpInterface.cpp.inc
+    # --gen-type-interface-decls UtilTypeInterfaces.h.inc
+    # --gen-type-interface-defs UtilTypeInterfaces.cpp.inc
 )
 

@@ -11,6 +11,7 @@ include "mlir/IR/OpBase.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "iree-amd-aie/IR/AMDAIEAttrs.td"
 include "iree-amd-aie/IR/AMDAIEDialect.td"
+include "iree-amd-aie/IR/AMDAIEDmaOpInterface.td"
 include "iree-amd-aie/IR/AMDAIETypes.td"
 
 
@@ -136,7 +137,7 @@ def LogicalObjectFifoFromMemref : AMDAIE_Op<"logicalobjectfifo.from_memref", []>
 }
 
 
-def DmaCpyNdOp: AMDAIE_Op<"dma_cpy_nd", [AttrSizedOperandSegments]>, Results<(outs Index)> {
+def DmaCpyNdOp: AMDAIE_Op<"dma_cpy_nd", [AttrSizedOperandSegments,DmaOpInterface,DoublyStridedOpInterface]>, Results<(outs Index)> {
   let summary = "dma operator";
   let arguments = (
     ins AnyAMDAIEObjectFifoType:$dst,
@@ -166,13 +167,6 @@ def DmaCpyNdOp: AMDAIE_Op<"dma_cpy_nd", [AttrSizedOperandSegments]>, Results<(ou
     LogicalObjectFifoFromMemref getSrcObjectFifo();
     LogicalObjectFifoFromMemref getDstObjectFifo();
     // Type getSrcMemrefType() { return getSrcType().cast<AMDAIEObjectFifoType>().getElementType(); }
-    // bool containsValueInOperands(Value value);
-    // int32_t getId() {
-    //   if (auto id_attr = (*this)->getAttrOfType<IntegerAttr>("id")) {
-    //     return id_attr.getInt();
-    //   }
-    //   return -1;
-    // }
   }];
 
   let cppNamespace = "mlir::iree_compiler::AMDAIE";
@@ -318,14 +312,9 @@ def IpuDmaCpyNdOp: AMDAIE_Op<"ipu.dma_cpy_nd", [AttrSizedOperandSegments]>, Resu
     ipu dma operator
   }];
   let extraClassDeclaration = [{
-    DmaCpyNdOp getDmaCpyNd() { return dyn_cast<DmaCpyNdOp>(getDma().getDefiningOp()); }
+    DmaCpyNdOp getDmaCpyNdOp() { return dyn_cast<DmaCpyNdOp>(getDma().getDefiningOp()); }
     bool hasDstAddressing() { return !getDstOffsets().empty() || !getDstSizes().empty() || !getDstStrides().empty(); }
     bool hasSrcAddressing() { return !getSrcOffsets().empty() || !getSrcSizes().empty() || !getSrcStrides().empty(); }
-    // Value getSrcMemref() { return getSrc(); }
-    // Value getDstMemref() { return getDst(); }
-    // Type getSrcType() { return getSrc().getType(); }
-    // Type getDstType() { return getDst().getType(); }
-    // Type getSrcMemrefType() { return getSrcType().cast<AMDAIEObjectFifoType>().getElementType(); }
   }];
 
   let cppNamespace = "mlir::iree_compiler::AMDAIE";
@@ -342,6 +331,12 @@ def IpuDmaWaitOp: AMDAIE_Op<"ipu.dma_wait", []> {
   );
   let assemblyFormat = [{
     `(` $dma `,` $objectfifo `)`  attr-dict `:` `(` type($objectfifo) `)`
+  }];
+  let extraClassDeclaration = [{
+    IpuDmaCpyNdOp getDmaOp() { return dyn_cast<IpuDmaCpyNdOp>(getDma().getDefiningOp()); }
+    DMAChannelDir getDirection() {
+      return getObjectfifo() == getDmaOp().getDmaCpyNdOp().getSrc() ? DMAChannelDir::MM2S : DMAChannelDir::S2MM; 
+    }
   }];
   let cppNamespace = "mlir::iree_compiler::AMDAIE";
 }

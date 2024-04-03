@@ -431,6 +431,7 @@ LogicalResult controlCodeToAie(IRRewriter &rewriter,
     }
   };
 
+  SmallVector<Operation *> toBeErased;
   auto res = controlCodeOp->walk([&](Operation *op) {
     if (auto loadCoreOp = dyn_cast<AMDAIE::LoadCoreOp>(op)) {
       // In MLIR-AIE, the cores are initialized implicitly before ipu instruction execution
@@ -463,7 +464,7 @@ LogicalResult controlCodeToAie(IRRewriter &rewriter,
           staticSizes[4 - srcSizes.size() + i] = getConstantIntValue(srcSizes[i]).value();
         for (int i = 0; i < srcStrides.size() - 1; ++i)
           staticStrides[3 - srcStrides.size() + i] = getConstantIntValue(srcStrides[i]).value();
-        auto dmaCpyNd = dmaOp.getDmaCpyNd();
+        auto dmaCpyNd = dmaOp.getDmaCpyNdOp();
         // TODO, not always there
         auto memref = argMap[dmaCpyNd.getSrcObjectFifo().getMemref()];
         auto symbol = dmaObjFifoMap[dmaCpyNd].getName();
@@ -493,7 +494,7 @@ LogicalResult controlCodeToAie(IRRewriter &rewriter,
           staticSizes[4 - dstSizes.size() + i] = getConstantIntValue(dstSizes[i]).value();
         for (int i = 0; i < dstStrides.size() - 1; ++i)
           staticStrides[3 - dstStrides.size() + i] = getConstantIntValue(dstStrides[i]).value();
-        auto dmaCpyNd = dmaOp.getDmaCpyNd();
+        auto dmaCpyNd = dmaOp.getDmaCpyNdOp();
         // TODO, not always there
         auto memref = argMap[dmaCpyNd.getDstObjectFifo().getMemref()];
         auto symbol = dmaObjFifoMap[dmaCpyNd].getName();
@@ -504,8 +505,10 @@ LogicalResult controlCodeToAie(IRRewriter &rewriter,
           rewriter.getUnknownLoc(), SmallVector<Type, 1>{}, 0, 0, memref,
           empty, empty, empty, staticOffsets, staticSizes, staticStrides, symbol, 0);
       }
-      dmaOp->dropAllUses();
-      rewriter.eraseOp(dmaOp);
+      // TODO(jornt): can we avoid this inplace rewrites with issues if directly erasing and still used
+      toBeErased.push_back(dmaOp);
+      // dmaOp->dropAllUses();
+      // rewriter.eraseOp(dmaOp);
     } else if (auto waitOp = dyn_cast<AMDAIE::IpuDmaWaitOp>(op)) {
       rewriter.setInsertionPoint(waitOp);
       auto objFifo = dyn_cast<AMDAIE::LogicalObjectFifoFromMemref>(waitOp.getObjectfifo().getDefiningOp());
@@ -517,7 +520,14 @@ LogicalResult controlCodeToAie(IRRewriter &rewriter,
       auto tile = dyn_cast<AIE::TileOp>(tileResults[0].getDefiningOp());
       auto col = rewriter.getI32IntegerAttr(tile.getCol());
       auto row = rewriter.getI32IntegerAttr(tile.getRow());
-      auto dir = rewriter.getI32IntegerAttr(0); // TODO derive from source/destination
+      // auto dir = rewriter.getI32IntegerAttr(0); // TODO derive from source/destination
+      // auto dir = dyn_cast<IntegerAttr>(waitOp.getDirection());
+      llvm::outs() << "BEFORE" << "\n";
+      llvm::outs() << waitOp.getDmaOp();
+      llvm::outs() << waitOp.getDmaOp().getDmaCpyNdOp();
+      llvm::outs() << waitOp.getDirection() << "\n";
+      auto dir = rewriter.getI32IntegerAttr((int32_t) waitOp.getDirection());
+      llvm::outs() << "AFTER" << "\n";
       auto channel = rewriter.getI32IntegerAttr(0); // Used??
       auto col_num = rewriter.getI32IntegerAttr(1); // Used??
       auto row_num = rewriter.getI32IntegerAttr(1); // Used??
@@ -532,6 +542,10 @@ LogicalResult controlCodeToAie(IRRewriter &rewriter,
     }
     return WalkResult::advance();
   });
+  for (auto *op : toBeErased) {
+    op->dropAllUses();
+    rewriter.eraseOp(op);
+  }
   if (res.wasInterrupted())
     return failure();
   // rewriter.mergeBlocks(controlCodeBlock, funcBlock);
@@ -593,32 +607,34 @@ LogicalResult toObjectFifo(mlir::ModuleOp moduleOp) {
           rewriter.moveOpBefore(tileOp, deviceBlock, deviceBlock->begin());
         } else if (auto dmaOp = dyn_cast<AMDAIE::DmaCpyNdOp>(op)) {
           // TODO(jornt): refactor
-          SmallVector<Value> srcTiles;
+          llvm::SmallSetVector<Value, 4> srcTiles;
           auto srcMemSpace = dmaOp.getSrcObjectFifo().getMemrefType().getMemorySpace();
           if (!srcMemSpace || dyn_cast<IntegerAttr>(srcMemSpace).getInt() != 2) {
-            srcTiles = dyn_cast<AMDAIE::LogicalObjectFifoFromMemref>(dmaOp.getSrc().getDefiningOp()).getTiles();
+            auto tiles = dyn_cast<AMDAIE::LogicalObjectFifoFromMemref>(dmaOp.getSrc().getDefiningOp()).getTiles();
+            srcTiles.insert(tiles.begin(), tiles.end());
           } else {
             for (auto userOp : dmaOp->getUsers()) {
               if (auto coreOp = userOp->getParentOfType<xilinx::AIE::CoreOp>()) {
-                srcTiles.push_back(coreOp.getTileOp().getResult());
+                srcTiles.insert(coreOp.getTileOp().getResult());
               }
             }
           }
-          SmallVector<Value> dstTiles;
+          llvm::SmallSetVector<Value, 4> dstTiles;
           auto dstMemSpace = dmaOp.getDstObjectFifo().getMemrefType().getMemorySpace();
           if (!dstMemSpace || dyn_cast<IntegerAttr>(dstMemSpace).getInt() != 2) {
-            dstTiles = dyn_cast<AMDAIE::LogicalObjectFifoFromMemref>(dmaOp.getDst().getDefiningOp()).getTiles();
+            auto tiles = dyn_cast<AMDAIE::LogicalObjectFifoFromMemref>(dmaOp.getDst().getDefiningOp()).getTiles();
+            dstTiles.insert(tiles.begin(), tiles.end());
           } else {
             for (auto userOp : dmaOp->getUsers()) {
               if (auto coreOp = userOp->getParentOfType<xilinx::AIE::CoreOp>()) {
-                dstTiles.push_back(coreOp.getTileOp().getResult());
+                dstTiles.insert(coreOp.getTileOp().getResult());
               }
             }
           }
           // auto dstTiles = dyn_cast<AMDAIE::LogicalObjectFifoFromMemref>(dmaOp.getDst().getDefiningOp()).getTiles();
           auto symName = "in" + std::to_string(dmaId++);
           auto symAttr = rewriter.getStringAttr(symName);
-          auto fifo = createObjectFifo(rewriter, srcTiles, dstTiles, dmaOp, symAttr);
+          auto fifo = createObjectFifo(rewriter, srcTiles.getArrayRef(), dstTiles.getArrayRef(), dmaOp, symAttr);
           dmaSymMap[dmaOp] = fifo;
           llvm::outs() << "fifo: " << fifo << "\n";
           // rewriter.eraseOp(dmaOp);
@@ -693,6 +709,28 @@ LogicalResult controlCodeLoopUnroll(mlir::ModuleOp moduleOp) {
 }
 
 
+// TODO(jornt): duplicate, add to cleanup pass
+LogicalResult mergeTiles(mlir::ModuleOp moduleOp) {
+  llvm::outs() << "mergeTiles\n";
+  IRRewriter rewriter(moduleOp.getContext());
+  moduleOp.walk([&](AMDAIE::AIERegionOp regionOp) {
+    DenseMap<std::tuple<int,int>, xilinx::AIE::TileOp> tileMap;
+    regionOp->walk([&](xilinx::AIE::TileOp op) {
+      auto loc = std::make_tuple(op.colIndex(), op.rowIndex());
+      if (!tileMap.contains(loc)) {
+        tileMap[loc] = op;
+      } else {
+        rewriter.replaceAllUsesWith(op.getResult(), tileMap[loc].getResult());
+        rewriter.eraseOp(op);
+      }
+      return WalkResult::advance();
+    });
+    return WalkResult::advance();
+  });
+  return success();
+}
+
+
 class AMDAIEPrepareForAIEPass
     : public impl::AMDAIEPrepareForAIEBase<AMDAIEPrepareForAIEPass> {
  public:
@@ -719,6 +757,9 @@ void AMDAIEPrepareForAIEPass::runOnOperation() {
     return signalPassFailure();
   }
   if (failed(controlCodeLoopUnroll(getOperation()))) {
+    return signalPassFailure();
+  }
+  if (failed(mergeTiles(getOperation()))) {
     return signalPassFailure();
   }
 }

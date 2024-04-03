@@ -56,13 +56,14 @@ LogicalResult dmaToControlCode(mlir::ModuleOp moduleOp) {
           dmaOp.getSrcSizes(),
           dmaOp.getSrcStrides()
         );
+        auto logicalObjFifo = !srcMemSpace ? dmaOp.getSrc() : dmaOp.getDst();
         rewriter.setInsertionPointToEnd(newEndBlock);
         rewriter.create<AMDAIE::IpuDmaWaitOp>(
           rewriter.getUnknownLoc(),
           SmallVector<Type, 1>{},
           ipuDmaCpy.getResult(),
+          logicalObjFifo
           // ipuDmaCpy.getDst()
-          dmaOp.getDst()
         );
         // if (!dstMemSpace) {
         //   // L2 -> L3
