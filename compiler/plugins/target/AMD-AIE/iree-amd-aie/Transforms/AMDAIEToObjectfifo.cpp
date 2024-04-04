@@ -28,12 +28,14 @@
 
 #define DEBUG_TYPE "iree-amdaie-to-objectfifo"
 
+using namespace xilinx;
+
 namespace mlir::iree_compiler::AMDAIE {
 
 namespace {
 
 
-//// Pattern to rewriter scf.forall -> scf.parallel after bufferization.
+//// Pattern to rewrite air::DmaMemcpyNdOp to AMDAIE::DmaCpyNdOp
 class DmaMemcpyNdToLogicalObjectfifo : public OpRewritePattern<xilinx::air::DmaMemcpyNdOp> {
   using OpRewritePattern<xilinx::air::DmaMemcpyNdOp>::OpRewritePattern;
 
@@ -42,16 +44,17 @@ class DmaMemcpyNdToLogicalObjectfifo : public OpRewritePattern<xilinx::air::DmaM
 
     auto srcType = op.getSrc().getType().cast<MemRefType>();
     auto dstType = op.getDst().getType().cast<MemRefType>();
-    rewriter.setInsertionPointToStart(op->getBlock());
-    AMDAIE::LogicalObjectFifoFromMemref src = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
+    // rewriter.setInsertionPointToStart(op->getBlock());
+    rewriter.setInsertionPointAfter(op.getSrc().getDefiningOp());
+    auto src = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
       rewriter.getUnknownLoc(), AMDAIEObjectFifoType::get(srcType), op.getSrc()
     );
-    AMDAIE::LogicalObjectFifoFromMemref dst = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
+    rewriter.setInsertionPointAfter(op.getDst().getDefiningOp());
+    auto dst = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
       rewriter.getUnknownLoc(), AMDAIEObjectFifoType::get(dstType), op.getDst()
     );
 
     rewriter.setInsertionPoint(op);
-    // AMDAIE::DmaCpyNdOp dmaCopy = 
     rewriter.create<AMDAIE::DmaCpyNdOp>(
       op.getLoc(),
       rewriter.getIndexType(), // SmallVector<Type, 1>{}, // rewriter.getIndexType(),
@@ -64,7 +67,6 @@ class DmaMemcpyNdToLogicalObjectfifo : public OpRewritePattern<xilinx::air::DmaM
       op.getSrcSizes(),
       op.getSrcStrides()
     );
-    // rewriter.replaceOp(op, dmaCopy);
     rewriter.eraseOp(op);
     return success();
   }
@@ -101,23 +103,18 @@ class SCFForAllToLogicalObjectfifo : public OpRewritePattern<scf::ForallOp> {
 
       auto srcType = op.getSrc().getType().cast<MemRefType>();
       auto dstType = op.getDst().getType().cast<MemRefType>();
-      rewriter.setInsertionPointToStart(forallOp->getBlock());
-      AMDAIE::LogicalObjectFifoFromMemref src = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
+      // rewriter.setInsertionPointToStart(forallOp->getBlock());
+      rewriter.setInsertionPointAfter(op.getSrc().getDefiningOp());
+      auto src = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
         forallOp.getLoc(), AMDAIEObjectFifoType::get(srcType), op.getSrc()
       );
-      AMDAIE::LogicalObjectFifoFromMemref dst = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
+      rewriter.setInsertionPointAfter(op.getDst().getDefiningOp());
+      auto dst = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
         forallOp.getLoc(), AMDAIEObjectFifoType::get(dstType), op.getDst()
       );
       // rewriter.setInsertionPoint(forallOp);
 
       rewriter.setInsertionPoint(op);
-      // AMDAIE::LogicalObjectFifoFromMemref src = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
-      //   forallOp.getLoc(), AMDAIEObjectFifoType::get(srcType), op.getSrc()
-      // );
-      // AMDAIE::LogicalObjectFifoFromMemref dst = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
-      //   forallOp.getLoc(), AMDAIEObjectFifoType::get(dstType), op.getDst()
-      // );
-      // AMDAIE::DmaCpyNdOp dmaCopy = 
       rewriter.create<AMDAIE::DmaCpyNdOp>(
         op.getLoc(),
         rewriter.getIndexType(), // rewriter.getIndexType(), // SmallVector<Type, 1>{}, // rewriter.getIndexType(),
@@ -434,21 +431,16 @@ LogicalResult cleanupLogicalObjectFifoFromMemref(mlir::ModuleOp moduleOp) {
     }
     return WalkResult::advance();
   });
-  // TODO some still used?? Something wrong here. To be debugged, but ok for now.
-  // for (auto op : toBeErased) {
-  //   if (op->use_empty())
-  //     rewriter.eraseOp(op);
-  //   else
-  //     llvm::outs() << "Still used: " << op << "\n";
-  // }
   return success();
 }
 
-LogicalResult distributeLogicalObjectFifos(mlir::ModuleOp moduleOp) {
+/// 
+LogicalResult distributeLogicalObjectFifosOnL2(mlir::ModuleOp moduleOp) {
   auto isBeforeInBlock = [](Operation *a, Operation *b) -> bool {
     return a->isBeforeInBlock(b);
   };
   IRRewriter rewriter(moduleOp.getContext());
+  // 1) Distribute on L2
   auto res = moduleOp.walk([&](AMDAIE::LogicalObjectFifoFromMemref logicalObjectFifo) {
     // Focus just on L2 for now
     auto memSpace = logicalObjectFifo.getMemrefType().getMemorySpace();
@@ -472,7 +464,7 @@ LogicalResult distributeLogicalObjectFifos(mlir::ModuleOp moduleOp) {
     // TODO(jornt): simplify this nested logic
     for (auto regionOp : regions) {
       llvm::outs() << "REGION: " << &regionOp << "\n";
-      // Sort dma users
+      // Sort dma users on order in block
       SmallVector<AMDAIE::DmaCpyNdOp> users;
       for (auto userOp : logicalObjectFifo->getUsers()) {
         if (auto dmaOp = dyn_cast<AMDAIE::DmaCpyNdOp>(userOp);
@@ -489,10 +481,11 @@ LogicalResult distributeLogicalObjectFifos(mlir::ModuleOp moduleOp) {
         if (logicalObjectFifo == dmaOp.getDstObjectFifo()) {
           producers.push_back(dmaOp);
         } else if (logicalObjectFifo == dmaOp.getSrcObjectFifo() &&
-            logicalObjectFifo.getType().cast<AMDAIEObjectFifoType>().getStaticSize() ==
-            dmaOp.getDstObjectFifo().getType().cast<AMDAIEObjectFifoType>().getStaticSize()) {
+                   logicalObjectFifo.getType().cast<AMDAIEObjectFifoType>().getStaticSize() ==
+                   dmaOp.getDstObjectFifo().getType().cast<AMDAIEObjectFifoType>().getStaticSize()) {
           llvm::outs() << "--parallel op: " << dmaOp << "\n";
           
+          // Allocate new memory on L1 for the new objectfifo
           rewriter.setInsertionPoint(logicalObjectFifo);
           auto newAlloc = rewriter.create<memref::AllocOp>(rewriter.getUnknownLoc(), logicalObjectFifo.getMemrefType());
           llvm::outs() << "--new alloc op: " << newAlloc << "\n";
@@ -501,6 +494,8 @@ LogicalResult distributeLogicalObjectFifos(mlir::ModuleOp moduleOp) {
           auto newLogicalObjectFifo = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
             rewriter.getUnknownLoc(), logicalObjectFifo.getType().cast<AMDAIEObjectFifoType>(), newAlloc.getResult()
           );
+
+          // Insert the new updated DMA op
           rewriter.setInsertionPoint(dmaOp);
           // TODO(jornt): use setOperand instead?
           auto newDmaOp = rewriter.create<AMDAIE::DmaCpyNdOp>(
@@ -542,19 +537,104 @@ LogicalResult distributeLogicalObjectFifos(mlir::ModuleOp moduleOp) {
           auto dealloc = rewriter.create<memref::DeallocOp>(rewriter.getUnknownLoc(), newAlloc);
           dealloc->moveBefore(&parentBlock->back());
         }
-        // }   
       }
     }
-    // TODO(jornt): not sure why this is necessary?
-    // logicalObjectFifo->dropAllUses();
-    // llvm::outs() << "--uses: " << logicalObjectFifo->use_empty() << "\n";
-    // if (!logicalObjectFifo->use_empty()) {
-    //   for (auto user : logicalObjectFifo->getUsers())
-    //     llvm::outs() << "--user: " << user << "\n";
-    // }
     return WalkResult::advance();
   });
   if (res.wasInterrupted())
+    return failure();
+  return success();
+}
+
+LogicalResult distributeLogicalObjectFifosOnL1(mlir::ModuleOp moduleOp) {
+  llvm::outs() << "distributeLogicalObjectFifosOnL1: " << moduleOp << "\n";
+  IRRewriter rewriter(moduleOp.getContext());
+  // 1) Distribute on L1
+  auto resL1 = moduleOp.walk([&](AMDAIE::LogicalObjectFifoFromMemref logicalObjectFifo) {
+    if (logicalObjectFifo.use_empty()) {
+      return WalkResult::advance();
+    }
+    auto memSpace = logicalObjectFifo.getMemrefType().getMemorySpace();
+    if (!memSpace || dyn_cast<IntegerAttr>(memSpace).getInt() != 2) {
+      return WalkResult::advance();
+    }
+    
+    llvm::outs() << "Distribute on L1: " << logicalObjectFifo << "\n";
+    auto alloc = logicalObjectFifo.getMemref();
+    auto allocOp = dyn_cast<memref::AllocOp>(alloc.getDefiningOp());
+    auto *allocBlock = allocOp->getBlock();
+    llvm::outs() << allocBlock << "\n";
+
+    //
+    DenseMap<std::tuple<int, int>, DenseSet<OpOperand *>> tilesToUses;
+    SmallVector<DenseSet<std::tuple<int, int>>> tileRegions;
+    // DenseMap<memref::AllocOp, DenseMap<CoreOp> >
+
+    //
+    for (auto &use : logicalObjectFifo->getUses()) {
+      auto *userOp = use.getOwner();
+      llvm::outs() << "--userOp: " << userOp << "\n";
+      if (auto dmaOp = dyn_cast<AMDAIE::DmaCpyNdOp>(userOp)) {
+        llvm::outs() << "--dmaOp: " << dmaOp << "\n";
+        // llvm::SmallSetVector<AIE::CoreOp, 16> coreUsers;
+        // llvm::DenseSet<AIE::TileOp> tileUsers;
+        DenseSet<std::tuple<int, int>> tileRegion; 
+        for (auto *dmaUserOp : dmaOp->getUsers()) {
+          if (auto coreOp = dmaUserOp->getParentOfType<AIE::CoreOp>()) {
+            auto tileOp = coreOp.getTileOp();
+            auto key = std::make_tuple(tileOp.colIndex(), tileOp.rowIndex());
+            tileRegion.insert(key);
+            if (!tilesToUses.contains(key)) {
+              DenseSet<OpOperand *> operands;
+              tilesToUses[key] = operands;
+            }
+            tilesToUses[key].insert(&use);
+            // coreUsers.insert(coreOp);
+            // tileUsers.insert(coreOp.getTileOp());
+          }
+        }
+        if (llvm::find(tileRegions, tileRegion) == tileRegions.end()) {
+          llvm::outs() << "Add tileRegion" << "\n";
+          tileRegions.push_back(tileRegion);
+        }
+      }
+    }
+    llvm::outs() << "tileRegions Size: " << tileRegions.size() << "\n";
+    llvm::outs() << "tilesToUses Size: " << tilesToUses.size() << "\n";
+    for (auto tileRegion : tileRegions) {
+      rewriter.setInsertionPoint(allocOp);
+      auto newAlloc = rewriter.create<memref::AllocOp>(rewriter.getUnknownLoc(), logicalObjectFifo.getMemrefType());
+      llvm::outs() << "--newAlloc: " << newAlloc << "\n";
+      // rewriter.setInsertionPoint(logicalObjectFifo);
+      // rewriter.setInsertionPoint(allocOp);
+      auto newLogicalObjectFifo = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
+        rewriter.getUnknownLoc(), logicalObjectFifo.getType().cast<AMDAIEObjectFifoType>(), newAlloc.getResult()
+      );
+      rewriter.setInsertionPoint(allocOp);
+      auto dealloc = rewriter.create<memref::DeallocOp>(rewriter.getUnknownLoc(), newAlloc);
+      dealloc->moveBefore(&allocBlock->back());
+
+      for (auto tileLoc : tileRegion) {
+        // // Replace all uses of the old alloc in the cores as indicated by the logical objectfifo.
+        // // This is to distribute, but using the same memory for broadcasted data.
+        rewriter.replaceUsesWithIf(alloc, newAlloc, [&](OpOperand &use) {
+          auto coreOp = use.getOwner()->getParentOfType<AIE::CoreOp>();
+          if (!coreOp)
+            return false;
+          auto tileOp = coreOp.getTileOp();
+          auto tileKey = std::make_tuple(tileOp.colIndex(), tileOp.rowIndex());
+          llvm::outs() << "--ALLOC replaceUsesWithIf: " << (tileKey == tileLoc) << "\n";
+          return (tileKey == tileLoc); // tileUsers.contains(coreOp.getTileOp());
+        });
+        rewriter.replaceUsesWithIf(logicalObjectFifo, newLogicalObjectFifo, [&](OpOperand &use) {
+          llvm::outs() << "--logicalObjectFifo replaceUsesWithIf: " << tilesToUses[tileLoc].contains(&use) << "\n";
+          return tilesToUses[tileLoc].contains(&use);
+        });
+      }
+    }
+    return WalkResult::advance();
+  });
+  if (resL1.wasInterrupted())
     return failure();
   return success();
 }
@@ -593,7 +673,10 @@ void AMDAIEToObjectfifoPass::runOnOperation() {
   if (failed(cleanupLogicalObjectFifoFromMemref(getOperation()))) {
     return signalPassFailure();
   }
-  if (failed(distributeLogicalObjectFifos(getOperation()))) {
+  if (failed(distributeLogicalObjectFifosOnL2(getOperation()))) {
+    return signalPassFailure();
+  }
+  if (failed(distributeLogicalObjectFifosOnL1(getOperation()))) {
     return signalPassFailure();
   }
   if (failed(cleanupLogicalObjectFifoFromMemref(getOperation()))) {

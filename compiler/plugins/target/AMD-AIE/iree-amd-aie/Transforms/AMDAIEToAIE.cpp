@@ -23,26 +23,82 @@ namespace mlir::iree_compiler::AMDAIE {
 
 namespace {
 
-LogicalResult assignAieTiles(mlir::ModuleOp moduleOp) {
-  IRRewriter rewriter(moduleOp.getContext());
-  auto walkResult = moduleOp.walk([&](AMDAIE::LogicalObjectFifoFromMemref logicalObjectFifo) {
+
+/// Return the tiles of the sources of the users of this logical objectfifo.
+/// TODO(jornt): refactor to util or member method
+SmallVector<AIE::TileOp, 16> getUserSrcTiles(AMDAIE::LogicalObjectFifoFromMemref logicalObjectFifo) {
+  llvm::SmallSetVector<AIE::TileOp, 16> tiles;
+  for (auto *user : logicalObjectFifo->getUsers()) {
+    if (auto dmaOp = dyn_cast<AMDAIE::DmaCpyNdOp>(user)) {
+      auto tileIndices = dyn_cast<AMDAIE::LogicalObjectFifoFromMemref>(dmaOp.getSrc().getDefiningOp()).getTiles();
+      for (auto index : tileIndices)
+        tiles.insert(dyn_cast<AIE::TileOp>(index.getDefiningOp()));
+    }
+  }
+  return tiles.takeVector();
+}
+
+/// Return the tiles of the destinations of the users of this logical objectfifo.
+/// TODO(jornt): refactor to util or member method
+SmallVector<AIE::TileOp, 16> getUserDstTiles(AMDAIE::LogicalObjectFifoFromMemref logicalObjectFifo) {
+  llvm::SmallSetVector<AIE::TileOp, 16> tiles;
+  for (auto *user : logicalObjectFifo->getUsers()) {
+    if (auto dmaOp = dyn_cast<AMDAIE::DmaCpyNdOp>(user)) {
+      auto tileIndices = dyn_cast<AMDAIE::LogicalObjectFifoFromMemref>(dmaOp.getDst().getDefiningOp()).getTiles();
+      for (auto index : tileIndices)
+        tiles.insert(dyn_cast<AIE::TileOp>(index.getDefiningOp()));
+    }
+  }
+  return tiles.takeVector();
+}
+
+
+/// Assign physical AIE tiles to logical objectfifos.
+/// TODO(jornt): The logic here is quite hardcoded and will need to be generalized.
+/// At some point, we probably need some AIE device model go guide the assignement here 
+/// to avoid resource issues down below.
+class AssignAieTiles : public OpRewritePattern<AMDAIE::LogicalObjectFifoFromMemref> {
+  using OpRewritePattern<AMDAIE::LogicalObjectFifoFromMemref>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(AMDAIE::LogicalObjectFifoFromMemref logicalObjectFifo,
+                                PatternRewriter &rewriter) const override {
+    if (!logicalObjectFifo.getTiles().empty()) {
+      return failure();
+    }
     Block *aieRegionBlock = &logicalObjectFifo->getParentOfType<AMDAIE::AIERegionOp>().getRegion().front();
     rewriter.setInsertionPointToStart(aieRegionBlock);
     auto memSpace = logicalObjectFifo.getMemrefType().getMemorySpace();
-    // Very hardcoded for now to (0, 0) and (0, 1). Needs generalization.
-    SmallVector<OpFoldResult> tileResults;
-    if (!memSpace) {
-      tileResults.push_back(rewriter.create<xilinx::AIE::TileOp>(rewriter.getUnknownLoc(), 0, 0).getResult());
-    } else if (dyn_cast<IntegerAttr>(memSpace).getInt() == 1) {
-      tileResults.push_back(rewriter.create<xilinx::AIE::TileOp>(rewriter.getUnknownLoc(), 0, 1).getResult());
+    SmallVector<Value> tileResults;
+    // if (!memSpace) {
+    //   // L3/Shim tiles
+    //   tileResults.push_back(rewriter.create<AIE::TileOp>(rewriter.getUnknownLoc(), 0, 0).getResult());
+    // } else 
+    if (!memSpace || dyn_cast<IntegerAttr>(memSpace).getInt() == 1) {
+      // HandLe both L3/shim and L2/Memtiles. Try to use memtiles in the same column as the AIE tiles 
+      // where the data needs to go to.
+      // TODO(jornt): If multiple src/dst tiles, use first tile for now to determine column. Can be extended.
+      int row = memSpace ? 1 : 0;
+      auto userDstTiles = getUserDstTiles(logicalObjectFifo);
+      auto userSrcTiles = getUserSrcTiles(logicalObjectFifo);
+      if (!userDstTiles.empty()) {
+        auto col = userDstTiles[0].colIndex();
+        tileResults.push_back(rewriter.create<AIE::TileOp>(rewriter.getUnknownLoc(), col, row).getResult());
+      } else if (!userSrcTiles.empty()) {
+        auto col = userSrcTiles[0].colIndex();
+        tileResults.push_back(rewriter.create<AIE::TileOp>(rewriter.getUnknownLoc(), col, row).getResult());
+      } else {
+        // Don't assign this logicalObjectFifo to a physical tile (yet!). Wait for other logical objectfifos to
+        // be assigned first.
+        return failure();
+      }
+      // tileResults.push_back(rewriter.create<AIE::TileOp>(rewriter.getUnknownLoc(), 0, 1).getResult());
     } else if (dyn_cast<IntegerAttr>(memSpace).getInt() == 2) {
-      // Add core tiles that use this logical objectfifo
+      // L1/AIE core tiles: add core tiles that use this logical objectfifo
       for (auto userOp : logicalObjectFifo->getUsers()) {
         if (auto dmaOp = dyn_cast<AMDAIE::DmaCpyNdOp>(userOp)) {
           for (auto dmaUserOp : dmaOp->getUsers()) {
-            if (auto coreParentOp = dmaUserOp->getParentOfType<xilinx::AIE::CoreOp>()) {
-              if (llvm::find(tileResults, (OpFoldResult) coreParentOp.getTileOp().getResult()) == tileResults.end()) {
-                // llvm::outs() << "coreParentOp: " << coreParentOp << "\n";
+            if (auto coreParentOp = dmaUserOp->getParentOfType<AIE::CoreOp>()) {
+              if (llvm::find(tileResults, coreParentOp.getTileOp().getResult()) == tileResults.end()) { // (OpFoldResult) 
                 tileResults.push_back(coreParentOp.getTileOp().getResult());
                 rewriter.moveOpAfter(coreParentOp.getTileOp(), aieRegionBlock, aieRegionBlock->begin());
               } 
@@ -52,26 +108,31 @@ LogicalResult assignAieTiles(mlir::ModuleOp moduleOp) {
       }
     } else {
       logicalObjectFifo.emitError("found logical objectfifo with unknown memory space");
-      return WalkResult::interrupt();
+      return failure();
     }
-    if (!tileResults.empty()) {
-      // TODO(jornt): can we just update the current LogicalObjectFifoFromMemref?
-      rewriter.setInsertionPoint(logicalObjectFifo);
-      auto newLogicalObjectFifo = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
-        rewriter.getUnknownLoc(),
-        logicalObjectFifo.getOutput().getType().cast<AMDAIEObjectFifoType>(),
-        logicalObjectFifo.getMemref(),
-        getValueOrCreateConstantIndexOp(rewriter, rewriter.getUnknownLoc(), tileResults)
-      );
-      rewriter.replaceAllUsesWith(logicalObjectFifo, newLogicalObjectFifo);
-      rewriter.eraseOp(logicalObjectFifo);
+    if (tileResults.empty()) {
+      return failure();
     }
-    return WalkResult::advance();
-  });
-  if (walkResult.wasInterrupted())
-    return failure();
-  return success();
-}
+    SmallVector<Value> objFifoTiles = logicalObjectFifo.getTiles();
+    DenseSet<Value> tileSet(objFifoTiles.begin(), objFifoTiles.end());
+    if (llvm::all_of(tileResults, [&](Value val) { return tileSet.contains(val); })) {
+      return failure();
+    }
+    
+    // TODO(jornt): can we just update the current LogicalObjectFifoFromMemref?
+    rewriter.setInsertionPoint(logicalObjectFifo);
+    auto newLogicalObjectFifo = rewriter.create<AMDAIE::LogicalObjectFifoFromMemref>(
+      rewriter.getUnknownLoc(),
+      logicalObjectFifo.getOutput().getType().cast<AMDAIEObjectFifoType>(),
+      logicalObjectFifo.getMemref(),
+      // getValueOrCreateConstantIndexOp(rewriter, rewriter.getUnknownLoc(), tileResults)
+      tileResults
+    );
+    rewriter.replaceAllUsesWith(logicalObjectFifo, newLogicalObjectFifo);
+    rewriter.eraseOp(logicalObjectFifo);
+    return success();
+  }
+};
 
 Operation *getParentOpInBlock(Block* block, Operation *op) {
   if (!op || op->getBlock() == block)
@@ -744,6 +805,7 @@ class AMDAIEPrepareForAIEPass
 };
 
 void AMDAIEPrepareForAIEPass::runOnOperation() {
+  MLIRContext *context = &getContext();
   if (failed(consumeToAcquireRelease(getOperation()))) {
     return signalPassFailure();
   }
@@ -753,7 +815,9 @@ void AMDAIEPrepareForAIEPass::runOnOperation() {
   if (failed(addExplicitLogicalObjectfifoLinks(getOperation()))) {
     return signalPassFailure();
   }
-  if (failed(assignAieTiles(getOperation()))) {
+  RewritePatternSet patterns(context);
+  patterns.insert<AssignAieTiles>(context);
+  if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(patterns)))) {
     return signalPassFailure();
   }
   if (failed(controlCodeLoopUnroll(getOperation()))) {
