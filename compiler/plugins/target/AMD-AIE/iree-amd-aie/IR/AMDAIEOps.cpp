@@ -329,12 +329,29 @@ LogicalObjectFifoFromMemrefOp CircularDmaCpyNdOp::getTargetObjectFifo() {
 };
 
 //===----------------------------------------------------------------------===//
+// AMDAIE_LogicalObjectFifoAccess
+//===----------------------------------------------------------------------===//
+
+void LogicalObjectFifoAccessOp::build(OpBuilder &b,
+                                      mlir::OperationState &result,
+                                      Value input,
+                                      MemoryAccess accessType) {
+  auto type =
+      llvm::cast<LogicalObjectFifoType>(input.getType());
+  build(b, result, type.getElementType(), input, accessType);
+}
+
+LogicalObjectFifoFromMemrefOp LogicalObjectFifoAccessOp::getLogicalObjectFifo() {
+  return dyn_cast<LogicalObjectFifoFromMemrefOp>(getInput().getDefiningOp());
+};
+
+//===----------------------------------------------------------------------===//
 // AMDAIE_LogicalObjectFifoAcquire
 //===----------------------------------------------------------------------===//
 
 void LogicalObjectFifoAcquire::build(OpBuilder &b, mlir::OperationState &result,
-                                     Value dma, LogicalObjectFifoPort port) {
-  build(b, result, dma, port, b.getI32IntegerAttr(1));
+                                     mlir::TypeRange resultTypes, Value dma, LogicalObjectFifoPort port) {
+  build(b, result, resultTypes, dma, port, b.getI32IntegerAttr(1));
 }
 
 //===----------------------------------------------------------------------===//
@@ -361,11 +378,16 @@ LogicalResult LogicalObjectFifoFromMemrefOp::canonicalize(
   };
   SmallVector<Value> tiles = logicalObjectFifo.getTiles();
   if (llvm::is_sorted(tiles, comparator)) {
+    // Still erase duplicates.
+    tiles.erase(std::unique(tiles.begin(), tiles.end()), tiles.end());
     return success();
   }
 
-  // If tiles are not sorted, sort them and replace the logical objectfifo
+  // If tiles are not sorted, sort them, erase duplicates and replace the
+  // logical objectfifo.
   llvm::sort(tiles.begin(), tiles.end(), comparator);
+  tiles.erase(std::unique(tiles.begin(), tiles.end()), tiles.end());
+
   rewriter.replaceOpWithNewOp<AMDAIE::LogicalObjectFifoFromMemrefOp>(
       logicalObjectFifo,
       llvm::cast<LogicalObjectFifoType>(

@@ -25,83 +25,185 @@ Operation *getParentOpInBlock(Block *block, Operation *op) {
 
 /// Walk all consume/produce operations within the core operations and insert
 /// semaphore operations.
-template <typename OpTy>
-LogicalResult consumeProduceToAcquireRelease(Operation *parentOp) {
-  using IteratorType = std::conditional_t<
-      std::is_same<OpTy, AMDAIE::LogicalObjectFifoConsume>::value,
-      ForwardIterator, ReverseIterator>;
-  using SemaphoreTypeAtOp = std::conditional_t<
-      std::is_same<OpTy, AMDAIE::LogicalObjectFifoConsume>::value,
-      AMDAIE::LogicalObjectFifoAcquire, AMDAIE::LogicalObjectFifoRelease>;
-  using SemaphoreTypeAtOtherEndOfBlock = std::conditional_t<
-      std::is_same<OpTy, AMDAIE::LogicalObjectFifoConsume>::value,
-      AMDAIE::LogicalObjectFifoRelease, AMDAIE::LogicalObjectFifoAcquire>;
-
+// template <typename OpTy>
+LogicalResult readAccessToAcquireRelease(Operation *parentOp) {
   IRRewriter rewriter(parentOp->getContext());
-  auto walkResult = parentOp->walk([&](AMDAIE::CoreOp coreOp) {
-    IRMapping mapper;
-    coreOp->walk<WalkOrder::PostOrder, IteratorType>([&](OpTy op) {
-      rewriter.setInsertionPoint(op);
-      rewriter.create<SemaphoreTypeAtOp>(rewriter.getUnknownLoc(), op.getDma(),
-                                         op.getPort());
 
-      // Retrieve the DMA operation for this consume/produce and check whether
-      // it was encountered before. Add it to the map and advance if not.
-      Operation *dmaOp = op.getDma().getDefiningOp();
-      if (!mapper.contains(dmaOp)) {
-        mapper.map(dmaOp, op.getOperation());
-        return WalkResult::advance();
-      }
+  SmallVector<AMDAIE::CoreOp> coreOps;
+  parentOp->walk([&](AMDAIE::CoreOp coreOp) { coreOps.push_back(coreOp); });
 
-      // Find the new consume/produce operation's parent operation within the
-      // same block as the previous operation of the same type and operating on
-      // the same DMA. Use this parent operation in the same block to set the
-      // insertion point either before or after depending on whether the
-      // iteration is happening in forward or backward fashion.
-      auto parentOpInBlock =
-          getParentOpInBlock(mapper.lookup(dmaOp)->getBlock(), op);
-      if (parentOpInBlock) {
-        if (std::is_same<IteratorType, ForwardIterator>::value) {
-          rewriter.setInsertionPoint(parentOpInBlock);
-        } else {
-          rewriter.setInsertionPointAfter(parentOpInBlock);
-        }
+  // Map from DMA source/target logical objectFifos to those respective DMA
+  // operations.
+  DenseMap<Value, AMDAIE::CircularDmaCpyNdOp> logicalObjectFifoToDma;
+  parentOp->walk([&](AMDAIE::CircularDmaCpyNdOp dmaOp) {
+    logicalObjectFifoToDma[dmaOp.getSource()] = dmaOp;
+    logicalObjectFifoToDma[dmaOp.getTarget()] = dmaOp;
+  });
+
+  for (AMDAIE::CoreOp coreOp : coreOps) {
+    DenseMap<Value, AMDAIE::LogicalObjectFifoAccessOp>
+        logicalObjectFifoToLastAccess;
+    WalkResult res =
+        coreOp->walk([&](AMDAIE::LogicalObjectFifoAccessOp accessOp) {
+          if (accessOp.getAccessType() != AMDAIE::MemoryAccess::Read)
+            return WalkResult::advance();
+
+          if (logicalObjectFifoToLastAccess.contains(accessOp.getInput())) {
+            rewriter.setInsertionPoint(accessOp);
+            rewriter.create<AMDAIE::LogicalObjectFifoRelease>(
+                rewriter.getUnknownLoc(),
+                logicalObjectFifoToDma[accessOp.getInput()].getResult(),
+                LogicalObjectFifoPort::Consume);
+          }
+
+          if (!logicalObjectFifoToDma.contains(accessOp.getInput())) {
+            accessOp.emitOpError() << "not found as source of DMA operation";
+            return WalkResult::interrupt();
+          }
+          rewriter.setInsertionPoint(accessOp);
+          auto acquireOp = rewriter.create<AMDAIE::LogicalObjectFifoAcquire>(
+              rewriter.getUnknownLoc(),
+              llvm::cast<LogicalObjectFifoType>(accessOp.getInput().getType()),
+              logicalObjectFifoToDma[accessOp.getInput()].getResult(),
+              LogicalObjectFifoPort::Consume);
+          auto newAccessOp = rewriter.create<AMDAIE::LogicalObjectFifoAccessOp>(
+              rewriter.getUnknownLoc(), acquireOp.getResult(),
+              AMDAIE::MemoryAccess::Read);
+          rewriter.replaceAllUsesWith(accessOp.getResult(),
+                                      newAccessOp.getResult());
+
+          logicalObjectFifoToLastAccess[accessOp.getInput()] = accessOp;
+          return WalkResult::advance();
+        });
+    if (res.wasInterrupted()) return failure();
+
+    // Insert release for remaining access operations at end of block.
+    for (auto &&[value, accessOp] : logicalObjectFifoToLastAccess) {
+      Block *parentBlock = accessOp->getBlock();
+      if (!parentBlock->back().hasTrait<OpTrait::IsTerminator>()) {
+        rewriter.setInsertionPointToEnd(parentBlock);
       } else {
-        if (std::is_same<IteratorType, ForwardIterator>::value) {
-          rewriter.setInsertionPoint(
-              mapper.lookup(dmaOp)->getBlock()->getTerminator());
-        } else {
-          rewriter.setInsertionPointToStart(mapper.lookup(dmaOp)->getBlock());
-        }
+        rewriter.setInsertionPoint(parentBlock->getTerminator());
       }
+      if (!logicalObjectFifoToDma.contains(accessOp.getInput())) {
+        accessOp.emitOpError() << "not found as source of DMA operation";
+        return failure();
+      }
+      rewriter.create<AMDAIE::LogicalObjectFifoRelease>(
+          rewriter.getUnknownLoc(), logicalObjectFifoToDma[accessOp.getInput()],
+          LogicalObjectFifoPort::Consume);
+    }
+  }
+  return success();
+}
 
-      // Insert the other semaphore operation and erase the produce/consume
-      // operation.
-      rewriter.create<SemaphoreTypeAtOtherEndOfBlock>(
-          rewriter.getUnknownLoc(), op.getDma(), op.getPort());
-      rewriter.eraseOp(mapper.lookup(dmaOp));
-      mapper.map(dmaOp, op.getOperation());
+/// TODO
+LogicalResult writeAccessToAcquireRelease(Operation *parentOp) {
+  IRRewriter rewriter(parentOp->getContext());
+
+  SmallVector<AMDAIE::CoreOp> coreOps;
+  parentOp->walk([&](AMDAIE::CoreOp coreOp) { coreOps.push_back(coreOp); });
+
+  // Map from DMA source/target logical objectFifos to those respective DMA
+  // operations.
+  DenseMap<Value, AMDAIE::CircularDmaCpyNdOp> logicalObjectFifoToDma;
+  parentOp->walk([&](AMDAIE::CircularDmaCpyNdOp dmaOp) {
+    logicalObjectFifoToDma[dmaOp.getSource()] = dmaOp;
+    logicalObjectFifoToDma[dmaOp.getTarget()] = dmaOp;
+  });
+
+  for (AMDAIE::CoreOp coreOp : coreOps) {
+    DenseMap<Value, SmallVector<AMDAIE::LogicalObjectFifoAccessOp>>
+        logicalObjectFifoToAccesses;
+    DenseMap<Value, AMDAIE::LogicalObjectFifoAccessOp>
+        logicalObjectFifoLastWriteAccesses;
+    WalkResult res = coreOp->walk([&](AMDAIE::LogicalObjectFifoAccessOp
+                                          accessOp) {
+      // llvm::outs() << "Access op: " << accessOp << "\n";
+      // If there is another write op on the same logical objectFifo,
+      // release it before the acquire.
+      if (logicalObjectFifoLastWriteAccesses.contains(accessOp.getInput())) {
+        llvm::outs() << "logicalObjectFifoLastWriteAccesses.contains\n";
+        AMDAIE::LogicalObjectFifoAccessOp prevAccess =
+            logicalObjectFifoLastWriteAccesses[accessOp.getInput()];
+        if (!logicalObjectFifoToDma.contains(prevAccess.getInput())) {
+          prevAccess.emitOpError() << "not found as source of DMA operation";
+          return WalkResult::interrupt();
+        }
+        rewriter.setInsertionPoint(accessOp);
+        rewriter.create<AMDAIE::LogicalObjectFifoRelease>(
+            rewriter.getUnknownLoc(),
+            logicalObjectFifoToDma[prevAccess.getInput()],
+            LogicalObjectFifoPort::Produce);
+        // Remove from last access as settled.
+        logicalObjectFifoLastWriteAccesses.erase(prevAccess.getInput());
+      }
+      // Insert acquire for write access at first `Any` access or at start
+      // of block.
+      if (accessOp.getAccessType() == AMDAIE::MemoryAccess::Write) {
+        if (!logicalObjectFifoToAccesses.contains(accessOp.getInput())) {
+          rewriter.setInsertionPointToStart(accessOp->getBlock());
+        } else {
+          AMDAIE::LogicalObjectFifoAccessOp firstAccess =
+              logicalObjectFifoToAccesses[accessOp.getInput()][0];
+          rewriter.setInsertionPoint(firstAccess);
+        }
+        if (!logicalObjectFifoToDma.contains(accessOp.getInput())) {
+          accessOp.emitOpError() << "not found as source of DMA operation";
+          llvm::outs() << "not found as source of DMA operation\n";
+          return WalkResult::interrupt();
+        }
+        auto acquireOp = rewriter.create<AMDAIE::LogicalObjectFifoAcquire>(
+            rewriter.getUnknownLoc(),
+            llvm::cast<LogicalObjectFifoType>(accessOp.getInput().getType()),
+            logicalObjectFifoToDma[accessOp.getInput()].getResult(),
+            LogicalObjectFifoPort::Produce);
+        auto newAccessOp = rewriter.create<AMDAIE::LogicalObjectFifoAccessOp>(
+            rewriter.getUnknownLoc(), acquireOp.getResult(),
+            AMDAIE::MemoryAccess::Write);
+
+        // Update uses of this access operation and the preceding ones.
+        rewriter.replaceAllUsesWith(accessOp.getResult(),
+                                    newAccessOp.getResult());
+        if (logicalObjectFifoToAccesses.contains(accessOp.getInput())) {
+          for (AMDAIE::LogicalObjectFifoAccessOp precedingAccessOp :
+               logicalObjectFifoToAccesses[accessOp.getInput()]) {
+            rewriter.replaceAllUsesWith(precedingAccessOp.getResult(),
+                                        newAccessOp.getResult());
+          }
+        }
+
+        // Insert into last access map
+        logicalObjectFifoLastWriteAccesses[accessOp.getInput()] = accessOp;
+      }
+      // Insert any access operation into first access map.
+      if (!logicalObjectFifoToAccesses.contains(accessOp.getInput())) {
+        logicalObjectFifoToAccesses[accessOp.getInput()] = {accessOp};
+      } else {
+        logicalObjectFifoToAccesses[accessOp.getInput()].push_back(accessOp);
+      }
       return WalkResult::advance();
     });
+    if (res.wasInterrupted()) return failure();
 
-    // Add `SemaphoreTypeAtOtherEndOfBlock` operations for remaining
-    // consume/produce operations at the other end of the blocks.
-    for (auto &&[keyOp, valueOp] : mapper.getOperationMap()) {
-      auto produceConsumeOp = dyn_cast<OpTy>(valueOp);
-      if (std::is_same<OpTy, AMDAIE::LogicalObjectFifoConsume>::value) {
-        rewriter.setInsertionPoint(
-            produceConsumeOp->getBlock()->getTerminator());
+    // Insert release for remaining access operations at end of block.
+    for (auto &&[value, writeAccessOp] : logicalObjectFifoLastWriteAccesses) {
+      Block *parentBlock = writeAccessOp->getBlock();
+      if (!parentBlock->back().hasTrait<OpTrait::IsTerminator>()) {
+        rewriter.setInsertionPointToEnd(parentBlock);
       } else {
-        rewriter.setInsertionPointToStart(produceConsumeOp->getBlock());
+        rewriter.setInsertionPoint(parentBlock->getTerminator());
       }
-      rewriter.create<SemaphoreTypeAtOtherEndOfBlock>(
-          rewriter.getUnknownLoc(), produceConsumeOp.getDma(),
-          produceConsumeOp.getPort());
-      rewriter.eraseOp(produceConsumeOp);
+      if (!logicalObjectFifoToDma.contains(writeAccessOp.getInput())) {
+        writeAccessOp.emitOpError() << "not found as source of DMA operation";
+        return failure();
+      }
+      rewriter.create<AMDAIE::LogicalObjectFifoRelease>(
+          rewriter.getUnknownLoc(),
+          logicalObjectFifoToDma[writeAccessOp.getInput()],
+          LogicalObjectFifoPort::Produce);
     }
-    return WalkResult::advance();
-  });
-  if (walkResult.wasInterrupted()) return failure();
+  }
   return success();
 }
 
@@ -120,14 +222,20 @@ class AMDAIEConsumeProduceToAcquireReleasePass
 };
 
 void AMDAIEConsumeProduceToAcquireReleasePass::runOnOperation() {
-  if (failed(consumeProduceToAcquireRelease<AMDAIE::LogicalObjectFifoConsume>(
-          getOperation()))) {
+  Operation *parentOp = getOperation();
+  if (failed(readAccessToAcquireRelease(parentOp))) {
     return signalPassFailure();
   }
-  if (failed(consumeProduceToAcquireRelease<AMDAIE::LogicalObjectFifoProduce>(
-          getOperation()))) {
+  if (failed(writeAccessToAcquireRelease(parentOp))) {
     return signalPassFailure();
   }
+  // Clean up
+  IRRewriter rewriter(parentOp->getContext());
+  parentOp->walk([&](AMDAIE::LogicalObjectFifoAccessOp accessOp) {
+    if (!isa<AMDAIE::LogicalObjectFifoAcquire>(accessOp.getInput().getDefiningOp())) {
+      rewriter.eraseOp(accessOp);
+    }
+  });
 }
 
 }  // namespace

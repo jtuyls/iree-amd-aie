@@ -319,6 +319,40 @@ def AMDAIE_NpuDmaWaitOp: AMDAIE_Op<"npu.dma_wait", []> {
 // IREE AMDAIE LogicalObjectFifo Ops
 //===----------------------------------------------------------------------===//
 
+def AMDAIE_LogicalObjectFifoAccessOp : AMDAIE_Op<"logicalobjectfifo.access"> {
+  let summary = "TODO";
+  let description = [{
+    TODO
+  }];
+
+  let arguments = (
+    ins AnyAMDAIELogicalObjectFifoType:$input,
+        MemoryAccess:$access_type
+  ); 
+
+  let results = (outs AnyMemRef:$output);
+
+  let assemblyFormat = [{
+    `(` $input `,` $access_type `)`  attr-dict `:` type($input) `->` type($output)
+  }];
+
+  // Build a LogicalObjectFifoFromMemrefOp with just a memref value.
+  let builders = [
+    OpBuilder<(ins "mlir::Value":$input, "MemoryAccess":$access_type)>
+  ];
+
+  let extraClassDeclaration = [{
+    LogicalObjectFifoFromMemrefOp getLogicalObjectFifo();
+  }];
+
+  // The canonicalizer will sort the tile arguments to get deterministic IR.
+  // The comparator first orders on column index and then on row index (if static).
+  // let hasCanonicalizeMethod = 1;
+
+  // let hasVerifier = 1;
+  let cppNamespace = "mlir::iree_compiler::AMDAIE";
+}
+
 def AMDAIE_LogicalObjectFifoAcquire: 
     AMDAIE_Op<"logicalobjectfifo.acquire", []> {
   let summary = "Semaphore operation to acquire objects from a logical"
@@ -350,12 +384,14 @@ def AMDAIE_LogicalObjectFifoAcquire:
         OptionalAttr<I32Attr>:$size
   );
 
+  let results = (outs AnyAMDAIELogicalObjectFifoType:$output);
+
   let assemblyFormat = [{
-    `(` $dma `,` $port `)` attr-dict
+    `(` $dma `,` $port `)` attr-dict `->` type($output)
   }];
 
   let builders = [
-    OpBuilder<(ins "mlir::Value":$dma, "LogicalObjectFifoPort":$port)>,
+    OpBuilder<(ins "mlir::TypeRange":$resultTypes, "mlir::Value":$dma, "LogicalObjectFifoPort":$port)>,
   ];
 }
 

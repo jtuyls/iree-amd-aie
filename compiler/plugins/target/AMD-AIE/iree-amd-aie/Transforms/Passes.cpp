@@ -279,7 +279,7 @@ void addPackPeelBasedPassPipeline(OpPassManager &funcPassManager,
   }
 
   // Vectorization passes
-  appendVectorizationToPipeline(funcPassManager);
+  // appendVectorizationToPipeline(funcPassManager);
   
   // Comprehensive bufferization
   addAMDAIEBufferizePasses(funcPassManager);
@@ -428,14 +428,58 @@ void buildAMDAIETransformPassPipeline(OpPassManager &variantPassManager) {
   });
 }
 
+/// TODO(avarma): Currently adding this as a separate utility until we deprecate
+/// the rest and keep just this as the main set of lowering passes.
+static void addAIELoweringPassesForPackPeel(OpPassManager &passManager) {
+  passManager.addPass(createEraseHALDescriptorTypeFromMemRefPass());
+  passManager.addPass(memref::createFoldMemRefAliasOpsPass());
+  passManager.addPass(createAMDAIEPackToDmaPass());
+  passManager.addPass(xilinx::air::createCopyToDmaPass());
+
+  passManager.addPass(createAMDAIEAIRDmaAMDAIEDmaPass());
+  passManager.addPass(createAMDAIEInsertAIEWorkgroupPass());
+  passManager.addPass(createAMDAIEFuseLogicalObjectFifoIntoWorkgroupPass());
+  passManager.addPass(createCSEPass());
+
+  passManager.addPass(createAMDAIEUnrollAndDistributeWorkgroupPass());
+  passManager.addPass(createCSEPass());
+  passManager.addPass(createCanonicalizerPass());
+
+  passManager.addPass(createAMDAIEDmaToCircularDmaPass());
+  passManager.addNestedPass<func::FuncOp>(createAMDAIECreateAIEWorkgroupPass());
+  passManager.addPass(createCSEPass());
+
+  passManager.addPass(createAMDAIECanonicalizeDoublyStridedOpPass());
+  passManager.addPass(createAMDAIEConsumeProduceToAcquireReleasePass());
+  passManager.addPass(createCSEPass());
+  passManager.addPass(createCanonicalizerPass());
+
+  passManager.addPass(createAMDAIEControlCodeLoopUnrollPass());
+  passManager.addPass(createCSEPass());
+  passManager.addPass(createCanonicalizerPass());
+
+  passManager.addPass(createAMDAIECreateLogicalObjectFifoLinkPass());
+  passManager.addPass(createCanonicalizerPass());
+
+  passManager.addPass(createAMDAIELowerToAIEPass());
+  passManager.addPass(createCanonicalizerPass());
+
+  passManager.addPass(createConvertLinalgToLoopsPass());
+}
+
 // TODO (Erwei): The "packPeel" temporary argument should be removed once
 // pack-peel and pack-pad share the same pass pipeline. See TODOs inlined below
 // for details.
 void addMLIRAIRAIELoweringPasses(OpPassManager &passManager, bool packPeel) {
+  if (packPeel) {
+    addAIELoweringPassesForPackPeel(passManager);
+    return;
+  }
   // Add passes for preparing for lowering to MLIR-AIR
   passManager.addPass(createEraseHALDescriptorTypeFromMemRefPass());
   passManager.addPass(memref::createFoldMemRefAliasOpsPass());
   passManager.addPass(createAMDAIEBridgeToAIRPass());
+  passManager.addPass(createAMDAIEPackToDmaPass());
   // TODO (Erwei): Figure out a way to work with AMDAIEPackToDmaPass.
   if (packPeel)
     passManager.addPass(createAMDAIEDecomposeLinalgExtPackUnPackToAIRPass());
