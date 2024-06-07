@@ -98,6 +98,13 @@ def AMDAIEDecomposeLinalgExtPackUnPackToAIR :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEDecomposeLinalgExtPackUnPackToAIRPass()";
 }
 
+def AMDAIEDistributeCoresAndObjectFifos :
+  Pass<"iree-amdaie-distribute-cores-and-objectfifos", "ModuleOp"> {
+  let summary = "Unroll the scf.forall operations around `amdaie.core` "
+                "operations and distribute the logical objectFifos.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEDistributeCoresAndObjectFifosPass()";
+}
+
 def AMDAIEDmaToCircularDma :
   Pass<"iree-amdaie-dma-to-circular-dma"> {
   let summary = "Convert dma operations to circular dma operations.";
@@ -126,13 +133,6 @@ def AMDAIEFuseFillIntoForall :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEFuseFillIntoForallPass()";
 }
 
-def AMDAIEFuseLogicalObjectFifoIntoWorkgroup :
-    Pass<"iree-amdaie-fuse-logicalobjectfifo-into-workgroup", "ModuleOp"> {
-  let summary = "Fuse or distribute logical objectFifos into workgroups.";
-  let constructor =
-    "mlir::iree_compiler::AMDAIE::createAMDAIEFuseLogicalObjectFifoIntoWorkgroupPass()";
-}
-
 def AMDAIEFusePackIntoLoop :
     InterfacePass<"iree-amdaie-fuse-pack-into-loop", "mlir::FunctionOpInterface"> {
   let summary = "Fuse the pack operations into the innermost for/forall loop.";
@@ -152,10 +152,10 @@ def AMDAIEHoistForLoopAffineApply : Pass<"iree-amdaie-hoist-for-affine-apply"> {
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEHoistForLoopAffineApplyPass()";
 }
 
-def AMDAIEInsertAIEWorkgroup :
-  Pass<"iree-amdaie-insert-aie-workgroup", "ModuleOp"> {
-  let summary = "Insert AIE workgroups around forall loops selected for parallel execution.";
-  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEInsertAIEWorkgroupPass()";
+def AMDAIEInsertCores :
+  Pass<"iree-amdaie-insert-cores", "ModuleOp"> {
+  let summary = "Insert `amdaie.core` operations inside the innermost `scf.forall` operations.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEInsertCoresPass()";
 }
 
 def AMDAIEInsertLoopsForVectorization :
@@ -188,6 +188,13 @@ def AMDAIELinkExecutables :
     Pass<"iree-amdaie-link-executables", "mlir::ModuleOp"> {
   let summary = "Links AMDAIE HAL executables within the top-level program module.";
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIELinkExecutablesPass()";
+}
+
+def AMDAIELocalizeLogicalObjectfifo :
+    Pass<"iree-amdaie-localize-logicalobjectfifo", "ModuleOp"> {
+  let summary = "Localize logical objectfifos to local parallel loop scopes.";
+  let constructor =
+    "mlir::iree_compiler::AMDAIE::createAMDAIELocalizeLogicalObjectFifoPass()";
 }
 
 def AMDAIELowerExecutableTarget :
@@ -357,12 +364,6 @@ def AMDAIEVectorization :
     InterfacePass<"iree-amdaie-vectorization", "mlir::FunctionOpInterface"> {
   let summary = "Convert operations to the vector dialect in an AIE-friendly way.";
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEVectorizationPass()";
-}
-
-def AMDAIEUnrollAndDistributeWorkgroup :
-  Pass<"iree-amdaie-unroll-and-distribute-workgroup", "ModuleOp"> {
-  let summary = "Create pass to unroll operations within AIE workgroups and distribute the logical objectFifos.";
-  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEUnrollAndDistributeWorkgroupPass()";
 }
 
 #endif // IREE_AMD_AIE_TRANSFORMS_PASSES

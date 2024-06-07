@@ -437,11 +437,11 @@ static void addAIELoweringPassesForPackPeel(OpPassManager &passManager) {
   passManager.addPass(xilinx::air::createCopyToDmaPass());
 
   passManager.addPass(createAMDAIEAIRDmaAMDAIEDmaPass());
-  passManager.addPass(createAMDAIEInsertAIEWorkgroupPass());
-  passManager.addPass(createAMDAIEFuseLogicalObjectFifoIntoWorkgroupPass());
+  passManager.addPass(createAMDAIEInsertCoresPass());
+  passManager.addPass(createAMDAIELocalizeLogicalObjectFifoPass());
   passManager.addPass(createCSEPass());
 
-  passManager.addPass(createAMDAIEUnrollAndDistributeWorkgroupPass());
+  passManager.addPass(createAMDAIEDistributeCoresAndObjectFifosPass());
   passManager.addPass(createCSEPass());
   passManager.addPass(createCanonicalizerPass());
 

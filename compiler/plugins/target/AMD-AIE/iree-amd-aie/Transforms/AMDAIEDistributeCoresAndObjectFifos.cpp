@@ -8,6 +8,7 @@
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Transforms.h"
+#include "iree/compiler/Codegen/TransformStrategies/GPU/Common.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/IR/Iterators.h"
@@ -15,9 +16,11 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/LoopInvariantCodeMotionUtils.h"
 
-#define DEBUG_TYPE "iree-amdaie-unroll-and-distribute-workgroup"
+#define DEBUG_TYPE "iree-amdaie-unroll-cores-and-distribute-memory"
 
 namespace mlir::iree_compiler::AMDAIE {
+
+static const llvm::StringLiteral kAMDAIELoopUnroll = "amdaie.unroll";
 
 namespace {
 
@@ -61,6 +64,8 @@ LogicalResult distributeLocalMemoryHack(ModuleOp moduleOp) {
         cast<MemRefType>(allocOp.getResult().getType()).getMemorySpace();
     if (!memSpace || dyn_cast<IntegerAttr>(memSpace).getInt() != 2)
       return WalkResult::advance();
+
+    LLVM_DEBUG(llvm::dbgs() << "Alloc op: " << allocOp << "\n");
 
     SmallVector<AMDAIE::DmaCpyNdOp> dmaUsers;
     for (Operation *userOp : allocOp->getUsers()) {
@@ -130,17 +135,24 @@ LogicalResult distributeLocalMemoryHack(ModuleOp moduleOp) {
         rewriter.replaceOp(dmaOp, newDmaOp);
       }
 
+      LLVM_DEBUG(llvm::dbgs()
+                 << "Before deallocOp\n");
+
       memref::DeallocOp deallocOp;
       for (Operation *userOp : allocOp->getUsers()) {
         if (auto deallocUser = dyn_cast<memref::DeallocOp>(userOp)) {
           deallocOp = deallocUser;
         }
       }
+      LLVM_DEBUG(llvm::dbgs()
+                 << "Before deallocOp if\n");
       if (deallocOp) {
         toBeErased.push_back(deallocOp);
       }
       toBeErased.push_back(allocOp);
     }
+    LLVM_DEBUG(llvm::dbgs()
+                 << "Before advance\n");
     return WalkResult::advance();
   });
 
@@ -156,16 +168,30 @@ LogicalResult distributeLocalMemoryHack(ModuleOp moduleOp) {
 /// TODO(jornt): use upstream `forallToFor` function once merged.
 LogicalResult workgroupForallToFor(ModuleOp moduleOp) {
   IRRewriter rewriter(moduleOp.getContext());
-  WalkResult res = moduleOp->walk([&](AMDAIE::WorkgroupOp workgroupOp) {
-    WalkResult workgroupRes = workgroupOp->walk([&](scf::ForallOp forallOp) {
-      if (failed(scf::forallToForLoop(rewriter, forallOp))) {
-        workgroupOp.emitOpError()
-            << "failed to transform scf.forall to scf.for";
+  WalkResult res = moduleOp->walk([&](scf::ForallOp forallOp) {
+    SmallVector<Attribute> mapping =
+        llvm::to_vector(forallOp.getMapping()->getValue());
+    // We index on thread mapping for core and dma unrolling and buffer
+    // distribution.
+    if (!isa<mlir::gpu::GPUThreadMappingAttr>(*mapping.begin()))
+      return WalkResult::advance();
+
+    SmallVector<Operation *> results;
+    if (failed(scf::forallToForLoop(rewriter, forallOp, &results))) {
+      forallOp.emitOpError() << "failed to transform scf.forall to scf.for";
+      return WalkResult::interrupt();
+    }
+    // Set attribute to unroll this loop later in this pass.
+    for (Operation *res : results) {
+      scf::ForOp forOp = dyn_cast<scf::ForOp>(res);
+      if (!forOp) {
+        forallOp.emitOpError() << "failed to retrieve generated scf.for from "
+                                  "scf::forallToForLoop conversion";
         return WalkResult::interrupt();
       }
-      return WalkResult::advance();
-    });
-    if (workgroupRes.wasInterrupted()) return WalkResult::interrupt();
+      forOp->setAttr(kAMDAIELoopUnroll,
+                     mlir::BoolAttr::get(forOp->getContext(), true));
+    }
     return WalkResult::advance();
   });
   if (res.wasInterrupted()) return failure();
@@ -361,8 +387,11 @@ class AMDAIEUnrollWorkgroupLoops : public OpRewritePattern<scf::ForOp> {
 
   LogicalResult matchAndRewrite(scf::ForOp forOp,
                                 PatternRewriter &rewriter) const override {
-    // Only unroll loops within a workgroup
-    if (!forOp->getParentOfType<AMDAIE::WorkgroupOp>()) return failure();
+    // Only unroll loops only if inidcated to be unrolled earlier in the pass.
+    // if (!forOp->getParentOfType<AMDAIE::WorkgroupOp>()) return failure();
+    if (!forOp->hasAttr(kAMDAIELoopUnroll) ||
+        !cast<BoolAttr>(forOp->getAttr(kAMDAIELoopUnroll)).getValue())
+      return failure();
 
     // Skip for ops with nested for ops. Wait until nested ones get resolved
     // first.
@@ -826,21 +855,21 @@ LogicalResult distributeSharedMemory(ModuleOp moduleOp) {
   return success();
 }
 
-class AMDAIEUnrollAndDistributeWorkgroupPass
-    : public impl::AMDAIEUnrollAndDistributeWorkgroupBase<
-          AMDAIEUnrollAndDistributeWorkgroupPass> {
+class AMDAIEDistributeCoresAndObjectFifosPass
+    : public impl::AMDAIEDistributeCoresAndObjectFifosBase<
+          AMDAIEDistributeCoresAndObjectFifosPass> {
  public:
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<AMDAIEDialect>();
   }
 
-  AMDAIEUnrollAndDistributeWorkgroupPass() = default;
-  AMDAIEUnrollAndDistributeWorkgroupPass(
-      const AMDAIEUnrollAndDistributeWorkgroupPass &pass){};
+  AMDAIEDistributeCoresAndObjectFifosPass() = default;
+  AMDAIEDistributeCoresAndObjectFifosPass(
+      const AMDAIEDistributeCoresAndObjectFifosPass &pass){};
   void runOnOperation() override;
 };
 
-void AMDAIEUnrollAndDistributeWorkgroupPass::runOnOperation() {
+void AMDAIEDistributeCoresAndObjectFifosPass::runOnOperation() {
   MLIRContext *context = &getContext();
   ModuleOp moduleOp = getOperation();
   if (failed(distributeLocalMemoryHack(moduleOp))) {
@@ -897,8 +926,8 @@ void AMDAIEUnrollAndDistributeWorkgroupPass::runOnOperation() {
 
 }  // namespace
 
-std::unique_ptr<Pass> createAMDAIEUnrollAndDistributeWorkgroupPass() {
-  return std::make_unique<AMDAIEUnrollAndDistributeWorkgroupPass>();
+std::unique_ptr<Pass> createAMDAIEDistributeCoresAndObjectFifosPass() {
+  return std::make_unique<AMDAIEDistributeCoresAndObjectFifosPass>();
 }
 
 }  // namespace mlir::iree_compiler::AMDAIE

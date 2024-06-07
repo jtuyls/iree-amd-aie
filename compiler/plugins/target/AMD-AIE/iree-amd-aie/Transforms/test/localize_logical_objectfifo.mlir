@@ -1,4 +1,4 @@
-// RUN: iree-opt --pass-pipeline="builtin.module(iree-amdaie-fuse-logicalobjectfifo-into-workgroup)" %s | FileCheck %s
+// RUN: iree-opt --pass-pipeline="builtin.module(iree-amdaie-localize-logicalobjectfifo)" %s | FileCheck %s
 
 // CHECK-LABEL: @fuse_logical_objectfifo_into_workgroup
 // CHECK:     %[[ALLOC0:.*]] = memref.alloc() : memref<32x1024xi32>
@@ -15,7 +15,7 @@
 // CHECK-SAME:      %[[FROMMEMREF0]]
 // CHECK-SAME:      (!amdaie.logicalobjectfifo<memref<32x64xi32, 1>>, !amdaie.logicalobjectfifo<memref<32x1024xi32>>)
 module {
-  func.func @fuse_logical_objectfifo_into_workgroup() {
+  func.func @localize_logical_objectfifo() {
     %alloc = memref.alloc() : memref<32x1024xi32>
     %alloc_1 = memref.alloc() : memref<32x64xi32, 1>
     %1 = amdaie.logicalobjectfifo.from_memref %alloc, {} : memref<32x1024xi32> -> !amdaie.logicalobjectfifo<memref<32x1024xi32>>

@@ -406,9 +406,6 @@ void AMDAIECreateAIEWorkgroupPass::runOnOperation() {
   if (failed(createSingleWorkgroupAndControlCode(getOperation()))) {
     return signalPassFailure();
   }
-  // if (failed(consolidateLogicalObjectFifos(getOperation()))) {
-  //   return signalPassFailure();
-  // }
 }
 
 }  // namespace

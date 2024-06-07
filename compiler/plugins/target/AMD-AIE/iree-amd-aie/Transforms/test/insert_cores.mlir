@@ -1,4 +1,4 @@
-// RUN: iree-opt --split-input-file --pass-pipeline="builtin.module(iree-amdaie-insert-aie-workgroup)" --verify-diagnostics %s | FileCheck %s
+// RUN: iree-opt --split-input-file --pass-pipeline="builtin.module(iree-amdaie-insert-cores)" --verify-diagnostics %s | FileCheck %s
 
 func.func @insert_aie_workgroup_with_non_normalized_forall() {
   %c2 = arith.constant 2 : index

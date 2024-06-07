@@ -86,9 +86,6 @@ std::unique_ptr<Pass> createAMDAIEFuseConsumerIntoLoopPass(
 /// Create a pass to fuse the linalg.fill into the forall loops.
 std::unique_ptr<Pass> createAMDAIEFuseFillIntoForallPass();
 
-/// Create a pass to fuse or distribute logical objectFifos into workgroups.
-std::unique_ptr<Pass> createAMDAIEFuseLogicalObjectFifoIntoWorkgroupPass();
-
 /// Hoist an affine.apply op on a scf.for op's induction variable.
 std::unique_ptr<Pass> createAMDAIEHoistForLoopAffineApplyPass();
 
@@ -100,13 +97,16 @@ std::unique_ptr<Pass> createAMDAIEInsertLoopsForVectorizationPass();
 std::unique_ptr<Pass> createAMDAIEFusePackIntoLoopPass(
     AMDAIEFusePackIntoLoopOptions options = {});
 
-/// Create pass to insert AIE workgroups around forall loops selected
-/// for parallel execution.
-std::unique_ptr<Pass> createAMDAIEInsertAIEWorkgroupPass();
+/// Create pass to insert `amdaie.core` operations inside the innermost
+/// `scf.forall` operations.
+std::unique_ptr<Pass> createAMDAIEInsertCoresPass();
 
 /// Links AMDAIE HAL executables within the top-level program module.
 std::unique_ptr<OperationPass<mlir::ModuleOp>>
 createAMDAIELinkExecutablesPass();
+
+/// Create a pass to localize logical objectfifos to local parallel loop scopes.
+std::unique_ptr<Pass> createAMDAIELocalizeLogicalObjectFifoPass();
 
 /// Create pass calling the dynamic pipeline for AMDAIE.
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
@@ -159,9 +159,9 @@ std::unique_ptr<Pass> createAMDAIETileAndFusePass(
 /// Create pass to propagate pack/unpack ops using upstream patterns.
 std::unique_ptr<Pass> createAMDAIEPropagateDataLayoutPass();
 
-/// Create pass to unroll the scf.forall operations within AIE workgroups and
-/// distribute the logical objectFifos .
-std::unique_ptr<Pass> createAMDAIEUnrollAndDistributeWorkgroupPass();
+/// Create pass to unroll the scf.forall operations around `amdaie.core`
+/// operations and distribute the logical objectFifos.
+std::unique_ptr<Pass> createAMDAIEDistributeCoresAndObjectFifosPass();
 
 void registerAMDAIEPasses();
 

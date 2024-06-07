@@ -1,4 +1,4 @@
-// RUN: iree-opt --pass-pipeline="builtin.module(iree-amdaie-unroll-and-distribute-workgroup,cse)" --split-input-file %s | FileCheck %s
+// RUN: iree-opt --pass-pipeline="builtin.module(iree-amdaie-distribute-cores-and-objectfifos,cse)" --split-input-file %s | FileCheck %s
 
 // Check for unrolling an amdaie.core within a parallel loop with a single
 // induction variable with multiple iterations. There are no dma ops in this
