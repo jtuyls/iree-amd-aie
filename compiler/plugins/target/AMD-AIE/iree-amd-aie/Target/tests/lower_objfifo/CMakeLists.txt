@@ -8,6 +8,7 @@ iree_lit_test_suite(
   NAME
     lit
   SRCS
+    buffers_xclbin.mlir
     basic_dma_transpose.mlir
     basic_matrix_multiplication_matrix_vector.mlir
     basic_matrix_multiplication_single_core.mlir
