@@ -199,6 +199,7 @@ void xilinx::AIE::registerAIEAssignBufferAddressesBasic() {
     return xilinx::AIE::createAIEAssignBufferAddressesBasicPass();
   });
 }
+
 //===- AIEAssignBufferDescriptorIDs.cpp -------------------------*- C++ -*-===//
 //
 // This file is licensed under the Apache License v2.0 with LLVM Exceptions.
@@ -258,100 +259,58 @@ struct AIEAssignBufferDescriptorIDsPass
         if (bd.getBdId().has_value()) gen.assignBdId(bd.getBdId().value());
       });
 
-      auto dmaOps = memOp.getOperation()->getRegion(0).getOps<DMAOp>();
-      if (!dmaOps.empty()) {
-        for (auto dmaOp : dmaOps) {
-          auto bdRegions = dmaOp.getBds();
-          for (auto &bdRegion : bdRegions) {
-            auto &block = bdRegion.getBlocks().front();
-            DMABDOp bd = *block.getOps<DMABDOp>().begin();
-            if (bd.getBdId().has_value())
-              assert(
-                  gen.bdIdAlreadyAssigned(bd.getBdId().value()) &&
-                  "bdId assigned by user but not found during previous walk");
-            else
-              bd.setBdId(gen.nextBdId(dmaOp.getChannelIndex()));
+      DenseMap<Block *, int> blockChannelMap;
+      // Associate with each block the channel index specified by the
+      // dma_start
+      for (Block &block : memOp.getOperation()->getRegion(0))
+        for (auto op : block.getOps<DMAStartOp>()) {
+          int chNum = op.getChannelIndex();
+          blockChannelMap[&block] = chNum;
+          Block *dest = op.getDest();
+          while (dest) {
+            blockChannelMap[dest] = chNum;
+            if (dest->hasNoSuccessors()) break;
+            dest = dest->getSuccessors()[0];
+            if (blockChannelMap.contains(dest)) dest = nullptr;
           }
         }
-      } else {
-        DenseMap<Block *, int> blockChannelMap;
-        // Associate with each block the channel index specified by the
-        // dma_start
-        for (Block &block : memOp.getOperation()->getRegion(0))
-          for (auto op : block.getOps<DMAStartOp>()) {
-            int chNum = op.getChannelIndex();
-            blockChannelMap[&block] = chNum;
-            Block *dest = op.getDest();
-            while (dest) {
-              blockChannelMap[dest] = chNum;
-              if (dest->hasNoSuccessors()) break;
-              dest = dest->getSuccessors()[0];
-              if (blockChannelMap.contains(dest)) dest = nullptr;
-            }
-          }
 
-        for (Block &block : memOp.getOperation()->getRegion(0)) {
-          if (block.getOps<DMABDOp>().empty()) continue;
-          assert(blockChannelMap.count(&block));
-          DMABDOp bd = (*block.getOps<DMABDOp>().begin());
-          if (bd.getBdId().has_value())
-            assert(gen.bdIdAlreadyAssigned(bd.getBdId().value()) &&
-                   "bdId assigned by user but not found during previous walk");
-          else
-            bd.setBdId(gen.nextBdId(blockChannelMap[&block]));
-        }
+      for (Block &block : memOp.getOperation()->getRegion(0)) {
+        if (block.getOps<DMABDOp>().empty()) continue;
+        assert(blockChannelMap.count(&block));
+        DMABDOp bd = (*block.getOps<DMABDOp>().begin());
+        if (bd.getBdId().has_value())
+          assert(gen.bdIdAlreadyAssigned(bd.getBdId().value()) &&
+                 "bdId assigned by user but not found during previous walk");
+        else
+          bd.setBdId(gen.nextBdId(blockChannelMap[&block]));
       }
     }
     for (TileElement memOp : memOps) {
-      auto dmaOps = memOp.getOperation()->getRegion(0).getOps<DMAOp>();
-      if (!dmaOps.empty()) {
-        for (auto dmaOp : dmaOps) {
-          auto bdRegions = dmaOp.getBds();
-          for (auto *bdRegionIt = bdRegions.begin();
-               bdRegionIt != bdRegions.end();) {
-            auto &block = bdRegionIt->getBlocks().front();
-            DMABDOp bd = *block.getOps<DMABDOp>().begin();
-            std::optional<int> nextBdId;
-            if (++bdRegionIt != bdRegions.end())
-              nextBdId =
-                  (*bdRegionIt->getBlocks().front().getOps<DMABDOp>().begin())
-                      .getBdId();
-            else if (dmaOp.getLoop())
-              nextBdId = (*bdRegions.front()
-                               .getBlocks()
-                               .front()
-                               .getOps<DMABDOp>()
-                               .begin())
-                             .getBdId();
-            bd.setNextBdId(nextBdId);
-          }
-        }
-      } else {
-        DenseMap<Block *, int> blockBdIdMap;
-        for (Block &block : memOp.getOperation()->getRegion(0)) {
-          if (block.getOps<DMABDOp>().empty()) continue;
-          DMABDOp bd = *block.getOps<DMABDOp>().begin();
-          assert(bd.getBdId().has_value() &&
-                 "DMABDOp should have bd_id assigned by now");
-          blockBdIdMap[&block] = bd.getBdId().value();
-        }
+      DenseMap<Block *, int> blockBdIdMap;
+      for (Block &block : memOp.getOperation()->getRegion(0)) {
+        if (block.getOps<DMABDOp>().empty()) continue;
+        DMABDOp bd = *block.getOps<DMABDOp>().begin();
+        assert(bd.getBdId().has_value() &&
+               "DMABDOp should have bd_id assigned by now");
+        blockBdIdMap[&block] = bd.getBdId().value();
+      }
 
-        for (Block &block : memOp.getOperation()->getRegion(0)) {
-          if (block.getOps<DMABDOp>().empty()) continue;
-          DMABDOp bd = *block.getOps<DMABDOp>().begin();
-          std::optional<int> nextBdId;
-          if (block.getNumSuccessors()) {
-            assert(llvm::range_size(block.getSuccessors()) == 1 &&
-                   "should have only one successor block");
-            Block *nextBlock = block.getSuccessor(0);
-            if (!blockBdIdMap.contains(nextBlock))
-              assert(nextBlock->getOperations().size() == 1 &&
-                     isa<EndOp>(nextBlock->getOperations().front()) &&
-                     "bb that's not in blockMap can only have aie.end");
-            else
-              nextBdId = blockBdIdMap[nextBlock];
-            bd.setNextBdId(nextBdId);
-          }
+      for (Block &block : memOp.getOperation()->getRegion(0)) {
+        if (block.getOps<DMABDOp>().empty()) continue;
+        DMABDOp bd = *block.getOps<DMABDOp>().begin();
+        std::optional<int> nextBdId;
+        if (block.getNumSuccessors()) {
+          assert(llvm::range_size(block.getSuccessors()) == 1 &&
+                 "should have only one successor block");
+          Block *nextBlock = block.getSuccessor(0);
+          if (!blockBdIdMap.contains(nextBlock))
+            assert(nextBlock->getOperations().size() == 1 &&
+                   isa<EndOp>(nextBlock->getOperations().front()) &&
+                   "bb that's not in blockMap can only have aie.end");
+          else
+            nextBdId = blockBdIdMap[nextBlock];
+          bd.setNextBdId(nextBdId);
         }
       }
     }
@@ -471,59 +430,11 @@ using namespace mlir::vector;
 using namespace xilinx;
 using namespace xilinx::AIE;
 
-static StringRef getArchIntrinsicString(AIEArch arch) {
-  switch (arch) {
-    case AIEArch::AIE1:
-      return "aie";
-    case AIEArch::AIE2:
-      return "aie2";
-  }
-  llvm::report_fatal_error("unsupported arch");
-}
+static StringRef getArchIntrinsicString(AIEArch arch) { return "aie2"; }
 
 typedef std::tuple<const char *, std::vector<Type>, std::vector<Type>>
     IntrinsicDecl;
 typedef std::vector<IntrinsicDecl> IntrinsicDecls;
-
-static auto getAIE1Intrinsics(OpBuilder &builder) {
-  Type int32Type = IntegerType::get(builder.getContext(), 32);
-  Type int128Type = IntegerType::get(builder.getContext(), 128);
-  Type int384Type = IntegerType::get(builder.getContext(), 384);
-  Type floatType = FloatType::getF32(builder.getContext());
-
-  // Note that not all of these are valid for a particular design, or needed.
-  // For right now, we will just accept the noise.
-  IntrinsicDecls functions = {
-      {"debug_i32", {int32Type}, {}},
-      {"llvm.aie.event0", {}, {}},
-      {"llvm.aie.event1", {}, {}},
-      {"llvm.aie.put.ms",
-       {int32Type, int32Type},
-       {}},  //(%channel, %value) -> ()
-      {"llvm.aie.put.wms",
-       {int32Type, int128Type},
-       {}},  //(%channel, %value) -> ()
-      {"llvm.aie.put.fms",
-       {int32Type, floatType},
-       {}},                                           //(%channel, %value) -> ()
-      {"llvm.aie.get.ss", {int32Type}, {int32Type}},  //(%channel, %value) -> ()
-      {"llvm.aie.get.wss",
-       {int32Type},
-       {int128Type}},  //(%channel, %value) -> ()
-      {"llvm.aie.get.fss",
-       {int32Type},
-       {floatType}},  //(%channel, %value) -> ()
-      {"llvm.aie.put.mcd", {int384Type}, {}},
-      {"llvm.aie.get.scd", {}, {int384Type}},
-      {"llvm.aie.lock.acquire.reg",
-       {int32Type, int32Type},
-       {}},  //(%lock_id, %lock_val) -> ()
-      {"llvm.aie.lock.release.reg",
-       {int32Type, int32Type},
-       {}},  //(%lock_id, %lock_val) -> ()
-  };
-  return functions;
-}
 
 static auto getAIE2Intrinsics(OpBuilder &builder) {
   Type int32Type = IntegerType::get(builder.getContext(), 32);
@@ -563,15 +474,7 @@ static void declareAIEIntrinsics(AIEArch arch, OpBuilder &builder) {
           .setPrivate();
     }
   };
-  switch (arch) {
-    case AIEArch::AIE1:
-      registerIntrinsics(getAIE1Intrinsics(builder));
-      return;
-    case AIEArch::AIE2:
-      registerIntrinsics(getAIE2Intrinsics(builder));
-      return;
-  }
-  llvm::report_fatal_error("unsupported arch");
+  registerIntrinsics(getAIE2Intrinsics(builder));
 }
 
 template <typename MyAIEOp>
@@ -629,10 +532,7 @@ struct AIEPutStreamToStdLowering : OpConversionPattern<PutStreamOp> {
     auto device = op->getParentOfType<DeviceOp>();
     const auto &targetModel = device.getTargetModel();
     std::string funcName;
-    if (targetModel.getTargetArch() == AIEArch::AIE1)
-      funcName = "llvm.aie.put.";
-    else
-      funcName = "llvm.aie2.put.";
+    funcName = "llvm.aie2.put.";
 
     if (op.isWideStream())
       funcName += "wms";
@@ -646,15 +546,10 @@ struct AIEPutStreamToStdLowering : OpConversionPattern<PutStreamOp> {
       return op.emitOpError("Could not find the intrinsic function ")
              << funcName;
     SmallVector<Value, 2> args;
-    if (targetModel.getTargetArch() == AIEArch::AIE1) {
-      args.push_back(op.getChannel());
-      args.push_back(op.getStreamValue());
-    } else {
-      args.push_back(op.getStreamValue());
-      args.push_back(rewriter.create<arith::ConstantOp>(
-          op.getLoc(), IntegerType::get(rewriter.getContext(), 32),
-          rewriter.getI32IntegerAttr(0)));  // tlast
-    }
+    args.push_back(op.getStreamValue());
+    args.push_back(rewriter.create<arith::ConstantOp>(
+        op.getLoc(), IntegerType::get(rewriter.getContext(), 32),
+        rewriter.getI32IntegerAttr(0)));  // tlast
     rewriter.create<func::CallOp>(rewriter.getUnknownLoc(), putMSFunc, args);
     rewriter.eraseOp(op);
     return success();
@@ -675,10 +570,7 @@ struct AIEGetStreamToStdLowering : OpConversionPattern<GetStreamOp> {
     auto device = op->getParentOfType<DeviceOp>();
     const auto &targetModel = device.getTargetModel();
     std::string funcName;
-    if (targetModel.getTargetArch() == AIEArch::AIE1)
-      funcName = "llvm.aie.get.";
-    else
-      funcName = "llvm.aie2.get.";
+    funcName = "llvm.aie2.get.";
 
     if (op.isWideStream())
       funcName += "wss";
@@ -692,8 +584,6 @@ struct AIEGetStreamToStdLowering : OpConversionPattern<GetStreamOp> {
       return op.emitOpError("Could not find the intrinsic function ")
              << funcName;
     SmallVector<Value, 2> args;
-    if (targetModel.getTargetArch() == AIEArch::AIE1)
-      args.push_back(op.getChannel());
     auto getSSCall = rewriter.create<func::CallOp>(rewriter.getUnknownLoc(),
                                                    getSSFunc, args);
     rewriter.replaceOp(op, getSSCall.getResult(0));
@@ -716,20 +606,16 @@ struct AIEPutCascadeToStdLowering : OpConversionPattern<PutCascadeOp> {
     auto device = op->getParentOfType<DeviceOp>();
     const auto &targetModel = device.getTargetModel();
     std::string funcName;
-    if (targetModel.getTargetArch() == AIEArch::AIE1)
-      funcName = "llvm.aie.put.mcd";
-    else
-      funcName = "llvm.aie2.mcd.write.vec";
+    funcName = "llvm.aie2.mcd.write.vec";
     auto putMCDFunc = module.lookupSymbol<func::FuncOp>(funcName);
     if (!putMCDFunc)
       return op.emitOpError("Could not find the intrinsic function ")
              << funcName;
     SmallVector<Value, 2> args;
     args.push_back(op.getCascadeValue());
-    if (targetModel.getTargetArch() == AIEArch::AIE2)
-      args.push_back(rewriter.create<arith::ConstantOp>(
-          op.getLoc(), IntegerType::get(rewriter.getContext(), 32),
-          rewriter.getI32IntegerAttr(1)));  // enable
+    args.push_back(rewriter.create<arith::ConstantOp>(
+        op.getLoc(), IntegerType::get(rewriter.getContext(), 32),
+        rewriter.getI32IntegerAttr(1)));  // enable
 
     rewriter.create<func::CallOp>(rewriter.getUnknownLoc(), putMCDFunc, args);
     rewriter.eraseOp(op);
@@ -751,19 +637,15 @@ struct AIEGetCascadeToStdLowering : OpConversionPattern<GetCascadeOp> {
     auto device = op->getParentOfType<DeviceOp>();
     const auto &targetModel = device.getTargetModel();
     std::string funcName;
-    if (targetModel.getTargetArch() == AIEArch::AIE1)
-      funcName = "llvm.aie.get.scd";
-    else
-      funcName = "llvm.aie2.scd.read.vec";
+    funcName = "llvm.aie2.scd.read.vec";
     auto getSCDFunc = module.lookupSymbol<func::FuncOp>(funcName);
     if (!getSCDFunc)
       return op.emitOpError("Could not find the intrinsic function ")
              << funcName;
     SmallVector<Value, 2> args;
-    if (targetModel.getTargetArch() == AIEArch::AIE2)
-      args.push_back(rewriter.create<arith::ConstantOp>(
-          op.getLoc(), IntegerType::get(rewriter.getContext(), 32),
-          rewriter.getI32IntegerAttr(1)));  // enable
+    args.push_back(rewriter.create<arith::ConstantOp>(
+        op.getLoc(), IntegerType::get(rewriter.getContext(), 32),
+        rewriter.getI32IntegerAttr(1)));  // enable
 
     auto getSCDCall = rewriter.create<func::CallOp>(rewriter.getUnknownLoc(),
                                                     getSCDFunc, args);
@@ -791,15 +673,11 @@ struct AIEUseLockToStdLowering : OpConversionPattern<UseLockOp> {
 
       // Generate the intrinsic name
       std::string funcName;
-      if (targetModel.getTargetArch() == AIEArch::AIE1)
-        funcName = "llvm.aie.lock.";
-      else
-        funcName = "llvm.aie2.";
+      funcName = "llvm.aie2.";
       if (useLock.acquire() || useLock.acquireGE())
         funcName += "acquire";
       else if (useLock.release())
         funcName += "release";
-      if (targetModel.getTargetArch() == AIEArch::AIE1) funcName += ".reg";
 
       auto useLockFunc = module.lookupSymbol<func::FuncOp>(funcName);
       if (!useLockFunc)
@@ -1786,42 +1664,24 @@ struct AIEObjectFifoStatefulTransformPass
     auto dev = op->getParentOfType<DeviceOp>();
     auto &target = dev.getTargetModel();
     if (creation_tile.isShimTile()) numElem = externalBuffersPerFifo[op].size();
-    if (target.getTargetArch() == AIEArch::AIE1) {
-      int of_elem_index =
-          0;  // used to give objectFifo elements a symbolic name
-      for (int i = 0; i < numElem; i++) {
-        // create corresponding aie1 locks
-        int lockID = lockAnalysis.getLockID(creation_tile);
-        assert(lockID >= 0 && "No more locks to allocate!");
-        auto lock = builder.create<LockOp>(builder.getUnknownLoc(),
-                                           creation_tile, lockID, 0);
-        lock.getOperation()->setAttr(
-            SymbolTable::getSymbolAttrName(),
-            builder.getStringAttr(op.name().str() + "_lock_" +
-                                  std::to_string(of_elem_index)));
-        locks.push_back(lock);
-        of_elem_index++;
-      }
-    } else {
-      // create corresponding aie2 locks
-      int prodLockID = lockAnalysis.getLockID(creation_tile);
-      assert(prodLockID >= 0 && "No more locks to allocate!");
-      auto prodLock = builder.create<LockOp>(
-          builder.getUnknownLoc(), creation_tile, prodLockID, numElem);
-      prodLock.getOperation()->setAttr(
-          SymbolTable::getSymbolAttrName(),
-          builder.getStringAttr(op.name().str() + "_prod_lock"));
-      locks.push_back(prodLock);
+    // create corresponding aie2 locks
+    int prodLockID = lockAnalysis.getLockID(creation_tile);
+    assert(prodLockID >= 0 && "No more locks to allocate!");
+    auto prodLock = builder.create<LockOp>(builder.getUnknownLoc(),
+                                           creation_tile, prodLockID, numElem);
+    prodLock.getOperation()->setAttr(
+        SymbolTable::getSymbolAttrName(),
+        builder.getStringAttr(op.name().str() + "_prod_lock"));
+    locks.push_back(prodLock);
 
-      int consLockID = lockAnalysis.getLockID(creation_tile);
-      assert(consLockID >= 0 && "No more locks to allocate!");
-      auto consLock = builder.create<LockOp>(builder.getUnknownLoc(),
-                                             creation_tile, consLockID, 0);
-      consLock.getOperation()->setAttr(
-          SymbolTable::getSymbolAttrName(),
-          builder.getStringAttr(op.name().str() + "_cons_lock"));
-      locks.push_back(consLock);
-    }
+    int consLockID = lockAnalysis.getLockID(creation_tile);
+    assert(consLockID >= 0 && "No more locks to allocate!");
+    auto consLock = builder.create<LockOp>(builder.getUnknownLoc(),
+                                           creation_tile, consLockID, 0);
+    consLock.getOperation()->setAttr(
+        SymbolTable::getSymbolAttrName(),
+        builder.getStringAttr(op.name().str() + "_cons_lock"));
+    locks.push_back(consLock);
     return locks;
   }
 
@@ -1956,21 +1816,13 @@ struct AIEObjectFifoStatefulTransformPass
     int relMode = 1;
     auto acqLockAction = LockAction::Acquire;
     auto dev = op->getParentOfType<DeviceOp>();
-    if (auto &target = dev.getTargetModel();
-        target.getTargetArch() == AIEArch::AIE1) {
-      acqMode = lockMode == 0 ? 1 : 0;
-      relMode = lockMode == 0 ? 0 : 1;
-      acqLock = locksPerFifo[op][blockIndex];
-      relLock = locksPerFifo[op][blockIndex];
-    } else {
-      acqMode = acqNum;
-      relMode = relNum;
-      acqLockAction = LockAction::AcquireGreaterEqual;
-      acqLock = channelDir == DMAChannelDir::S2MM ? locksPerFifo[op][0]
-                                                  : locksPerFifo[op][1];
-      relLock = channelDir == DMAChannelDir::S2MM ? locksPerFifo[op][1]
-                                                  : locksPerFifo[op][0];
-    }
+    acqMode = acqNum;
+    relMode = relNum;
+    acqLockAction = LockAction::AcquireGreaterEqual;
+    acqLock = channelDir == DMAChannelDir::S2MM ? locksPerFifo[op][0]
+                                                : locksPerFifo[op][1];
+    relLock = channelDir == DMAChannelDir::S2MM ? locksPerFifo[op][1]
+                                                : locksPerFifo[op][0];
     createBd(builder, acqLock, acqMode, acqLockAction, relLock, relMode, buff,
              offset, len, succ, dims);
   }
@@ -2341,43 +2193,25 @@ struct AIEObjectFifoStatefulTransformPass
         target = objFifoLinks[*linkOp];
 
     auto dev = op->getParentOfType<DeviceOp>();
-    if (auto &targetArch = dev.getTargetModel();
-        targetArch.getTargetArch() == AIEArch::AIE1) {
-      int lockMode = 0;
-      if ((port == ObjectFifoPort::Produce &&
-           lockAction == LockAction::Release) ||
-          (port == ObjectFifoPort::Consume &&
-           lockAction == LockAction::Acquire))
-        lockMode = 1;
-      for (int i = 0; i < numLocks; i++) {
-        int lockID = acc[{op, portNum}];
-        builder.create<UseLockOp>(builder.getUnknownLoc(),
-                                  locksPerFifo[target][lockID], lockAction,
-                                  lockMode);
-        acc[{op, portNum}] =
-            (lockID + 1) % op.size();  // update to next objFifo elem
-      }
+    if (numLocks == 0) return;
+    // search for the correct lock based on the port of the acq/rel
+    // operation e.g. acq as consumer is the read lock (second)
+    LockOp lock;
+    if (lockAction == LockAction::AcquireGreaterEqual) {
+      if (port == ObjectFifoPort::Produce)
+        lock = locksPerFifo[target][0];
+      else
+        lock = locksPerFifo[target][1];
     } else {
-      if (numLocks == 0) return;
-      // search for the correct lock based on the port of the acq/rel
-      // operation e.g. acq as consumer is the read lock (second)
-      LockOp lock;
-      if (lockAction == LockAction::AcquireGreaterEqual) {
-        if (port == ObjectFifoPort::Produce)
-          lock = locksPerFifo[target][0];
-        else
-          lock = locksPerFifo[target][1];
-      } else {
-        if (port == ObjectFifoPort::Produce)
-          lock = locksPerFifo[target][1];
-        else
-          lock = locksPerFifo[target][0];
-      }
-      builder.create<UseLockOp>(builder.getUnknownLoc(), lock, lockAction,
-                                numLocks);
-      acc[{op, portNum}] = (acc[{op, portNum}] + numLocks) %
-                           op.size();  // update to next objFifo elem
+      if (port == ObjectFifoPort::Produce)
+        lock = locksPerFifo[target][1];
+      else
+        lock = locksPerFifo[target][0];
     }
+    builder.create<UseLockOp>(builder.getUnknownLoc(), lock, lockAction,
+                              numLocks);
+    acc[{op, portNum}] = (acc[{op, portNum}] + numLocks) %
+                         op.size();  // update to next objFifo elem
   }
 
   /// Function used to check whether op is already contained in map.
@@ -2840,13 +2674,8 @@ struct AIEObjectFifoStatefulTransformPass
           numCreate = 0;
 
         auto dev = op->getParentOfType<DeviceOp>();
-        if (auto &targetArch = dev.getTargetModel();
-            targetArch.getTargetArch() == AIEArch::AIE1)
-          createUseLocks(builder, op, port, acqPerFifo, numCreate,
-                         LockAction::Acquire);
-        else
-          createUseLocks(builder, op, port, acqPerFifo, numCreate,
-                         LockAction::AcquireGreaterEqual);
+        createUseLocks(builder, op, port, acqPerFifo, numCreate,
+                       LockAction::AcquireGreaterEqual);
 
         // if objFifo was linked with others, find which objFifos
         // elements to use
