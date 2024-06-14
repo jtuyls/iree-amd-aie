@@ -56,108 +56,32 @@ using namespace mlir;
 using namespace xilinx;
 using namespace xilinx::AIE;
 
-#define AIERC_STR(x) x, #x
-static const std::map<AieRC, std::string> AIERCTOSTR = {
-    {AIERC_STR(XAIE_OK)},
-    {AIERC_STR(XAIE_ERR)},
-    {AIERC_STR(XAIE_INVALID_DEVICE)},
-    {AIERC_STR(XAIE_INVALID_RANGE)},
-    {AIERC_STR(XAIE_INVALID_ARGS)},
-    {AIERC_STR(XAIE_INVALID_TILE)},
-    {AIERC_STR(XAIE_ERR_STREAM_PORT)},
-    {AIERC_STR(XAIE_INVALID_DMA_TILE)},
-    {AIERC_STR(XAIE_INVALID_BD_NUM)},
-    {AIERC_STR(XAIE_ERR_OUTOFBOUND)},
-    {AIERC_STR(XAIE_INVALID_DATA_MEM_ADDR)},
-    {AIERC_STR(XAIE_INVALID_ELF)},
-    {AIERC_STR(XAIE_CORE_STATUS_TIMEOUT)},
-    {AIERC_STR(XAIE_INVALID_CHANNEL_NUM)},
-    {AIERC_STR(XAIE_INVALID_LOCK)},
-    {AIERC_STR(XAIE_INVALID_DMA_DIRECTION)},
-    {AIERC_STR(XAIE_INVALID_PLIF_WIDTH)},
-    {AIERC_STR(XAIE_INVALID_LOCK_ID)},
-    {AIERC_STR(XAIE_INVALID_LOCK_VALUE)},
-    {AIERC_STR(XAIE_LOCK_RESULT_FAILED)},
-    {AIERC_STR(XAIE_INVALID_DMA_DESC)},
-    {AIERC_STR(XAIE_INVALID_ADDRESS)},
-    {AIERC_STR(XAIE_FEATURE_NOT_SUPPORTED)},
-    {AIERC_STR(XAIE_INVALID_BURST_LENGTH)},
-    {AIERC_STR(XAIE_INVALID_BACKEND)},
-    {AIERC_STR(XAIE_INSUFFICIENT_BUFFER_SIZE)},
-    {AIERC_STR(XAIE_ERR_MAX)}};
-#undef AIERC_STR
-
-static const std::map<WireBundle, StrmSwPortType>
-    WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE = {
-        {WireBundle::Core, StrmSwPortType::CORE},
-        {WireBundle::DMA, StrmSwPortType::DMA},
-        {WireBundle::Ctrl, StrmSwPortType::CTRL},
-        {WireBundle::FIFO, StrmSwPortType::FIFO},
-        {WireBundle::South, StrmSwPortType::SOUTH},
-        {WireBundle::West, StrmSwPortType::WEST},
-        {WireBundle::North, StrmSwPortType::NORTH},
-        {WireBundle::East, StrmSwPortType::EAST},
-        // missing PLIO from WireBundle
-        // missing NOC from WireBundle
-        {WireBundle::Trace, StrmSwPortType::TRACE},
+const std::map<WireBundle, StrmSwPortType> _WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE = {
+    {WireBundle::Core, StrmSwPortType::CORE},
+    {WireBundle::DMA, StrmSwPortType::DMA},
+    {WireBundle::Ctrl, StrmSwPortType::CTRL},
+    {WireBundle::FIFO, StrmSwPortType::FIFO},
+    {WireBundle::South, StrmSwPortType::SOUTH},
+    {WireBundle::West, StrmSwPortType::WEST},
+    {WireBundle::North, StrmSwPortType::NORTH},
+    {WireBundle::East, StrmSwPortType::EAST},
+    // missing PLIO from WireBundle
+    // missing NOC from WireBundle
+    {WireBundle::Trace, StrmSwPortType::TRACE},
 };
 
-// https://stackoverflow.com/a/32230306
-template <typename H1>
-raw_ostream &showArgs(raw_ostream &out, const char *label, H1 &&value) {
-  return out << label << "=" << std::forward<H1>(value);
+inline StrmSwPortType WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE(
+    xilinx::AIE::WireBundle w) {
+  return _WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(w);
 }
 
-template <typename H1, typename... T>
-raw_ostream &showArgs(raw_ostream &out, const char *label, H1 &&value,
-                      T &&...rest) {
-  const char *pcomma = strchr(label, ',');
-  return showArgs(out.write(label, pcomma - label)
-                      << "=" << std::forward<H1>(value) << ',',
-                  pcomma + 1, std::forward<T>(rest)...);
-}
-
-#define SHOW_ARGS(os, ...) showArgs(os, #__VA_ARGS__, __VA_ARGS__)
-
-raw_ostream &operator<<(raw_ostream &os, const XAie_LocType &loc) {
-  os << "XAie_LocType(col: " << std::to_string(loc.Col)
-     << ", row: " << std::to_string(loc.Row) << ")";
-  return os;
-}
-
-raw_ostream &operator<<(raw_ostream &os, const XAie_Lock &lock) {
-  os << "XAie_Lock(id: " << std::to_string(lock.LockId)
-     << ", val: " << std::to_string(lock.LockVal) << ")";
-  return os;
-}
-
-raw_ostream &operator<<(raw_ostream &os, const XAie_Packet &packet) {
-  os << "XAie_Packet(id: " << std::to_string(packet.PktId)
-     << ", type: " << std::to_string(packet.PktType) << ")";
-  return os;
-}
-
-// So that we can use the pattern if(auto r = TRY_XAIE_API...) { // r is nonzero
-// }
-static_assert(XAIE_OK == 0);
-
-#define TRY_XAIE_API_FATAL_ERROR(API, ...)                                     \
-  do {                                                                         \
-    LLVM_DEBUG(llvm::dbgs() << "trying XAIE API: " << #API << " with args: "); \
-    LLVM_DEBUG(SHOW_ARGS(llvm::dbgs(), __VA_ARGS__));                          \
-    LLVM_DEBUG(llvm::dbgs() << "\n");                                          \
-    if (auto r = API(__VA_ARGS__))                                             \
-      llvm::report_fatal_error(llvm::Twine(#API " failed with ") +             \
-                               AIERCTOSTR.at(r));                              \
-  } while (0)
-
-#define TRY_XAIE_API_EMIT_ERROR(OP, API, ...)                                  \
-  do {                                                                         \
-    LLVM_DEBUG(llvm::dbgs() << "trying XAIE API: " << #API << " with args: "); \
-    LLVM_DEBUG(SHOW_ARGS(llvm::dbgs(), __VA_ARGS__));                          \
-    LLVM_DEBUG(llvm::dbgs() << "\n");                                          \
-    if (auto r = API(__VA_ARGS__))                                             \
-      return OP.emitOpError() << #API " failed with " << AIERCTOSTR.at(r);     \
+#define TRY_XAIE_API_EMIT_ERROR(OP, API, ...)                           \
+  do {                                                                  \
+    LLVM_DEBUG(llvm::dbgs() << "XAIE API: " << #API << " with args: "); \
+    LLVM_DEBUG(SHOW_ARGS(llvm::dbgs(), __VA_ARGS__));                   \
+    LLVM_DEBUG(llvm::dbgs() << "\n");                                   \
+    if (auto r = API(__VA_ARGS__))                                      \
+      return OP.emitOpError() << #API " failed with " << AIERCTOSTR(r); \
   } while (0)
 
 #define TRY_XAIE_API_LOGICAL_RESULT(API, ...)                                  \
@@ -166,7 +90,7 @@ static_assert(XAIE_OK == 0);
     LLVM_DEBUG(SHOW_ARGS(llvm::dbgs(), __VA_ARGS__));                          \
     LLVM_DEBUG(llvm::dbgs() << "\n");                                          \
     if (auto r = API(__VA_ARGS__)) {                                           \
-      llvm::errs() << #API " failed with " << AIERCTOSTR.at(r);                \
+      llvm::errs() << #API " failed with " << AIERCTOSTR(r);                   \
       return failure();                                                        \
     }                                                                          \
   } while (0)
@@ -182,15 +106,13 @@ auto ps = std::filesystem::path::preferred_separator;
 
 #define NPI_ADDR 0x0
 #define NUM_LOCKS 16
-#define EVEN_BD_NUM_START 0
-#define ODD_BD_NUM_START 24
 #define MEM_TILE_LOCK_ID_INCR 64
 #define BASE_ADDR_A_INCR 0x80000
 
 namespace xilinx::AIE {
 
 LogicalResult configureLocksInBdBlock(XAie_DmaDesc &dmaTileBd, Block &block,
-                                      AMDAIENPUTargetModel targetModel,
+                                      AMDAIENPUDeviceModel targetModel,
                                       XAie_LocType &tileLoc) {
   LLVM_DEBUG(llvm::dbgs() << "\nstart configuring bds\n");
   std::optional<int> acqValue, relValue, acqLockId, relLockId;
@@ -236,7 +158,7 @@ LogicalResult configureLocksInBdBlock(XAie_DmaDesc &dmaTileBd, Block &block,
 }
 
 LogicalResult configureBdInBlock(XAie_DevInst &devInst, XAie_DmaDesc &dmaTileBd,
-                                 Block &block, AMDAIENPUTargetModel targetModel,
+                                 Block &block, AMDAIENPUDeviceModel targetModel,
                                  XAie_LocType &tileLoc, int bdId,
                                  std::optional<int> nextBdId) {
   std::optional<int> packetType;
@@ -360,7 +282,7 @@ LogicalResult pushToBdQueueAndEnable(XAie_DevInst &devInst, Operation &op,
 
 LogicalResult configureLocksAndBd(XAie_DevInst &devInst, Block &block,
                                   XAie_LocType tileLoc,
-                                  AMDAIENPUTargetModel targetModel) {
+                                  AMDAIENPUDeviceModel targetModel) {
   DMABDOp bd = *block.getOps<DMABDOp>().begin();
   assert(bd.getBdId().has_value() &&
          "DMABDOp must have assigned bd_id; did you forget to run "
@@ -382,7 +304,7 @@ struct AIEControl {
   XAie_DevInst devInst;
 
   AIEControl(size_t partitionStartCol, bool aieSim, bool xaieDebug,
-             AMDAIENPUTargetModel tm) {
+             const AMDAIENPUDeviceModel &tm) {
     size_t partitionNumCols = tm.columns();
     size_t deviceRows = tm.rows();
     size_t deviceCols = tm.columns() + partitionStartCol;
@@ -489,7 +411,8 @@ struct AIEControl {
                    << "lock op missing either id or init" << lockOp << "\n");
     });
 
-    AMDAIENPUTargetModel targetModel = targetOp.getTargetModel();
+    AMDAIENPUDeviceModel &targetModel =
+        mlir::iree_compiler::AMDAIE::getDeviceModel();
 
     auto memOps = llvm::to_vector_of<TileElement>(targetOp.getOps<MemOp>());
     llvm::append_range(memOps, targetOp.getOps<MemTileDMAOp>());
@@ -539,9 +462,9 @@ struct AIEControl {
       for (auto connectOp : b.getOps<ConnectOp>())
         TRY_XAIE_API_EMIT_ERROR(
             switchboxOp, XAie_StrmConnCctEnable, &devInst, tileLoc,
-            WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(connectOp.getSourceBundle()),
+            WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE(connectOp.getSourceBundle()),
             connectOp.sourceIndex(),
-            WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(connectOp.getDestBundle()),
+            WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE(connectOp.getDestBundle()),
             connectOp.destIndex());
 
       for (auto connectOp : b.getOps<MasterSetOp>()) {
@@ -566,7 +489,7 @@ struct AIEControl {
             isdma ? XAIE_SS_PKT_DROP_HEADER : XAIE_SS_PKT_DONOT_DROP_HEADER;
         TRY_XAIE_API_EMIT_ERROR(
             connectOp, XAie_StrmPktSwMstrPortEnable, &devInst, tileLoc,
-            WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(connectOp.getDestBundle()),
+            WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE(connectOp.getDestBundle()),
             connectOp.destIndex(), dropHeader, arbiter, mask);
       }
 
@@ -579,13 +502,13 @@ struct AIEControl {
           int msel = amselOp.getMselValue();
           TRY_XAIE_API_EMIT_ERROR(
               connectOp, XAie_StrmPktSwSlavePortEnable, &devInst, tileLoc,
-              WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(connectOp.getSourceBundle()),
+              WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE(connectOp.getSourceBundle()),
               connectOp.sourceIndex());
           auto packetInit = XAie_PacketInit(slotOp.valueInt(), /*PktType*/ 0);
           // TODO Need to better define packet id,type used here
           TRY_XAIE_API_EMIT_ERROR(
               connectOp, XAie_StrmPktSwSlaveSlotEnable, &devInst, tileLoc,
-              WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(connectOp.getSourceBundle()),
+              WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE(connectOp.getSourceBundle()),
               connectOp.sourceIndex(), slot, packetInit, slotOp.maskInt(), msel,
               arbiter);
           slot++;
@@ -617,9 +540,9 @@ struct AIEControl {
       for (auto connectOp : b.getOps<ConnectOp>())
         TRY_XAIE_API_EMIT_ERROR(
             switchboxOp, XAie_StrmConnCctEnable, &devInst, tileLoc,
-            WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(connectOp.getSourceBundle()),
+            WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE(connectOp.getSourceBundle()),
             connectOp.sourceIndex(),
-            WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(connectOp.getDestBundle()),
+            WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE(connectOp.getDestBundle()),
             connectOp.destIndex());
     }
 
@@ -629,9 +552,9 @@ struct AIEControl {
       auto tileLoc = XAie_TileLoc(tile.getCol(), tile.getRow());
       TRY_XAIE_API_EMIT_ERROR(
           targetOp, XAie_CoreConfigAccumulatorControl, &devInst, tileLoc,
-          WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(
+          WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE(
               static_cast<WireBundle>(configOp.getInputDir())),
-          WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE.at(
+          WIRE_BUNDLE_TO_STRM_SW_PORT_TYPE(
               static_cast<WireBundle>(configOp.getOutputDir())));
     }
 
@@ -733,7 +656,7 @@ LogicalResult AIETranslateToCDODirect(ModuleOp m, llvm::StringRef workDirPath,
          "only exactly 1 device op supported.");
   DeviceOp targetOp = *devOps.begin();
   AIEControl ctl(partitionStartCol, aieSim, xaieDebug,
-                 targetOp.getTargetModel());
+                 mlir::iree_compiler::AMDAIE::getDeviceModel());
   initializeCDOGenerator(endianness, cdoDebug);
   if (emitUnified)
     return generateCDOUnified(ctl, workDirPath, targetOp, aieSim, enableCores);

@@ -6,6 +6,12 @@
 #define IREE_AIE_RUNTIME_H
 
 #include <optional>
+#include <ostream>
+#include <sstream>
+
+#include "llvm/ADT/Twine.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/FormattedStream.h"
 
 #ifdef _WIN32
 #ifndef IREE_AIE_RUNTIME_EXPORT
@@ -25,8 +31,14 @@
 extern "C" {
 #include "xaiengine.h"
 
-enum byte_ordering { Little_Endian, Big_Endian };
-void startCDOFileStream(const char* cdoFileName);
+#define s8
+#define u8
+#define u16
+#define s32
+#define u32
+#define u64
+
+void startCDOFileStream(const char *cdoFileName);
 void endCurrentCDOFileStream();
 void FileHeader();
 void EnAXIdebug();
@@ -34,63 +46,151 @@ void setEndianness(bool endianness);
 void configureHeader();
 }
 
-struct AMDAIENPUTargetModel {
-  int rows() { return 6; /* 1 Shim row, 1 memtile row, and 4 Core rows. */ }
-  int columns() { return 5; }
+#define XAIE_BASE_ADDR 0x40000000
+#define XAIE_COL_SHIFT 25
+#define XAIE_ROW_SHIFT 20
+#define XAIE_SHIM_ROW 0
+#define XAIE_MEM_TILE_ROW_START 1
+#define XAIE_PARTITION_BASE_ADDR 0x0
 
-  bool isCoreTile(int col, int row) { return row > 1; }
+#define NPI_ADDR 0x0
+#define NUM_LOCKS 16
+#define MEM_TILE_LOCK_ID_INCR 64
+#define BASE_ADDR_A_INCR 0x80000
 
-  bool isMemTile(int col, int row) { return row == 1; }
+std::string AIERCTOSTR(AieRC rc);
 
-  uint32_t getNumLocks(int col, int row) {
-    return isMemTile(col, row) ? 64 : 16;
+// https://stackoverflow.com/a/32230306
+template <typename H1>
+llvm::raw_ostream &showArgs(llvm::raw_ostream &out, const char *label,
+                            H1 &&value) {
+  return out << label << "=" << std::forward<H1>(value);
+}
+
+template <typename H1, typename... T>
+llvm::raw_ostream &showArgs(llvm::raw_ostream &out, const char *label,
+                            H1 &&value, T &&...rest) {
+  const char *pcomma = strchr(label, ',');
+  return showArgs(out.write(label, pcomma - label)
+                      << "=" << std::forward<H1>(value) << ',',
+                  pcomma + 1, std::forward<T>(rest)...);
+}
+
+llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const XAie_LocType &loc);
+
+llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const XAie_Lock &lock);
+
+llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const XAie_Packet &packet);
+
+#define SHOW_ARGS(os, ...) showArgs(os, #__VA_ARGS__, __VA_ARGS__)
+#define TRY_XAIE_API_FATAL_ERROR(API, ...)                              \
+  do {                                                                  \
+    LLVM_DEBUG(llvm::dbgs() << "XAIE API: " << #API << " with args: "); \
+    LLVM_DEBUG(SHOW_ARGS(llvm::dbgs(), __VA_ARGS__));                   \
+    LLVM_DEBUG(llvm::dbgs() << "\n");                                   \
+    if (auto r = API(__VA_ARGS__))                                      \
+      llvm::report_fatal_error(llvm::Twine(#API " failed with ") +      \
+                               AIERCTOSTR(r));                          \
+  } while (0)
+
+struct TileLoc {
+  // friend definition (will define the function as a non-member function in the
+  // namespace surrounding the class).
+  friend std::ostream &operator<<(std::ostream &os, const TileLoc &s) {
+    os << "TileLoc(" << s.col << ", " << s.row << ")";
+    return os;
   }
 
-  bool isShimNOCTile(int col, int row) { return row == 0 && col > 0; }
-
-  bool isShimPLTile(int col, int row) {
-    // This isn't useful because it's not connected to anything.
-    return row == 0 && col == 0;
+  friend std::string to_string(const TileLoc &s) {
+    std::ostringstream ss;
+    ss << s;
+    return ss.str();
   }
 
-  uint32_t getNumMemTileRows() { return 1; }
-
-  std::optional<XAie_LocType> getMemWest(XAie_LocType src);
-  std::optional<XAie_LocType> getMemEast(XAie_LocType src);
-  std::optional<XAie_LocType> getMemNorth(XAie_LocType src);
-  std::optional<XAie_LocType> getMemSouth(XAie_LocType src);
-
-  bool isMemWest(int srcCol, int srcRow, int dstCol, int dstRow);
-  bool isMemEast(int srcCol, int srcRow, int dstCol, int dstRow);
-  bool isMemNorth(int srcCol, int srcRow, int dstCol, int dstRow);
-  bool isMemSouth(int srcCol, int srcRow, int dstCol, int dstRow);
-
-  bool isLegalMemAffinity(int coreCol, int coreRow, int memCol, int memRow);
-
-  static uint32_t getMemInternalBaseAddress() {
-    return getMemEastBaseAddress();
+  friend llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                       const TileLoc &s) {
+    os << to_string(s);
+    return os;
   }
 
-  static uint32_t getMemSouthBaseAddress() { return 0x00040000; }
-  static uint32_t getMemWestBaseAddress() { return 0x00050000; }
-  static uint32_t getMemNorthBaseAddress() { return 0x00060000; }
-  static uint32_t getMemEastBaseAddress() { return 0x00070000; }
-  static uint32_t getLocalMemorySize() { return 0x00010000; }
+  inline bool operator<(const TileLoc &rhs) const {
+    return std::tie(col, row) < std::tie(rhs.col, rhs.row);
+  }
 
-  uint32_t getNumBDs(int col, int row) { return isMemTile(col, row) ? 48 : 16; }
+  bool operator==(const TileLoc &rhs) const {
+    return std::tie(col, row) == std::tie(rhs.col, rhs.row);
+  }
 
-  uint32_t getMemTileSize() { return 0x00080000; }
+  bool operator!=(const TileLoc &rhs) const { return !(*this == rhs); }
 
-  uint32_t getNumDestSwitchboxConnections(int col, int row,
-                                          StrmSwPortType bundle);
-  uint32_t getNumSourceSwitchboxConnections(int col, int row,
-                                            StrmSwPortType bundle);
-  uint32_t getNumDestShimMuxConnections(int col, int row,
-                                        StrmSwPortType bundle);
-  uint32_t getNumSourceShimMuxConnections(int col, int row,
-                                          StrmSwPortType bundle);
-  bool isLegalMemtileConnection(StrmSwPortType srcBundle, int srcChan,
-                                StrmSwPortType dstBundle, int dstChan);
+  operator XAie_LocType() const { return XAie_TileLoc(col, row); }
+  TileLoc(XAie_LocType loc) : col(loc.Col), row(loc.Row) {}
+  TileLoc(int col, int row) : col(col), row(row) {}
+
+  int col, row;
 };
+
+struct AMDAIENPUDeviceModel {
+  XAie_Config configPtr;
+  XAie_DevInst devInst;
+
+  explicit AMDAIENPUDeviceModel(size_t partitionStartCol, bool aieSim = false,
+                                bool xaieDebug = false);
+
+  static int rows();
+  static int columns();
+  static uint32_t getNumMemTileRows();
+
+  bool isCoreTile(uint8_t col, uint8_t row);
+  bool isMemTile(uint8_t col, uint8_t row);
+  bool isShimNOCTile(uint8_t col, uint8_t row);
+  bool isShimPLTile(uint8_t col, uint8_t row);
+
+  uint32_t getNumLocks(uint8_t col, uint8_t row);
+
+  std::optional<TileLoc> getMemWest(TileLoc src);
+  static std::optional<TileLoc> getMemEast(TileLoc src);
+  std::optional<TileLoc> getMemNorth(TileLoc src);
+  std::optional<TileLoc> getMemSouth(TileLoc src);
+
+  static bool hasMemWest(uint8_t srcCol, uint8_t srcRow, uint8_t dstCol,
+                         uint8_t dstRow);
+  static bool hasMemEast(uint8_t srcCol, uint8_t srcRow, uint8_t dstCol,
+                         uint8_t dstRow);
+  static bool hasMemNorth(uint8_t srcCol, uint8_t srcRow, uint8_t dstCol,
+                          uint8_t dstRow);
+  static bool hasMemSouth(uint8_t srcCol, uint8_t srcRow, uint8_t dstCol,
+                          uint8_t dstRow);
+  /// Return true if core can access the memory in mem
+  bool hasLegalMemAffinity(uint8_t coreCol, uint8_t coreRow, uint8_t memCol,
+                           uint8_t memRow);
+
+  uint32_t getMemInternalBaseAddress();
+  static uint32_t getMemSouthBaseAddress();
+  static uint32_t getMemWestBaseAddress();
+  static uint32_t getMemNorthBaseAddress();
+  static uint32_t getMemEastBaseAddress();
+  uint32_t getLocalMemorySize(uint8_t col, uint8_t row);
+  uint32_t getMemTileSize(uint8_t col, uint8_t row);
+
+  uint32_t getNumBDs(uint8_t col, uint8_t row);
+
+  uint32_t getNumSourceSwitchboxConnections(uint8_t col, uint8_t row,
+                                            StrmSwPortType bundle);
+  uint32_t getNumDestSwitchboxConnections(uint8_t col, uint8_t row,
+                                          StrmSwPortType bundle);
+  bool isLegalMemtileConnection(uint8_t col, uint8_t row,
+                                StrmSwPortType srcBundle, uint8_t srcChan,
+                                StrmSwPortType dstBundle, uint8_t dstChan);
+};
+
+namespace mlir::iree_compiler::AMDAIE {
+
+struct AMDAIENPUDeviceModel &getDeviceModel();
+
+}  // namespace mlir::iree_compiler::AMDAIE
+
+StrmSwPortType getConnectingStrmSwPortType(StrmSwPortType dir);
+std::string stringifyStrmSwPortType(StrmSwPortType val);
 
 #endif  // IREE_AIE_RUNTIME_H
