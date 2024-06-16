@@ -322,6 +322,7 @@ iree_cc_library(
     ::AIETransformPassHeaders
     ::AIEXDialectIR
     ::AIEXTransformPassHeaders
+    iree-amd-aie::runtime::iree_aie_runtime_static
 )
 
 ###############################################################################
@@ -342,7 +343,6 @@ iree_cc_library(
     "AIETargets.cpp"
     "AIETargetCDODirect.cpp"
   DEPS
-    ::AIEDialectIR
     ::AIEDialectIR
     ::AIEPass
     ::AIEVecDialectIR

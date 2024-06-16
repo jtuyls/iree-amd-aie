@@ -15,14 +15,16 @@
 #define XAIE_SHIM_ROW 0
 #define XAIE_MEM_TILE_ROW_START 1
 
+enum byte_ordering { Little_Endian, Big_Endian };
+
 int main(int argc, char** argv) {
   std::string elfPath(argv[1]);
 
   int col = 0;
   // XAie_LocType is row, col but we always think col, row
-  XAie_LocType tile_0_0 = {0, static_cast<u8>(col)};
-  XAie_LocType tile_0_1 = {1, static_cast<u8>(col)};
-  XAie_LocType tile_0_2 = {2, static_cast<u8>(col)};
+  XAie_LocType tile_0_0 = {0, static_cast<uint8_t>(col)};
+  XAie_LocType tile_0_1 = {1, static_cast<uint8_t>(col)};
+  XAie_LocType tile_0_2 = {2, static_cast<uint8_t>(col)};
   XAie_Lock lock_0_1 = XAie_Lock{0, 1};
   XAie_Lock lock_1_0 = XAie_Lock{1, 0};
 
