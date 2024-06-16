@@ -101,11 +101,6 @@ include(${_aie_rt_source_dir}/fal/cmake/collect.cmake)
 # gotta add the subdirectory so the copies to build/include/xaiengine occur...
 add_subdirectory(${_aie_rt_source_dir}/driver/src iree_aie_runtime)
 
-string(TOUPPER "${CMAKE_BUILD_TYPE}" uppercase_CMAKE_BUILD_TYPE)
-if(uppercase_CMAKE_BUILD_TYPE STREQUAL "DEBUG")
-  set(XAIE_DEBUG "XAIE_DEBUG")
-endif()
-
 get_target_property(_aie_runtime_compile_options aienginev2 COMPILE_OPTIONS)
 list(REMOVE_ITEM _aie_runtime_compile_options -D__AIEBAREMETAL__)
 set_target_properties(

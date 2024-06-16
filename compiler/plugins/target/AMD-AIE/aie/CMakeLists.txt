@@ -6,7 +6,7 @@
 
 set(IREE_PACKAGE_ROOT_DIR "${CMAKE_CURRENT_LIST_DIR}")
 set(IREE_PACKAGE_ROOT_PREFIX "iree::target::amd-aie::aie")
-
+add_subdirectory(aie_passes)
 list(APPEND IREE_COMPILER_TABLEGEN_INCLUDE_DIRS
     "${IREE_MLIR_AIE_SOURCE_DIR}/include")
 
@@ -296,18 +296,14 @@ iree_cc_library(
   SRCS
     "AIETransformPasses.cpp"
     "AIEAssignBufferAddressesBasic.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIE/Transforms/AIEAssignLockIDs.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIE/Transforms/AIEAssignBuffers.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIE/Transforms/AIEAssignBufferDescriptorIDs.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIE/Transforms/AIECanonicalizeDevice.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIE/Transforms/AIECoreToStandard.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIE/Transforms/AIECreatePacketFlows.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIE/Transforms/AIECreatePathFindFlows.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIE/Transforms/AIELocalizeLocks.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIE/Transforms/AIEObjectFifoRegisterProcess.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIE/Transforms/AIEObjectFifoStatefulTransform.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIE/Transforms/AIENormalizeAddressSpaces.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIE/Transforms/AIEPathFinder.cpp"
+    "AIEAssignBufferDescriptorIDs.cpp"
+    "AIEAssignLockIDs.cpp"
+    "AIECanonicalizeDevice.cpp"
+    "AIECoreToStandard.cpp"
+    "AIECreatePathFindFlows.cpp"
+    "AIELocalizeLocks.cpp"
+    "AIEObjectFifoStatefulTransform.cpp"
+    "AIEPathFinder.cpp"
   DEPS
     ::defs
     ::AIEDialectIR
@@ -345,11 +341,8 @@ iree_cc_library(
     AIEXTransformPasses
   SRCS
     "AIEXTransformPasses.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIEX/Transforms/AIECreateBroadcastPacket.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIEX/Transforms/AIEDmaToNpu.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIEX/Transforms/AIELowerMulticast.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIEX/Transforms/AIECreateBroadcastPacket.cpp"
-    "${IREE_MLIR_AIE_SOURCE_DIR}/lib/Dialect/AIEX/Transforms/AIEXToStandard.cpp"
+    "AIEDmaToNpu.cpp"
+    "AIEXToStandard.cpp"
   DEPS
     ::defs
     ::AIEXDialectIR
