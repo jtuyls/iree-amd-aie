@@ -8,14 +8,13 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "Passes.h"
 #include "aie/Dialect/AIE/IR/AIEDialect.h"
 #include "aie/Dialect/AIEX/IR/AIEXDialect.h"
-#include "aie/Dialect/AIEX/Transforms/AIEXPasses.h"
-
+#include "llvm/ADT/DenseMap.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "llvm/ADT/DenseMap.h"
 
 using namespace mlir;
 using namespace xilinx;
@@ -69,54 +68,6 @@ struct ShimDMAllocationGetter {
   }
 };
 } // namespace
-
-struct RtpToNpuPattern : OpConversionPattern<NpuWriteRTPOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  RtpToNpuPattern(MLIRContext *context, PatternBenefit benefit = 1)
-      : OpConversionPattern(context, benefit) {}
-
-  LogicalResult
-  matchAndRewrite(NpuWriteRTPOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto *ctx = op->getContext();
-    auto i32ty = IntegerType::get(ctx, 32);
-    auto ui32ty =
-        IntegerType::get(ctx, 32, IntegerType::SignednessSemantics::Unsigned);
-    auto device = op->getParentOfType<AIE::DeviceOp>();
-
-    uint32_t rtp_buffer_addr = UINT_MAX;
-    int c = op.getCol();
-    int r = op.getRow();
-    uint32_t v = op.getValue();
-    uint32_t idx = op.getIndex();
-
-    if (auto buffer = device.lookupSymbol<AIE::BufferOp>(op.getBufferSymName()))
-      if (AIE::TileOp tile = buffer.getTileOp();
-          tile.colIndex() == c && tile.rowIndex() == r) {
-        assert(buffer.getAddress().has_value() &&
-               "buffer must have address assigned");
-        rtp_buffer_addr = static_cast<uint32_t>(buffer.getAddress().value());
-      }
-
-    if (rtp_buffer_addr == UINT_MAX) {
-      return op->emitOpError("RTP buffer address cannot be found. Has "
-          "an RTP buffer been allocated?");
-    }
-
-    rtp_buffer_addr += idx * sizeof(uint32_t);
-
-    IntegerAttr column = IntegerAttr::get(i32ty, c);
-    IntegerAttr row = IntegerAttr::get(i32ty, r);
-    IntegerAttr address = IntegerAttr::get(ui32ty, rtp_buffer_addr);
-    IntegerAttr value = IntegerAttr::get(i32ty, v);
-    rewriter.create<NpuWrite32Op>(op->getLoc(), address.getUInt(),
-                                  value.getInt(), column, row);
-
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
 
 struct PushToNpuPattern : OpConversionPattern<NpuPushQueueOp> {
 
@@ -397,7 +348,7 @@ struct DmaWaitToNpuPattern : OpConversionPattern<NpuDmaWaitOp> {
   }
 };
 
-struct AIEDmaToNpuPass : AIEDmaToNpuBase<AIEDmaToNpuPass> {
+struct AIEDmaToNpuPass : xilinx::AIEX::impl::AIEDmaToNpuBase<AIEDmaToNpuPass> {
   void runOnOperation() override {
 
     ShimDMAllocationGetter cachingGetter;
@@ -417,7 +368,6 @@ struct AIEDmaToNpuPass : AIEDmaToNpuBase<AIEDmaToNpuPass> {
     patterns.insert<DmaToNpuPattern>(&getContext(), cachingGetter);
     patterns.insert<DmaWaitToNpuPattern>(&getContext(), cachingGetter);
     patterns.insert<PushToNpuPattern>(&getContext());
-    patterns.insert<RtpToNpuPattern>(&getContext());
 
     if (failed(applyPartialConversion(device, target, std::move(patterns))))
       signalPassFailure();
