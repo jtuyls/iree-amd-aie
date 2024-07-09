@@ -37,27 +37,24 @@ namespace {
 
 /// Recursive function to check whether the provided op is a parent op of
 /// 'other'.
-bool isParentOf(Operation *op, Operation *other) {
+bool isAncestorOf(Operation *op, Operation *other) {
   if (!op || !other) return false;
-  if (op == other) return true;
-  Operation *parentOp = other->getParentOp();
-  return isParentOf(op, parentOp);
+  return op == other || op->isProperAncestor(other);
 }
 
-/// Recursive function to find the parent operation in the same block as the
-/// 'other' operation.
-Operation *getParentInSameBlock(Operation *op, Operation *other) {
-  if (!op || !other) return nullptr;
-  if (op->getBlock() == other->getBlock()) return op;
-  Operation *parentOp = op->getParentOp();
-  return getParentInSameBlock(parentOp, other);
+/// Return an ancestor of 'op' in 'block', or nullptr if no such ancestor.
+Operation *getAncestorInBlock(Operation *op, Block *block) {
+  if (!op || !block) return nullptr;
+  auto parent = op;
+  while (parent && (parent->getBlock() != block))
+    parent = parent->getParentOp();
+  return parent;
 }
 
 /// Utility affine expression visitor to retrieve the stride from the
 /// expression.
 struct RetrieveStrideSize : public AffineExprVisitor<RetrieveStrideSize> {
   std::optional<int64_t> stride;
-  RetrieveStrideSize() {}
   void visitMulExpr(AffineBinaryOpExpr expr) {
     if (auto rhsSize = dyn_cast<AffineConstantExpr>(expr.getRHS())) {
       stride = rhsSize.getValue();
@@ -78,8 +75,13 @@ LogicalResult moveUsersToHoistedDMAScope(Operation *parentOp) {
   // whatever operations are still remaining inside the loop's scope.
   WalkResult res = parentOp->walk([&](AMDAIE::NpuDmaWaitOp npuDmaWaitOp) {
     Operation *dmaOp = npuDmaWaitOp.getDma().getDefiningOp();
-    Operation *parentInSameBlock = getParentInSameBlock(npuDmaWaitOp, dmaOp);
-    if (!parentInSameBlock) return WalkResult::interrupt();
+    Operation *parentInSameBlock =
+        getAncestorInBlock(npuDmaWaitOp, dmaOp->getBlock());
+    if (!parentInSameBlock) {
+      npuDmaWaitOp->emitOpError(
+          "was not moved to correct scope after loop subsumption");
+      return WalkResult::interrupt();
+    }
     rewriter.moveOpAfter(npuDmaWaitOp, parentInSameBlock);
     return WalkResult::advance();
   });
@@ -172,8 +174,12 @@ class SubsumeLoopIntoDMA
                                   size_t maxNbDims) -> LogicalResult {
       size_t counter = 0;
       for (Value offset : dynamicOffsets)
-        if (allApplyValues.contains(offset)) counter++;
-      if ((nbOffsets + counter) > maxNbDims) return failure();
+        if (allApplyValues.contains(offset)) {
+          counter++;
+        } else {
+          // assert(false && "ok so it does happen");
+        }
+      if (nbOffsets + counter > maxNbDims) return failure();
       return success();
     };
     SmallVector<Value> dynamicSourceOffsets = op.getSourceOffsets();
@@ -282,8 +288,8 @@ class SubsumeLoopIntoDMA
         getConstantIntValues(forallOp.getMixedStep());
     if (!lowerBounds || !upperBounds || !steps) return failure();
 
-    // A set all `affine.apply` values for easy verification whether any of the
-    // `affine.apply` values on any of the induction vars is being used.
+    // A set of all `affine.apply` values for easy verification whether any of
+    // the `affine.apply` values on any of the induction vars is being used.
     DenseSet<Value> allApplyValues;
     // A vector of all `affine.apply` values for each induction var.
     SmallVector<DenseSet<Value>> applyValues;
@@ -344,7 +350,7 @@ class SubsumeLoopIntoDMA
       if (!parentOp) return failure();
       Value dma = npuDmaOp.getDma();
       for (Operation *userOp : dma.getUsers()) {
-        if (userOp != op.getOperation() && isParentOf(parentOp, userOp)) {
+        if (userOp != op.getOperation() && isAncestorOf(parentOp, userOp)) {
           return failure();
         }
       }
@@ -386,11 +392,7 @@ void AMDAIEDmaLoopSubsumptionPass::runOnOperation() {
     return signalPassFailure();
   }
 
-  if (failed(moveUsersToHoistedDMAScope(parentOp))) {
-    parentOp->emitOpError(
-        "failed to move DMA users to correct scope after loop subsumption");
-    return signalPassFailure();
-  }
+  if (failed(moveUsersToHoistedDMAScope(parentOp))) return signalPassFailure();
 }
 
 }  // namespace

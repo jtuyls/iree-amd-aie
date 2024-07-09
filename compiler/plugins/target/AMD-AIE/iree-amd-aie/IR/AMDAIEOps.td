@@ -273,7 +273,7 @@ def AMDAIE_NpuDmaCpyNdOp: AMDAIE_Op<"npu.dma_cpy_nd",
     // return 0. Else cast the memory space attribute to an integer. 
     uint64_t getSourceMemorySpaceAsUInt() {
       Attribute memSpace = getSourceMemorySpace();
-      return memSpace ? dyn_cast<IntegerAttr>(memSpace).getInt() : 0;
+      return memSpace ? cast<IntegerAttr>(memSpace).getInt() : 0;
     }
 
     // Return the target memref type. This is retrieved using information from
@@ -293,7 +293,7 @@ def AMDAIE_NpuDmaCpyNdOp: AMDAIE_Op<"npu.dma_cpy_nd",
     // return 0. Else cast the memory space attribute to an integer. 
     uint64_t getTargetMemorySpaceAsUInt() {
       Attribute memSpace = getTargetMemorySpace();
-      return memSpace ? dyn_cast<IntegerAttr>(memSpace).getInt() : 0;
+      return memSpace ? cast<IntegerAttr>(memSpace).getInt() : 0;
     }
 
     // A utility to create a new doubly strided operation from this one with a
@@ -537,7 +537,7 @@ def AMDAIE_LogicalObjectFifoFromMemrefOp
     // Else cast the memory space attribute to an integer. 
     uint64_t getMemorySpaceAsUInt() {
       Attribute memSpace = getMemorySpace();
-      return memSpace ? dyn_cast<IntegerAttr>(memSpace).getInt() : 0;
+      return memSpace ? cast<IntegerAttr>(memSpace).getInt() : 0;
     }
 
     // Return the source memref type.
