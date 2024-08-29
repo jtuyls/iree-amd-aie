@@ -61,7 +61,6 @@ void eraseOp(IRRewriter &rewriter, IRMapping &mapper, Operation *op) {
 
 namespace {
 
-
 /// Utility to convert vectors of `size` and `stride` into an
 /// `AIE::BDDimLayoutArrayAttr`.
 AIE::BDDimLayoutArrayAttr convertSizeStrideToBDDimLayoutArrayAttr(
@@ -93,19 +92,20 @@ AIE::BDDimLayoutArrayAttr convertSizeStrideToBDDimLayoutArrayAttr(
 /// Utility to create an `aie.objectfifo` operation from
 /// `amdaie.circular_dma_cpy_nd`.
 FailureOr<AIE::ObjectFifoCreateOp> createObjectFifo(
-    IRRewriter &rewriter, AMDAIE::CircularDmaCpyNdOp dmaOp, Value srcTile,
-    ValueRange dstTiles, StringAttr &symName) {
+    IRRewriter &rewriter, AMDAIE::FlowOp flowOp,
+    AMDAIE::NpuCircularDmaCpyNdOp dmaOp, Value srcTile, ValueRange dstTiles,
+    StringAttr &symName) {
   auto sourceType =
-      cast<AMDAIE::LogicalObjectFifoType>(dmaOp.getSource().getType());
+      cast<AMDAIE::LogicalObjectFifoType>(flowOp.getSource().getType());
   auto targetType =
-      cast<AMDAIE::LogicalObjectFifoType>(dmaOp.getTarget().getType());
+      cast<AMDAIE::LogicalObjectFifoType>(flowOp.getTarget().getType());
   uint8_t sourceMemSpace = sourceType.getMemorySpaceAsUInt();
   uint8_t targetMemSpace = targetType.getMemorySpaceAsUInt();
   unsigned depth;
   unsigned sourceDepth = sourceType.getDepth();
   unsigned targetDepth = targetType.getDepth();
   if (sourceMemSpace == 0 && targetMemSpace == 0) {
-    return dmaOp.emitOpError()
+    return flowOp.emitOpError()
            << "both source and target on main memory not supported";
   } else if (sourceMemSpace == 0) {
     depth = targetDepth;
@@ -113,7 +113,7 @@ FailureOr<AIE::ObjectFifoCreateOp> createObjectFifo(
     depth = sourceDepth;
   } else {
     if (sourceDepth != targetDepth)
-      return dmaOp.emitOpError() << "unsupported sourceDepth != targetDepth";
+      return flowOp.emitOpError() << "unsupported sourceDepth != targetDepth";
     depth = sourceDepth;
   }
 
@@ -143,9 +143,9 @@ FailureOr<AIE::ObjectFifoCreateOp> createObjectFifo(
   // directly to make this more clean.
   // TODO(jornt): I think objectfifos should support source type != dest type.
   MemRefType srcType =
-      cast<LogicalObjectFifoType>(dmaOp.getSourceType()).getElementType();
+      cast<LogicalObjectFifoType>(flowOp.getSourceType()).getElementType();
   MemRefType dstType =
-      cast<LogicalObjectFifoType>(dmaOp.getTargetType()).getElementType();
+      cast<LogicalObjectFifoType>(flowOp.getTargetType()).getElementType();
   ArrayRef<int64_t> sourceShape = srcType.getShape();
   ArrayRef<int64_t> targetShape = dstType.getShape();
   int64_t sourceSize = std::accumulate(sourceShape.begin(), sourceShape.end(),
@@ -229,15 +229,12 @@ LogicalResult acquireOpToAIE(IRRewriter &rewriter,
 
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(acquireOp);
-  auto dmaOp =
-      dyn_cast<AMDAIE::CircularDmaCpyNdOp>(acquireOp.getDma().getDefiningOp());
-  if (!dmaOp) {
-    return dmaOp.emitError()
-           << "acquire doesn't operate on a `amdaie.circular_dma_cpy_nd`";
-  }
+  auto flowOp = dyn_cast<AMDAIE::FlowOp>(acquireOp.getDma().getDefiningOp());
+  if (!flowOp)
+    return flowOp.emitError() << "acquire doesn't operate on a `amdaie.flow`";
 
   auto objFifo =
-      dyn_cast<AIE::ObjectFifoCreateOp>(mapper.lookup(dmaOp.getOperation()));
+      dyn_cast<AIE::ObjectFifoCreateOp>(mapper.lookup(flowOp.getOperation()));
   if (!objFifo) {
     return acquireOp.emitError()
            << "input isn't mapped to an `aie.objectifo` operation";
@@ -452,44 +449,48 @@ LogicalResult coreToAIE(IRRewriter &rewriter, AMDAIE::CoreOp coreOp,
 // Convert amdaie.circular_dma_cpy_nd operation to aie.objectfifo
 //===----------------------------------------------------------------------===//
 
-/// Convert the `amdaie.circular_dma_cpy_nd` operation into bidirectional object
+/// Convert the `amdaie.flow` operation into bidirectional object
 /// fifos.
-LogicalResult circularDmaToAIE(IRRewriter &rewriter,
-                               AMDAIE::CircularDmaCpyNdOp dmaOp,
-                               IRMapping &mapper, Block *deviceBlock,
-                               int &dmaId) {
+LogicalResult flowToAIE(IRRewriter &rewriter, AMDAIE::FlowOp flowOp,
+                        IRMapping &mapper, Block *deviceBlock, int &dmaId) {
   LLVM_DEBUG(llvm::dbgs() << "Convert [AMDAIE::CircularDmaCpyNdOp]\n");
   rewriter.setInsertionPointToEnd(deviceBlock);
-  if (!dmaOp.getSource()) return dmaOp.emitOpError() << "expected a source";
+  if (!flowOp.getSource()) return flowOp.emitOpError() << "expected a source";
   auto sourceLogicalObjFifo = dyn_cast<AMDAIE::LogicalObjFifoOpInterface>(
-      dmaOp.getSource().getDefiningOp());
+      flowOp.getSource().getDefiningOp());
   if (!sourceLogicalObjFifo)
-    return dmaOp.emitOpError() << "expected a logical objectFifo source";
+    return flowOp.emitOpError() << "expected a logical objectFifo source";
   SmallVector<Value> newSourceTiles =
       llvm::map_to_vector(sourceLogicalObjFifo.getTiles(),
                           [&](Value tile) { return mapper.lookup(tile); });
   if (newSourceTiles.size() != 1) {
-    return dmaOp.emitError()
-           << "Can't create an `aie.objectfifo` from this DMA operation as "
-              "`ObjectFifoCreateOp` only handles a single source tile for now.";
+    return flowOp.emitError()
+           << "Can't create an `aie.objectfifo` from this flow operation as "
+              "`ObjectFifoCreateOp` only handles a single source tile for now, "
+              "but got: ";
   }
   Value newSourceTile = newSourceTiles[0];
 
-  if (!dmaOp.getTarget()) return dmaOp.emitOpError() << "expected a source";
+  if (!flowOp.getTarget()) return flowOp.emitOpError() << "expected a source";
   auto targetLogicalObjFifo = dyn_cast<AMDAIE::LogicalObjFifoOpInterface>(
-      dmaOp.getTarget().getDefiningOp());
+      flowOp.getTarget().getDefiningOp());
   if (!targetLogicalObjFifo)
-    return dmaOp.emitOpError() << "expected a logical objectFifo source";
+    return flowOp.emitOpError() << "expected a logical objectFifo source";
   SmallVector<Value> newTargetTiles =
       llvm::map_to_vector(targetLogicalObjFifo.getTiles(),
                           [&](Value tile) { return mapper.lookup(tile); });
 
+  FailureOr<AMDAIE::NpuCircularDmaCpyNdOp> npuDmaUserOp =
+      flowOp.getNpuCircularDmaCpyNdUser();
+  if (failed(npuDmaUserOp)) return failure();
+
   auto symName = "obj" + std::to_string(dmaId++);
   auto symAttr = rewriter.getStringAttr(symName);
   FailureOr<AIE::ObjectFifoCreateOp> objFifo =
-      createObjectFifo(rewriter, dmaOp, newSourceTile, newTargetTiles, symAttr);
+      createObjectFifo(rewriter, flowOp, npuDmaUserOp.value(), newSourceTile,
+                       newTargetTiles, symAttr);
   if (failed(objFifo)) return failure();
-  mapper.map(dmaOp.getOperation(), objFifo.value().getOperation());
+  mapper.map(flowOp.getOperation(), objFifo.value().getOperation());
   return success();
 }
 
@@ -606,10 +607,10 @@ LogicalResult npuDmaCpyNdOpToAIE(IRRewriter &rewriter,
       return dmaOp.emitError() << "could not canonicalize for AIE";
     }
 
-    AMDAIE::CircularDmaCpyNdOp dmaCpyNd = dmaOp.getDmaCpyNdOp();
+    AMDAIE::FlowOp flowOp = dmaOp.getFlowOp();
     Value memref = bindingsMapper.lookup(sourceLogicalObjFifo.getMemref());
     auto objFifo = dyn_cast<xilinx::AIE::ObjectFifoCreateOp>(
-        mapper.lookup(dmaCpyNd.getOperation()));
+        mapper.lookup(flowOp.getOperation()));
     if (!objFifo) {
       return dmaOp.emitError()
              << "input isn't mapped to an `aie.objectifo` operation";
@@ -652,10 +653,10 @@ LogicalResult npuDmaCpyNdOpToAIE(IRRewriter &rewriter,
       return dmaOp.emitError() << "could not canonicalize for AIE";
     }
 
-    AMDAIE::CircularDmaCpyNdOp dmaCpyNd = dmaOp.getDmaCpyNdOp();
+    AMDAIE::FlowOp flowOp = dmaOp.getFlowOp();
     Value memref = bindingsMapper.lookup(targetLogicalObjFifo.getMemref());
     auto objFifo = dyn_cast<xilinx::AIE::ObjectFifoCreateOp>(
-        mapper.lookup(dmaCpyNd.getOperation()));
+        mapper.lookup(flowOp.getOperation()));
     if (!objFifo) {
       return dmaOp.emitError()
              << "input isn't mapped to an `aie.objectifo` operation";
@@ -675,9 +676,9 @@ LogicalResult npuDmaWaitToAIE(IRRewriter &rewriter, AMDAIE::NpuDmaWaitOp waitOp,
                               SmallVector<Operation *> &toBeErased,
                               IRMapping &mapper, IRMapping &bindingsMapper) {
   rewriter.setInsertionPoint(waitOp);
-  AMDAIE::CircularDmaCpyNdOp dmaCpyNd = waitOp.getDmaOp().getDmaCpyNdOp();
+  AMDAIE::FlowOp flowOp = waitOp.getDmaOp().getFlowOp();
   auto objFifo = dyn_cast<xilinx::AIE::ObjectFifoCreateOp>(
-      mapper.lookup(dmaCpyNd.getOperation()));
+      mapper.lookup(flowOp.getOperation()));
   if (!objFifo) {
     return waitOp.emitError()
            << "input isn't mapped to an `aie.objectifo` operation";
@@ -714,6 +715,13 @@ LogicalResult controlCodeToAie(IRRewriter &rewriter,
   WalkResult res =
       funcOp->walk<WalkOrder::PostOrder, ReverseIterator>([&](Operation *op) {
         if (TypeSwitch<Operation *, LogicalResult>(op)
+                .Case<AMDAIE::NpuCircularDmaCpyNdOp>([&](auto dmaOp) {
+                  // TODO(jornt): This is temporarily handled already by
+                  // combining with `FlowOp` to create `aie.objectfifo` until we
+                  // get rid of those.
+                  eraseOp(rewriter, mapper, dmaOp);
+                  return success();
+                })
                 .Case<AMDAIE::NpuDmaCpyNdOp>([&](auto dmaOp) {
                   return npuDmaCpyNdOpToAIE(rewriter, dmaOp, toBeErased, mapper,
                                             bindingsMapper);
@@ -824,8 +832,12 @@ LogicalResult workgroupToAIE(IRRewriter &rewriter,
           return WalkResult::advance();
         })
         .Case<AMDAIE::CircularDmaCpyNdOp>([&](auto dmaOp) {
-          if (failed(circularDmaToAIE(rewriter, dmaOp, mapper, deviceBlock,
-                                      dmaId))) {
+          dmaOp.emitOpError()
+              << "`amdaie.circular_dma_cpy_nd` unsupported in lowering to AIE";
+          return WalkResult::interrupt();
+        })
+        .Case<AMDAIE::FlowOp>([&](auto dmaOp) {
+          if (failed(flowToAIE(rewriter, dmaOp, mapper, deviceBlock, dmaId))) {
             return WalkResult::interrupt();
           }
           return WalkResult::advance();
@@ -1032,7 +1044,7 @@ class AMDAIELowerToAIEPass
   }
 
   AMDAIELowerToAIEPass() = default;
-  AMDAIELowerToAIEPass(const AMDAIELowerToAIEPass &pass){};
+  AMDAIELowerToAIEPass(const AMDAIELowerToAIEPass &pass) {};
   void runOnOperation() override;
 };
 

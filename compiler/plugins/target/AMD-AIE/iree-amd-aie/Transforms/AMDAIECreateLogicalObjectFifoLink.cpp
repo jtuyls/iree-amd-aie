@@ -33,10 +33,13 @@ namespace mlir::iree_compiler::AMDAIE {
 /// 63].
 template <CopyOpOperateOn OperateOn>
 LogicalResult checkForNoOverlappingAccessPatterns(
-    const SmallVector<std::pair<DoublyStridedCopyOpInterface, int64_t>>
-        &stridedOps) {
-  for (auto &&[i, stridedOpAndOffset] : llvm::enumerate(stridedOps)) {
-    DoublyStridedCopyOpInterface stridedOp = stridedOpAndOffset.first;
+    SmallVector<std::pair<AMDAIE::FlowOp, int64_t>> &flowOps) {
+  for (auto &&[i, flowOpAndOffset] : llvm::enumerate(flowOps)) {
+    FailureOr<AMDAIE::NpuCircularDmaCpyNdOp> npuDmaUserOp =
+        flowOpAndOffset.first.getNpuCircularDmaCpyNdUser();
+    if (failed(npuDmaUserOp)) return failure();
+    auto stridedOp = cast<AMDAIE::DoublyStridedOpInterface>(
+        npuDmaUserOp.value().getOperation());
     std::optional<int64_t> extent;
     if constexpr (OperateOn == CopyOpOperateOn::Source) {
       extent = stridedOp.getSourceStaticExtent();
@@ -47,9 +50,9 @@ LogicalResult checkForNoOverlappingAccessPatterns(
       return stridedOp.emitOpError()
              << "non-constant access extent is not supported";
     }
-    int64_t offset = stridedOpAndOffset.second;
-    if (i < (stridedOps.size() - 1) &&
-        (offset + extent.value()) > stridedOps[i + 1].second) {
+    int64_t offset = flowOpAndOffset.second;
+    if (i < (flowOps.size() - 1) &&
+        (offset + extent.value()) > flowOps[i + 1].second) {
       return stridedOp.emitOpError()
              << "access pattern of strided operation overlaps with next one, "
                 "which is not supported for now";
@@ -71,56 +74,65 @@ LogicalResult createLogicalObjectFifoLink(
     return success();
   }
 
-  // Visit all DoublyStridedCopyOpInterface users of this logical objectFifo and
+  // Visit all DoublyStridedOpInterface users of this logical objectFifo and
   // add them to either the input or output side of this logical objectFifo
   // together with the base offset to be used later for sorting. While doing
   // this, keep track of the last user operation for insertion purposes.
-  SmallVector<std::pair<DoublyStridedCopyOpInterface, int64_t>> ins;
-  SmallVector<std::pair<DoublyStridedCopyOpInterface, int64_t>> outs;
-  DoublyStridedCopyOpInterface lastUserOp;
+  SmallVector<std::pair<AMDAIE::FlowOp, int64_t>> ins;
+  SmallVector<std::pair<AMDAIE::FlowOp, int64_t>> outs;
+  AMDAIE::FlowOp lastUserOp;
   for (Operation *userOp : logicalObjectFifo->getUsers()) {
-    if (auto stridedOp = dyn_cast<DoublyStridedCopyOpInterface>(userOp)) {
-      if (lastUserOp && stridedOp->getBlock() != lastUserOp->getBlock()) {
-        logicalObjectFifo->emitError(
-            "does have copy-like users not residing in the same block");
-        return failure();
-      }
-      auto sourceLogicalObjectFifo =
-          dyn_cast<AMDAIE::LogicalObjectFifoFromMemrefOp>(
-              stridedOp.getSource().getDefiningOp());
-      if (!lastUserOp || lastUserOp->isBeforeInBlock(stridedOp)) {
-        lastUserOp = stridedOp;
-      }
-      // The `sourceLogicalObjectFifo` could be either a
-      // `LogicalObjectFifoFromMemrefOp` or `LogicalObjectFifoPlaceholderOp`,
-      // but currently the linking only works with
-      // `LogicalObjectFifoFromMemrefOp` on L2.
-      if (sourceLogicalObjectFifo &&
-          logicalObjectFifo == sourceLogicalObjectFifo) {
-        if (std::optional<int64_t> offset =
-                stridedOp.getSourceStaticBaseOffset()) {
-          outs.push_back(std::make_pair(stridedOp, offset.value()));
-        } else {
-          return stridedOp.emitOpError()
-                 << "non-constant offset found which is not supported";
-        }
+    auto flowOp = dyn_cast<AMDAIE::FlowOp>(userOp);
+    llvm::outs() << "Flow op: " << flowOp << "\n";
+    if (!flowOp) {
+      return logicalObjectFifo.emitOpError()
+             << "found user which is not an `amdaie.flow` op";
+    }
+    FailureOr<AMDAIE::NpuCircularDmaCpyNdOp> npuDmaUserOp =
+        flowOp.getNpuCircularDmaCpyNdUser();
+    if (failed(npuDmaUserOp)) return failure();
+    auto stridedOp = cast<AMDAIE::DoublyStridedOpInterface>(
+        npuDmaUserOp.value().getOperation());
+
+    if (lastUserOp && flowOp->getBlock() != lastUserOp->getBlock()) {
+      logicalObjectFifo->emitError(
+          "does have copy-like users not residing in the same block");
+      return failure();
+    }
+    auto sourceLogicalObjectFifo =
+        dyn_cast<AMDAIE::LogicalObjectFifoFromMemrefOp>(
+            flowOp.getSource().getDefiningOp());
+    if (!lastUserOp || lastUserOp->isBeforeInBlock(flowOp)) {
+      lastUserOp = flowOp;
+    }
+    // The `sourceLogicalObjectFifo` could be either a
+    // `LogicalObjectFifoFromMemrefOp` or `LogicalObjectFifoPlaceholderOp`,
+    // but currently the linking only works with
+    // `LogicalObjectFifoFromMemrefOp` on L2.
+    if (sourceLogicalObjectFifo &&
+        logicalObjectFifo == sourceLogicalObjectFifo) {
+      if (std::optional<int64_t> offset =
+              stridedOp.getSourceStaticBaseOffset()) {
+        outs.push_back(std::make_pair(flowOp, offset.value()));
       } else {
-        if (std::optional<int64_t> offset =
-                stridedOp.getTargetStaticBaseOffset()) {
-          ins.push_back(std::make_pair(stridedOp, offset.value()));
-        } else {
-          return stridedOp.emitOpError()
-                 << "non-constant offset found which is not supported";
-        }
+        return stridedOp.emitOpError()
+               << "non-constant offset found which is not supported";
+      }
+    } else {
+      if (std::optional<int64_t> offset =
+              stridedOp.getTargetStaticBaseOffset()) {
+        ins.push_back(std::make_pair(flowOp, offset.value()));
+      } else {
+        return stridedOp.emitOpError()
+               << "non-constant offset found which is not supported";
       }
     }
   }
 
   // Sort the inputs and outputs on offset as the link operation uses this order
   // to generate correct data buffer sizes.
-  auto comparator =
-      [](std::pair<DoublyStridedCopyOpInterface, int64_t> a,
-         std::pair<DoublyStridedCopyOpInterface, int64_t> b) -> bool {
+  auto comparator = [](std::pair<AMDAIE::FlowOp, int64_t> a,
+                       std::pair<AMDAIE::FlowOp, int64_t> b) -> bool {
     return a.second < b.second;
   };
 
@@ -139,13 +151,15 @@ LogicalResult createLogicalObjectFifoLink(
   }
 
   SmallVector<Value> inResults = llvm::map_to_vector<8>(
-      ins, [](std::pair<DoublyStridedCopyOpInterface, int64_t> elem) -> Value {
+      ins, [](std::pair<AMDAIE::FlowOp, int64_t> elem) -> Value {
         return cast<Value>(elem.first->getResult(0));
       });
   SmallVector<Value> outResults = llvm::map_to_vector(
-      outs, [](std::pair<DoublyStridedCopyOpInterface, int64_t> elem) -> Value {
+      outs, [](std::pair<AMDAIE::FlowOp, int64_t> elem) -> Value {
         return cast<Value>(elem.first->getResult(0));
       });
+
+  llvm::outs() << "LogicalObjectFifoLink create\n";
 
   // Insert the `LogicalObjectFifoLink` after the last user operation.
   if (lastUserOp) {
@@ -181,24 +195,42 @@ struct AMDAIECreateLogicalObjectFifoLinkPass
     if (res.wasInterrupted()) return signalPassFailure();
 
     // Remove all non-zero offsets.
-    parentOp->walk([&](AMDAIE::LogicalObjectFifoLink linkOp) {
+    res = parentOp->walk([&](AMDAIE::LogicalObjectFifoLink linkOp) {
       for (Value input : linkOp.getIns()) {
-        if (auto stridedOp = dyn_cast<AMDAIE::DoublyStridedCopyOpInterface>(
-                input.getDefiningOp())) {
-          SmallVector<int64_t> shape;
-          (void)discardAllNonZeroOffsets<CopyOpOperateOn::Target>(
-              rewriter, stridedOp, shape);
+        auto flowOp = dyn_cast<AMDAIE::FlowOp>(input.getDefiningOp());
+        if (!flowOp) {
+          linkOp.emitOpError()
+              << "found input which is not an `amdaie.flow` op";
+          return WalkResult::interrupt();
         }
+        FailureOr<AMDAIE::NpuCircularDmaCpyNdOp> npuDmaUserOp =
+            flowOp.getNpuCircularDmaCpyNdUser();
+        if (failed(npuDmaUserOp)) return WalkResult::interrupt();
+        auto stridedOp = cast<AMDAIE::DoublyStridedOpInterface>(
+            npuDmaUserOp.value().getOperation());
+        SmallVector<int64_t> shape;
+        (void)discardAllNonZeroOffsets<CopyOpOperateOn::Target>(
+            rewriter, stridedOp, shape);
       }
       for (Value output : linkOp.getOuts()) {
-        if (auto stridedOp = dyn_cast<AMDAIE::DoublyStridedCopyOpInterface>(
-                output.getDefiningOp())) {
-          SmallVector<int64_t> shape;
-          (void)discardAllNonZeroOffsets<CopyOpOperateOn::Source>(
-              rewriter, stridedOp, shape);
+        auto flowOp = dyn_cast<AMDAIE::FlowOp>(output.getDefiningOp());
+        if (!flowOp) {
+          linkOp.emitOpError()
+              << "found input which is not an `amdaie.flow` op";
+          return WalkResult::interrupt();
         }
+        FailureOr<AMDAIE::NpuCircularDmaCpyNdOp> npuDmaUserOp =
+            flowOp.getNpuCircularDmaCpyNdUser();
+        if (failed(npuDmaUserOp)) return WalkResult::interrupt();
+        auto stridedOp = cast<AMDAIE::DoublyStridedOpInterface>(
+            npuDmaUserOp.value().getOperation());
+        SmallVector<int64_t> shape;
+        (void)discardAllNonZeroOffsets<CopyOpOperateOn::Source>(
+            rewriter, stridedOp, shape);
       }
+      return WalkResult::advance();
     });
+    if (res.wasInterrupted()) return signalPassFailure();
   }
 };
 

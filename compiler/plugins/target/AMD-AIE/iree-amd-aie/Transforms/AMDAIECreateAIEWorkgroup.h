@@ -219,6 +219,15 @@ class WorkgroupBuilder {
  private:
   /// Build function that handles `amdaie.dma_cpy_nd` by converting it into a
   /// workgroup DMA with potentially corresponding control code.
+  LogicalResult buildForCircularDmaCpyNdOp(AMDAIE::CircularDmaCpyNdOp dmaOp,
+                                           Block *target, Block *controlCode,
+                                           CoreContext &coreContext,
+                                           Block::iterator targetBegin,
+                                           Block::iterator controlCodeBegin,
+                                           Block::iterator controlCodeEnd);
+
+  /// Build function that handles `amdaie.dma_cpy_nd` by converting it into a
+  /// workgroup DMA with potentially corresponding control code.
   LogicalResult buildForDmaCpyNdOp(AMDAIE::DmaCpyNdOp dmaOp, Block *target,
                                    Block *controlCode, CoreContext &coreContext,
                                    Block::iterator targetBegin,
