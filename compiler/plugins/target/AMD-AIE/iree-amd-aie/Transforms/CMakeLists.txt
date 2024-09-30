@@ -55,6 +55,7 @@ iree_cc_library(
     "AMDAIECanonicalizeNpuDmaCpyNd.cpp"
     "AMDAIECanonicalizeDoublyStridedOp.cpp"
     "AMDAIECombineStridedOps.cpp"
+    "AMDAIEConnectionToFlow.cpp"
     "AMDAIEConvertToDma.cpp"
     "AMDAIEControlCodeLoopUnroll.cpp"
     "AMDAIEConvertCoreForallToFor.cpp"

@@ -133,6 +133,12 @@ def AMDAIECombineStridedOps :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIECombineStridedOpsPass()";
 }
 
+def AMDAIEConnectionToFlow :
+    Pass<"iree-amdaie-connection-to-flow", ""> {
+  let summary = "Create flow ops for connections.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEConnectionToFlowPass()";
+}
+
 def AMDAIEControlCodeLoopUnroll :
     Pass<"iree-amdaie-controlcode-loop-unroll", ""> {
   let summary = "Unroll the loops in the control code regions.";

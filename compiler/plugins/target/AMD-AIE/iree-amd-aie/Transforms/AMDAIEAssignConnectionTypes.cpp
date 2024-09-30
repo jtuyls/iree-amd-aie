@@ -43,7 +43,7 @@ void AMDAIEAssignConnectionTypesPass::runOnOperation() {
     rewriter.replaceOpWithNewOp<AMDAIE::ConnectionOp>(
         connectionOp, connectionOp.getTarget(),
         connectionOp.getTargetChannels(), connectionOp.getSource(),
-        connectionOp.getSourceChannels(), connectionTypeAttr);
+        connectionOp.getSourceChannels(), connectionTypeAttr, nullptr);
     return WalkResult::advance();
   });
   if (res.wasInterrupted()) return signalPassFailure();

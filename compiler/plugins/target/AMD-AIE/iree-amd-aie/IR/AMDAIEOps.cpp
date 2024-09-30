@@ -445,13 +445,14 @@ void CircularDmaCpyNdOp::getCanonicalizationPatterns(RewritePatternSet &results,
 
 void ConnectionOp::build(mlir::OpBuilder &b, mlir::OperationState &result,
                          Value target, Value source) {
-  build(b, result, target, {}, source, {}, nullptr);
+  build(b, result, target, {}, source, {}, nullptr, nullptr);
 }
 
 void ConnectionOp::build(mlir::OpBuilder &b, mlir::OperationState &result,
                          Value target, ValueRange targetChannels, Value source,
                          ValueRange sourceChannels) {
-  build(b, result, target, targetChannels, source, sourceChannels, nullptr);
+  build(b, result, target, targetChannels, source, sourceChannels, nullptr,
+        nullptr);
 }
 
 FailureOr<AMDAIE::NpuCircularDmaCpyNdOp>
@@ -467,6 +468,10 @@ ConnectionOp::getNpuCircularDmaCpyNdUser() {
                          << npuDmaUsers.size();
   }
   return npuDmaUsers[0];
+}
+
+AMDAIE::FlowOp ConnectionOp::getFlowOp() {
+  return dyn_cast_if_present<AMDAIE::FlowOp>(getFlow().getDefiningOp());
 }
 
 //===----------------------------------------------------------------------===//

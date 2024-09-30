@@ -91,6 +91,25 @@ def AMDAIE_EndOp: AMDAIE_Op<"end", [Terminator]> {
   let assemblyFormat = [{ attr-dict }];
 }
 
+def AMDAIE_FlowOp: AMDAIE_Op<"flow", [AttrSizedOperandSegments]>, Results<(outs Index)> {
+  let summary = "";
+  let description = [{
+    TODO
+  }];
+
+  let arguments = (
+    ins Variadic<Index>:$sources,
+        Variadic<Index>:$targets,
+        OptionalAttr<UI8Attr>:$packet_id
+  );
+
+  let assemblyFormat = [{ `(` `{` $sources `}` `->` `{` $targets `}` `)` attr-dict }];
+
+
+  // let extraClassDeclaration = [{
+  // }];
+}
+
 def AMDAIE_TileOp: AMDAIE_Op<"tile", [
     Pure,
     DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>
@@ -325,7 +344,8 @@ def AMDAIE_ChannelOp: AMDAIE_Op<"channel", [
 
   let arguments = (
     ins Index:$tile,
-        ConfinedAttr<I8Attr, [IntMinValue<0>]>:$value
+        ConfinedAttr<I8Attr, [IntMinValue<0>]>:$value,
+        StrmSwPortTypeAttr:$port_type
   );
 
   let extraClassDeclaration = [{
@@ -733,8 +753,8 @@ def AMDAIE_ConnectionOp: AMDAIE_Op<"connection",
         Variadic<Index>:$target_channels,
         AnyAMDAIELogicalObjectFifoType:$source,
         Variadic<Index>:$source_channels,
-        OptionalAttr<AMDAIE_ConnectionType>:$connection_type
-        
+        OptionalAttr<AMDAIE_ConnectionType>:$connection_type,
+        Optional<Index>:$flow
   );
   let results = (outs Index:$result);
 
@@ -746,6 +766,7 @@ def AMDAIE_ConnectionOp: AMDAIE_Op<"connection",
     $source 
     ( ` ` `{` $source_channels^  `}` )?
     ( `,` `connection_type` `=` $connection_type^ )?
+    ( `,` `flow` `=` $flow^ )?
     `)`  
     attr-dict
     `:` `(` type($target) `,` type($source) `)`
@@ -758,6 +779,7 @@ def AMDAIE_ConnectionOp: AMDAIE_Op<"connection",
   ];
 
   let extraClassDeclaration = [{
+    FlowOp getFlowOp();
     Value getSourceMemref() { return getSource(); }
     Value getTargetMemref() { return getTarget(); }
     Type getSourceType() { return getSource().getType(); }
