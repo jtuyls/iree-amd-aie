@@ -21,6 +21,11 @@ include "iree-amd-aie/IR/AMDAIEDmaOpInterface.td"
 include "iree-amd-aie/IR/AMDAIELogicalObjFifoOpInterface.td"
 include "iree-amd-aie/IR/AMDAIETypes.td"
 
+// Define the AttrDef
+// def StrmSwPortTypeAttr : EnumAttr<AMDAIE_Dialect, StrmSwPortType, "StrmSwPortType"> {
+//   let assemblyFormat = "``$value";
+// }
+
 //===----------------------------------------------------------------------===//
 // IREE AMDAIE Base class
 //===----------------------------------------------------------------------===//
@@ -100,6 +105,7 @@ def AMDAIE_FlowOp: AMDAIE_Op<"flow", [AttrSizedOperandSegments]>, Results<(outs 
   let arguments = (
     ins Variadic<Index>:$sources,
         Variadic<Index>:$targets,
+        BoolAttr:$is_packet_flow,
         OptionalAttr<UI8Attr>:$packet_id
   );
 
@@ -352,7 +358,7 @@ def AMDAIE_ChannelOp: AMDAIE_Op<"channel", [
     TileOp getTileOp();
   }];
 
-  let assemblyFormat = [{ `(` $tile `,` $value `)` attr-dict }];
+  let assemblyFormat = [{ `(` $tile `,` $value `,` `port_type` `=` $port_type `)` attr-dict }];
 }
 
 //===----------------------------------------------------------------------===//

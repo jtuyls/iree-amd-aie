@@ -173,12 +173,12 @@ SmallVector<Operation *> AIEDeviceBuilder::createFlowOps(
       Block *b_pktFlow = rewriter.createBlock(&r_pktFlow);
       rewriter.setInsertionPointToStart(b_pktFlow);
       rewriter.create<AIE::PacketSourceOp>(
-          rewriter.getUnknownLoc(), aieProducerTile, AIE::WireBundle::DMA,
+          rewriter.getUnknownLoc(), aieProducerTile, producerChannel.getPortType(),
           producerChannel.getValue());
       for (AMDAIE::ChannelOp consumerChannel : consumerChannels) {
         Value aieConsumerTile = mapper.lookup(consumerChannel.getTile());
         rewriter.create<AIE::PacketDestOp>(
-            rewriter.getUnknownLoc(), aieConsumerTile, AIE::WireBundle::DMA,
+            rewriter.getUnknownLoc(), aieConsumerTile, consumerChannel.getPortType(),
             consumerChannel.getValue());
       }
       rewriter.create<AIE::EndOp>(rewriter.getUnknownLoc());

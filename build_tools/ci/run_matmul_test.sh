@@ -624,14 +624,14 @@ function run_matmul_test_on_shapes() {
 
 i32_shapes_small=(
   '32x32x32'
-  '64x32x128'
-  '128x32x64'
-  '128x32x64'
-  '128x32x128'
-  '256x32x256'
-  '32x64x32'
-  '64x64x64'
-  '128x256x128'
+  # '64x32x128'
+  # '128x32x64'
+  # '128x32x64'
+  # '128x32x128'
+  # '256x32x256'
+  # '32x64x32'
+  # '64x64x64'
+  # '128x256x128'
 )
 
 # run_matmul_test_on_shapes ${i32_shapes_small[@]} \

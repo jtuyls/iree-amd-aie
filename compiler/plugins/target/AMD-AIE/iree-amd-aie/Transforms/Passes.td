@@ -61,6 +61,12 @@ def AMDAIEAssignNpuDmaBdIds :
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEAssignNpuDmaBdIdsPass()";
 }
 
+def AMDAIEAssignPacketIds :
+    Pass<"iree-amdaie-assign-packet-ids", ""> {
+  let summary = "Assign packet ids to `amdaie.flow` operations.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEAssignPacketIdsPass()";
+}
+
 def AMDAIEBridgeToAIR : Pass<"iree-amdaie-bridge-to-air", ""> {
   let summary = "Perform transformations that allow hooking into AIR/AIE lowering";
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIEBridgeToAIRPass()";
@@ -155,6 +161,12 @@ def AMDAIECreateAIEWorkgroup :
   Pass<"iree-amdaie-create-aie-workgroup", "func::FuncOp"> {
   let summary = "Creates a single AIE workgroup.";
   let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIECreateAIEWorkgroupPass()";
+}
+
+def AMDAIECreateConfigConnections :
+    Pass<"iree-amdaie-create-config-connections", ""> {
+  let summary = "Create configuration connections.";
+  let constructor = "mlir::iree_compiler::AMDAIE::createAMDAIECreateConfigConnectionsPass()";
 }
 
 def AMDAIECreateReferenceToAllocation :

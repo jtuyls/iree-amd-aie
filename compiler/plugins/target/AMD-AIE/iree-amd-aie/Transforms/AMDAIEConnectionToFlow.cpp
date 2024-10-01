@@ -27,21 +27,17 @@ class AMDAIEConnectionToFlowPass
 void AMDAIEConnectionToFlowPass::runOnOperation() {
   Operation *parentOp = getOperation();
   IRRewriter rewriter(parentOp->getContext());
-  int pktFlowIndex{0};
   WalkResult res = parentOp->walk([&](AMDAIE::ConnectionOp connectionOp) {
     rewriter.setInsertionPoint(connectionOp);
     // TODO(jornt): currently, don't delete connections as they are still
     // needed. This will be changed in the future.
     std::optional<AMDAIE::ConnectionType> connectionType =
         connectionOp.getConnectionType();
-    
-    auto ui8ty = IntegerType::get(rewriter.getContext(), 8, IntegerType::Unsigned);
-    IntegerAttr pktIdAttr = connectionType &&
-        connectionType.value() == AMDAIE::ConnectionType::Packet ? IntegerAttr::get(ui8ty, pktFlowIndex++) : nullptr;
+    bool isPacketFlow = connectionType &&
+        connectionType.value() == AMDAIE::ConnectionType::Packet;
     auto flowOp = rewriter.create<AMDAIE::FlowOp>(rewriter.getUnknownLoc(),
                                     connectionOp.getSourceChannels(),
-                                    connectionOp.getTargetChannels(), pktIdAttr);
-    // rewriter.setInsertionPoint(connectionOp);
+                                    connectionOp.getTargetChannels(), isPacketFlow, nullptr);
     rewriter.replaceOpWithNewOp<AMDAIE::ConnectionOp>(
         connectionOp, connectionOp.getTarget(),
         connectionOp.getTargetChannels(), connectionOp.getSource(),
