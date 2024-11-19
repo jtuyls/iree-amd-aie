@@ -604,6 +604,9 @@ void addAMDAIEObjectFifoLoweringPasses(
   passManager.addPass(createAMDAIESplitLogicalObjFifosForConnectionReusePass());
   passManager.addPass(createCSEPass());
   passManager.addPass(createCanonicalizerPass());
+  passManager.addPass(createAMDAIEAssignTilesPass());
+  passManager.addPass(createCSEPass());
+  passManager.addPass(createCanonicalizerPass());
 
   passManager.addPass(createAMDAIEDmaToCircularDmaPass());
   passManager.addNestedPass<func::FuncOp>(createAMDAIECreateAIEWorkgroupPass());
@@ -613,6 +616,8 @@ void addAMDAIEObjectFifoLoweringPasses(
   passManager.addPass(createAMDAIEHoistLogicalObjFifoPass());
   passManager.addPass(createAMDAIECanonicalizeDoublyStridedOpPass());
   passManager.addPass(createAMDAIEFlattenLogicalObjectFifoPass());
+  // Uncomment to disable double buffering
+  // passManager.addPass(createAMDAIEAssignLogicalObjectFifoDepthPass({1, 1, 1}));
   passManager.addPass(createAMDAIEAssignLogicalObjectFifoDepthPass());
   passManager.addPass(createAMDAIEAccessToAcquireReleasePass());
   passManager.addPass(createAMDAIENoneAccessToTemporaryBufferPass());

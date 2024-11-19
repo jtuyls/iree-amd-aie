@@ -17,11 +17,30 @@
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Transforms.h"
 #include "iree-amd-aie/aie_runtime/iree_aie_runtime.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Transforms.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
 #define DEBUG_TYPE "iree-amdaie-dma-composition"
 
 namespace mlir::iree_compiler::AMDAIE {
+
+LogicalResult forallToFor(RewriterBase &rewriter, Operation *op) {
+  WalkResult res = op->walk([&](scf::ForallOp forallOp) {
+    rewriter.setInsertionPoint(forallOp);
+    if (succeeded(forallOp.promoteIfSingleIteration(rewriter))) {
+      return WalkResult::advance();
+    }
+    if (failed(scf::forallToForLoop(rewriter, forallOp))) {
+      forallOp.emitOpError() << "failed to transform scf.forall to scf.for";
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (res.wasInterrupted()) return failure();
+  return success();
+}
 
 namespace {
 
@@ -32,6 +51,9 @@ class AMDAIEDmaCompositionPass
   AMDAIEDmaCompositionPass(const AMDAIEDmaCompositionPass &pass){};
   AMDAIEDmaCompositionPass(const AMDAIEDmaCompositionOptions &options)
       : AMDAIEDmaCompositionBase(options) {}
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<scf::SCFDialect>();
+  }
   void runOnOperation() override;
 };
 
@@ -55,13 +77,24 @@ void AMDAIEDmaCompositionPass::runOnOperation() {
                                     onlyZeroStrideOnOuterDim);
   populateStridedOpCombinationPattern(patterns);
   populateCanonicalizeDoublyStridedOpPatterns(patterns, false, deviceModel);
+  
+  IRRewriter rewriter(parentOp->getContext());
+  SmallVector<AMDAIE::ControlCodeOp> controlCodeOps;
+  parentOp->walk([&](AMDAIE::ControlCodeOp controlCodeOp) {
+    if (failed(forallToFor(rewriter, controlCodeOp.getOperation()))) {
+      return signalPassFailure();
+    }
+    controlCodeOp->walk([&](affine::AffineApplyOp applyOp) {
+      (void)hoistForAffineApplyOp(rewriter, applyOp);
+    });
+  });
 
   if (failed(applyPatternsAndFoldGreedily(parentOp, std::move(patterns)))) {
     parentOp->emitOpError("failed to compose strided operations");
     return signalPassFailure();
   }
 
-  IRRewriter rewriter(parentOp->getContext());
+  // IRRewriter rewriter(parentOp->getContext());
   if (failed(moveNpuDmaSyncUsersAfterAncestorInSameBlock(rewriter, parentOp))) {
     parentOp->emitOpError() << "failed to move DMA users to correct scope "
                                "after strided op composition";

@@ -4,6 +4,9 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <chrono>
+#include <iostream>
+
 #include "iree-amd-aie/driver/xrt-lite/direct_command_buffer.h"
 
 #include "iree-amd-aie/driver/xrt-lite/buffer.h"
@@ -13,6 +16,7 @@
 #include "iree-amd-aie/driver/xrt-lite/util.h"
 #include "iree/hal/utils/resource_set.h"
 
+#define IREE_AMDAIE_TIME_KERNEL
 #ifdef IREE_AMDAIE_TIME_KERNEL
 #include <chrono>
 #include <iostream>
@@ -200,10 +204,14 @@ static iree_status_t iree_hal_xrt_lite_direct_command_buffer_dispatch(
 
 #ifdef IREE_AMDAIE_TIME_KERNEL
   auto time0 = std::chrono::high_resolution_clock::now();
-  hwq->issue_command(ebuf.get_exec_buf_bo());
-  hwq->wait_command(ebuf.get_exec_buf_bo(), 0);
+   int nb_runs = 1000;
+  for (int i = 0; i < nb_runs; i++) {
+    ebuf.m_cmd_pkt->state = ERT_CMD_STATE_NEW;
+    hwq->issue_command(ebuf.get_exec_buf_bo());
+    hwq->wait_command(ebuf.get_exec_buf_bo(), 0);
+  }
   auto time1 = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> elapsed_s = time1 - time0;
+  std::chrono::duration<double> elapsed_s = (time1 - time0) / nb_runs;
   double ellapsed_ms = elapsed_s.count() * 1000;
   std::cout << "[IREE_AMDAIE] Kernel time: " << ellapsed_ms << " [ms]\n";
 #else
