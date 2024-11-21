@@ -13,6 +13,44 @@
 
 namespace mlir::iree_compiler::AMDAIE {
 
+struct DmaSplitInfo {
+  size_t sourceSplitDim;
+  size_t targetSplitDim;
+}
+
+using DmaObjFifoPairT =
+    std::pair<AMDAIE::DmaCpyNdOp, AMDAIE::LogicalObjectFifoFromMemrefOp>;
+
+///
+LogicalResult collectSplittingDims(
+    const SmallVector<DmaObjFifoPairT> &dmaObjFifoPairs,
+    DenseMap<AMDAIE::DmaCpyNdOp, DmaSplitInfo> &dmaSplitInfoMap,
+    DenseMap<AMDAIE::LogicalObjectFifoFromMemrefOp, size_t>
+        &objFifoSplitDimMap) {
+  for (auto &&[dmaOp, objFifo] : dmaObjFifoPairs) {
+    // The splitting dimension is the outermost, non-unit, dimension.
+    ArrayRef<int64_t> memrefShape = objFifo.getMemrefType().getShape();
+    if (llvm::any_of(memrefShape, [](int64_t size) { return size < 0; })) {
+      return objFifo.emitOpError()
+             << "can't find a valid split dimension for dynamic sizes memref";
+    }
+    size_t objFifoSplitDim{0};
+    for (int i = 0; i < memrefShape.size(); i++) {
+      if (memrefShape[i] != 1) {
+        objFifoSplitDim = i;
+        break;
+      }
+    }
+    int64_t remainingSize =
+        std::accumulate(memrefShape.begin() + objFifoSplitDim + 1,
+                        memrefShape.end(), 1, std::multiplies<>());
+
+    if (dmaOp.getTargetObjectFifo() == objFifo) {
+    }
+    objFifoSplitDimMap[objFifo] = objFifoSplitDim.value();
+  }
+}
+
 namespace {
 
 class AMDAIESplitLogicalObjFifosPass
