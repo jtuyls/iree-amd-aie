@@ -41,13 +41,41 @@ LogicalResult collectSplittingDims(
         break;
       }
     }
-    int64_t remainingSize =
+    int64_t remainderSize =
         std::accumulate(memrefShape.begin() + objFifoSplitDim + 1,
                         memrefShape.end(), 1, std::multiplies<>());
 
+    size_t sourceSplitDim{0};
+    size_t targetSplitDim{0};
     if (dmaOp.getTargetObjectFifo() == objFifo) {
+      // Find outermost dimension in the access pattern that has stride ==
+      // remainderSize and size != 1.
+      std::optional<SmallVector<int64_t>> targetSizes =
+          getConstantIntValues(dmaOp.getTargetMixedSizes());
+      std::optional<SmallVector<int64_t>> targetStrides =
+          getConstantIntValues(dmaOp.getTargetMixedStrides());
+      std::optional<SmallVector<int64_t>> sourceSizes =
+          getConstantIntValues(dmaOp.getSourceMixedSizes());
+      if (!targetSizes.has_value() || !targetStrides.has_value() ||
+          !sourceSizes.has_value()) {
+        return dmaOp.emitOpError() << "has unsupported dynamic target strides "
+                                      "or sizes or source sizes";
+      }
+      for (auto iter : llvm::enumerate(llvm::zip(targetSizes.value(), targetStrides.value()))) {
+        int64_t size = std::get<0>(iter.value());
+        int64_t stride = std::get<1>(iter.value());
+        if (stride == remainderSize && size != 1) {
+          targetSplitDim = iter.index();
+          break;
+        }
+      }
+      int64_t tgtRemainderSize =
+          std::accumulate(targetSizes.begin() + targetSplitDim + 1,
+                          targetSizes.end(), 1, std::multiplies<>());
+      SmallVector<int64_t> sourceRemainderSizes 
+    } else if (dmaOp.getSourceObjectFifo() == objFifo) {
     }
-    objFifoSplitDimMap[objFifo] = objFifoSplitDim.value();
+    objFifoSplitDimMap[objFifo] = objFifoSplitDim;
   }
 }
 
