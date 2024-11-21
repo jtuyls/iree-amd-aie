@@ -602,6 +602,7 @@ void addAMDAIEObjectFifoLoweringPasses(
   passManager.addPass(createCanonicalizerPass());
 
   passManager.addPass(createAMDAIESplitLogicalObjFifosForConnectionReusePass());
+  passManager.addPass(createAMDAIESplitLogicalObjFifosPass());
   passManager.addPass(createCSEPass());
   passManager.addPass(createCanonicalizerPass());
 
