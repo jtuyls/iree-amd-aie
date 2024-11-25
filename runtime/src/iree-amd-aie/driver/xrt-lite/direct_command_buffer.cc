@@ -200,7 +200,7 @@ static iree_status_t iree_hal_xrt_lite_direct_command_buffer_dispatch(
   shim_xdna::hw_q* hwq = context.get_hw_queue();
 
 #ifdef IREE_AMDAIE_TIME_KERNEL
-  int nb_runs = 1000;
+  int nb_runs = 1;
   auto time0 = std::chrono::high_resolution_clock::now();
   for (int i = 0; i < nb_runs; i++) {
     ebuf.m_cmd_pkt->state = ERT_CMD_STATE_NEW;

@@ -408,7 +408,7 @@ function run_matmul_test() {
                       --mlir-elide-resource-strings-if-larger=10 \
                       --iree-amd-aie-show-invoked-commands
                       --debug-only=iree-amdaie-controlcode-to-transaction \
-                      --iree-amdaie-enable-infinite-loop-around-core-block=true --mlir-print-ir-before-all"
+                      --iree-amdaie-enable-infinite-loop-around-core-block=true"
                       # --mlir-print-ir-before-all
 
   if [ $use_ukernel -ne 0 ]; then
@@ -685,8 +685,8 @@ function run_matmul_test_on_shapes() {
 
 bf16_i8_shapes_small=(
   # '64x64x64'
-  '128x256x128'
-  # '512x512x4096'
+  # '128x256x128'
+  '512x512x4096'
 )
 
 # bf16_i8_shapes_medium=(
