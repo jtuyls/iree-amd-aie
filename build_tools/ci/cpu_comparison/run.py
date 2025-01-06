@@ -364,6 +364,7 @@ class MatmulBenchmark(BaseMatmul):
         aie_compilation_flags=None,
         n_repeats=1,
         n_kernel_runs=1,
+        use_chess=False,
     ):
         aie_compilation_flags = (
             [] if aie_compilation_flags is None else aie_compilation_flags
@@ -381,6 +382,7 @@ class MatmulBenchmark(BaseMatmul):
             use_ukernel=use_ukernel,
             n_repeats=n_repeats,
             n_kernel_runs=n_kernel_runs,
+            use_chess=use_chess,
         )
 
         self.name = f"matmul_benchmark_{M}_{N}_{K}_{input_type}_{acc_type}"
@@ -728,6 +730,7 @@ class BatchMatmul(BaseMatmul):
     def _execute(self, config):
         matmul_template_dir = config.file_dir / "matmul_template"
         template_name = matmul_template_dir / "batch_matmul_BxMxK_BxKxN.mlir"
+        # self.add_aie_compilation_flags(["--mlir-print-ir-before-all", "--debug-only=iree-amdaie-combine-strided-ops,iree-amdaie-dma-utils"])
         generate_matmul_test(
             self.get_filename(config),
             template_name,
@@ -795,6 +798,7 @@ class MatmulTruncf(BaseMatmul):
         Currently without function outlining, we run out of program memory.
         """
         self.add_aie_compilation_flags(["--iree-amdaie-enable-function-outlining"])
+        # self.add_aie_compilation_flags(["--mlir-print-ir-before-all", "--debug-only=iree-amdaie-fuse-consumer-into-loop"])
         aie_vs_baseline(
             config=config,
             aie_compilation_flags=self.aie_compilation_flags,
@@ -1404,6 +1408,10 @@ def aie_vs_baseline(
             output_type,
         )
 
+        np.set_printoptions(threshold=sys.maxsize)
+        # print(f"baseline: {baseline_value}")
+        # print(f"aie_output: {aie_output}")
+
         summary_string = compare(baseline_value, aie_output, rtol, atol)
         if summary_string:
             print(summary_string)
@@ -1640,7 +1648,7 @@ class Tests:
         # MatmulTransposeB test(s):
         for input_type, acc_type in zip(["i8", "bf16"], ["i32", "f32"]):
             self.register(MatmulTransposeB(32, 32, 32, input_type, acc_type))
-            self.register(MatmulTransposeB(128, 256, 128, input_type, acc_type))
+            self.register(MatmulTransposeB(128, 256, 128, input_type, acc_type, aie_compilation_flags=["--mlir-print-ir-before-all"]))
             self.register(MatmulTransposeB(1536, 1536, 2048, input_type, acc_type))
 
         # MatmulTransposeA test(s):
@@ -1663,6 +1671,27 @@ class Tests:
                 name_suffix="chess_npu4",
                 run_on_target=["npu4"],
                 use_chess=True,
+            )
+        )
+        self.register(
+            Matmul(
+                512,
+                4096,
+                512,
+                "bf16",
+                "f32",
+                name_suffix="_cache",
+                run_on_target=["npu1_4col"],
+                tile_pipeline="pack-peel-4-level-tiling",
+                use_chess=False,
+                additional_labels=["CacheTest"],
+                aie_compilation_flags=[
+                    "--iree-amdaie-num-rows=4",
+                    "--iree-amdaie-num-cols=4",
+                    # "--mlir-print-ir-before-all",
+                    "--debug-only=iree-amdaie-split-logical-objectfifos,iree-amdaie-logicalobjfifo-splitting-utils",
+                ],
+                use_ukernel=True,
             )
         )
 
@@ -1725,78 +1754,74 @@ class Tests:
                 aie_compilation_flags=[
                     "--iree-amdaie-num-rows=4",
                     "--iree-amdaie-num-cols=2",
+                    # "--mlir-print-ir-before-all",
+                    # "--debug-only=iree-amdaie-logicalobjfifo-splitting-utils,iree-amdaie-split-logical-objectfifos"
                 ],
                 name_suffix="4rows_2cols",
             )
         )
 
         performance_tests = [
-            {
-                "M": 512,
-                "N": 512,
-                "K": 4096,
-                "use_ukernel": False,
-                "peano_opt_level": 2,
-                "outline": False,
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel",
-            },
-            {
-                "M": 512,
-                "N": 512,
-                "K": 4096,
-                "use_ukernel": False,
-                "peano_opt_level": 2,
-                "outline": True,
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel",
-            },
-            {
-                "M": 512,
-                "N": 512,
-                "K": 4096,
-                "use_ukernel": False,
-                "peano_opt_level": 3,
-                "outline": False,
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel",
-            },
-            {
-                "M": 512,
-                "N": 512,
-                "K": 4096,
-                "use_ukernel": False,
-                "peano_opt_level": 3,
-                "outline": True,
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel",
-            },
-            {
-                "M": 512,
-                "N": 512,
-                "K": 4096,
-                "use_ukernel": True,
-                "peano_opt_level": 3,
-                "outline": True,
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel",
-            },
-            {
-                "M": 512,
-                "N": 4096,
-                "K": 512,
-                "use_ukernel": False,
-                "peano_opt_level": 3,
-                "outline": True,
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel",
-            },
+            # {
+            #     "M": 512,
+            #     "N": 512,
+            #     "K": 4096,
+            #     "use_ukernel": False,
+            #     "peano_opt_level": 2,
+            #     "outline": False,
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            # },
+            # {
+            #     "M": 512,
+            #     "N": 512,
+            #     "K": 4096,
+            #     "use_ukernel": False,
+            #     "peano_opt_level": 2,
+            #     "outline": True,
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            # },
+            # {
+            #     "M": 512,
+            #     "N": 512,
+            #     "K": 4096,
+            #     "use_ukernel": False,
+            #     "peano_opt_level": 3,
+            #     "outline": False,
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            # },
+            # {
+            #     "M": 512,
+            #     "N": 512,
+            #     "K": 4096,
+            #     "use_ukernel": False,
+            #     "peano_opt_level": 3,
+            #     "outline": True,
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            # },
+            # {
+            #     "M": 512,
+            #     "N": 512,
+            #     "K": 4096,
+            #     "use_ukernel": True,
+            #     "peano_opt_level": 3,
+            #     "outline": True,
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            # },
+            # {
+            #     "M": 512,
+            #     "N": 4096,
+            #     "K": 512,
+            #     "use_ukernel": False,
+            #     "peano_opt_level": 3,
+            #     "outline": True,
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            # },
             {
                 "M": 512,
                 "N": 4096,
@@ -1808,104 +1833,46 @@ class Tests:
                 "transpose_b": False,
                 "tile_pipeline": "pack-peel",
             },
-            {
-                "M": 512,
-                "N": 4096,
-                "K": 512,
-                "use_ukernel": False,
-                "peano_opt_level": 3,
-                "outline": True,
-                "transpose_a": False,
-                "transpose_b": True,
-                "tile_pipeline": "pack-peel",
-            },
-            {
-                "M": 4096,
-                "N": 512,
-                "K": 512,
-                "use_ukernel": False,
-                "peano_opt_level": 3,
-                "outline": True,
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel",
-            },
-            {
-                "M": 4096,
-                "N": 512,
-                "K": 512,
-                "use_ukernel": True,
-                "peano_opt_level": 3,
-                "outline": True,
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel",
-            },
-            {
-                "M": 4096,
-                "N": 512,
-                "K": 512,
-                "use_ukernel": False,
-                "peano_opt_level": 3,
-                "outline": True,
-                "transpose_a": True,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel",
-            },
-            # Test where the compute is omitted, this should help triangulate
-            # how much performance gain can be obtained with better matmul
-            # on core vs data movement.
-            {
-                "M": 4096,
-                "N": 512,
-                "K": 512,
-                "use_ukernel": False,
-                "peano_opt_level": 3,
-                "outline": True,
-                "outline_to_empty_function": True,
-                "transpose_a": False,
-                "transpose_b": False,
-                "skip_numerics": True,
-                "tile_pipeline": "pack-peel",
-            },
-            {
-                "M": 512,
-                "N": 4096,
-                "K": 512,
-                "use_ukernel": False,
-                "peano_opt_level": 3,
-                "outline": True,
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel-4-level-tiling",
-            },
-            {
-                "M": 512,
-                "N": 4096,
-                "K": 512,
-                "use_ukernel": True,
-                "peano_opt_level": 3,
-                "outline": True,
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel-4-level-tiling",
-            },
-            # Test where the compute is omitted, this should help triangulate
-            # how much performance gain can be obtained with better matmul
-            # on core vs data movement.
-            {
-                "M": 512,
-                "N": 4096,
-                "K": 512,
-                "use_ukernel": False,
-                "peano_opt_level": 3,
-                "outline": True,
-                "outline_to_empty_function": True,
-                "transpose_a": False,
-                "transpose_b": False,
-                "skip_numerics": True,
-                "tile_pipeline": "pack-peel-4-level-tiling",
-            },
+            # {
+            #     "M": 512,
+            #     "N": 4096,
+            #     "K": 512,
+            #     "use_ukernel": False,
+            #     "peano_opt_level": 3,
+            #     "outline": True,
+            #     "transpose_a": False,
+            #     "transpose_b": True,
+            # },
+            # {
+            #     "M": 4096,
+            #     "N": 512,
+            #     "K": 512,
+            #     "use_ukernel": False,
+            #     "peano_opt_level": 3,
+            #     "outline": True,
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            # },
+            # {
+            #     "M": 4096,
+            #     "N": 512,
+            #     "K": 512,
+            #     "use_ukernel": True,
+            #     "peano_opt_level": 3,
+            #     "outline": True,
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            # },
+            # {
+            #     "M": 4096,
+            #     "N": 512,
+            #     "K": 512,
+            #     "use_ukernel": False,
+            #     "peano_opt_level": 3,
+            #     "outline": True,
+            #     "transpose_a": True,
+            #     "transpose_b": False,
+            # },
         ]
 
         # Some bf16 Performance tests:
@@ -1990,12 +1957,18 @@ class Tests:
                     K,
                     "bf16",
                     "f32",
-                    tile_pipeline=tile_pipeline,
+                    tile_pipeline="pack-peel-4-level-tiling",
                     additional_labels=["Performance"],
                     use_ukernel=use_ukernel,
                     n_repeats=5,
-                    n_kernel_runs=100,
-                    aie_compilation_flags=aie_compilation_flags,
+                    n_kernel_runs=1000,
+                    use_chess=False,
+                    aie_compilation_flags=[
+                        "--iree-amdaie-num-rows=4",
+                        "--iree-amdaie-num-cols=4",
+                        # "--mlir-print-ir-before-all",
+                        # "--debug-only=iree-amdaie-dma-loop-subsumption,iree-amdaie-combine-strided-ops"
+                    ],
                     name_suffix=name_suffix,
                 )
             )

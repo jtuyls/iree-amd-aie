@@ -248,6 +248,12 @@ FailureOr<ParameterSetting> ParameterSetting::create(
     // instruction size).
     uint32_t m0Pack = (M0 / numRows) % m1Pack == 0 ? (M0 / numRows) : M0;
     uint32_t n0Pack = (N0 / numCols) % n1Pack == 0 ? (N0 / numCols) : N0;
+    llvm::outs() << "m0Pack: " << m0Pack << "\n";
+    llvm::outs() << "n0Pack: " << n0Pack << "\n";
+    llvm::outs() << "k0Pack: " << k0Pack << "\n";
+    llvm::outs() << "m1Pack: " << m1Pack << "\n";
+    llvm::outs() << "n1Pack: " << n1Pack << "\n";
+    llvm::outs() << "k1Pack: " << k1Pack << "\n";
 
     return ParameterSetting(M0, N0, K0, M1, N1, K1, m0Pack, n0Pack, k0Pack,
                             m1Pack, n1Pack, k1Pack, M, N, K, nBitsLhs, nBitsRhs,
