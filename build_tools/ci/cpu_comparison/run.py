@@ -375,6 +375,7 @@ class MatmulBenchmark(BaseMatmul):
             use_ukernel=use_ukernel,
             n_repeats=n_repeats,
             n_kernel_runs=n_kernel_runs,
+            use_chess=False,
         )
 
         self.name = f"matmul_benchmark_{M}_{N}_{K}_{input_type}_{acc_type}"
@@ -1770,7 +1771,7 @@ class Tests:
         self.register(
             Matmul(
                 512,
-                512,
+                4096,
                 512,
                 "i8",
                 "i32",
@@ -1782,6 +1783,28 @@ class Tests:
                     "--iree-amdaie-num-cols=8",
                 ],
                 additional_labels=["I8UKernel"],
+            )
+        )
+        self.register(
+            Matmul(
+                512,
+                4096,
+                512,
+                "i8",
+                "i16",
+                use_ukernel=False,
+                use_chess=False,
+                run_on_target=["npu4"],
+                name_suffix="ukernel_npu4_4x8",
+                aie_compilation_flags=[
+                    "--iree-amdaie-num-rows=4",
+                    "--iree-amdaie-num-cols=8",
+                    "--iree-amdaie-enable-function-outlining=1",
+                    "--iree-amdaie-replace-outlined-functions-with-empty",
+                    "--mlir-print-ir-after-all",
+                ],
+                additional_labels=["I8UKernel2"],
+                tile_pipeline="pack-peel-4-level-tiling",
             )
         )
 
@@ -1993,6 +2016,37 @@ class Tests:
                 "skip_numerics": True,
                 "tile_pipeline": "pack-peel-4-level-tiling",
             },
+            # NPU4 tests:
+            # {
+            #     "M": 512,
+            #     "N": 4096,
+            #     "K": 512,
+            #     "in_dtype": "i8",
+            #     "out_dtype": "i32",
+            #     "use_ukernel": True,
+            #     "peano_opt_level": 3,
+            #     "outline": True,
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            #     "tile_pipeline": "pack-peel-4-level-tiling",
+            #     "run_on_target": "npu4",
+            # },
+            {
+                "M": 512,
+                "N": 4096,
+                "K": 512,
+                "in_dtype": "i8",
+                "out_dtype": "i8",
+                "use_ukernel": False,
+                "peano_opt_level": 3,
+                "outline": "all",
+                "outline_to_empty_function": True,
+                "transpose_a": False,
+                "transpose_b": False,
+                "tile_pipeline": "pack-peel-4-level-tiling",
+                "run_on_target": "npu4",
+                "skip_numerics": True,
+            },
         ]
 
         # Some bf16 Performance tests:
@@ -2006,6 +2060,12 @@ class Tests:
             transpose_a = test["transpose_a"]
             transpose_b = test["transpose_b"]
             tile_pipeline = test["tile_pipeline"]
+            run_on_target = test["run_on_target"] if "run_on_target" in test else "npu1_4col"
+            in_dtype = test["in_dtype"] if "in_dtype" in test else "bf16"
+            out_dtype = test["out_dtype"] if "out_dtype" in test else "f32"
+
+            name_suffix = "O" + str(peano_opt_level)
+            name_suffix += ("_" + run_on_target)
 
             outlining_string = "--iree-amdaie-enable-function-outlining=" + outline
 
@@ -2047,6 +2107,12 @@ class Tests:
             if tile_pipeline == "pack-peel-4-level-tiling":
                 name_suffix += "_4_level_tiling"
 
+            if run_on_target == "npu4":
+                aie_compilation_flags.append("--iree-amdaie-num-rows=4")
+                aie_compilation_flags.append("--iree-amdaie-num-cols=8")
+                # aie_compilation_flags.append("--mlir-print-ir-after-all")
+                # aie_compilation_flags.append("--debug-only=iree-amdaie-controlcode-to-transaction")
+
             # This should only be the case for benchmark tests which we expect
             # to not pass numerically.
             if "skip_numerics" in test and test["skip_numerics"]:
@@ -2057,8 +2123,9 @@ class Tests:
                         M,
                         N,
                         K,
-                        "bf16",
-                        "f32",
+                        in_dtype,
+                        out_dtype,
+                        run_on_target=run_on_target,
                         tile_pipeline=tile_pipeline,
                         use_ukernel=use_ukernel,
                         n_repeats=2,
@@ -2073,13 +2140,14 @@ class Tests:
                     M,
                     N,
                     K,
-                    "bf16",
-                    "f32",
+                    in_dtype,
+                    out_dtype,
                     tile_pipeline=tile_pipeline,
+                    run_on_target=run_on_target,
                     additional_labels=["Performance"],
                     use_ukernel=use_ukernel,
                     n_repeats=5,
-                    n_kernel_runs=100,
+                    n_kernel_runs=2000,
                     aie_compilation_flags=aie_compilation_flags,
                     name_suffix=name_suffix,
                 )

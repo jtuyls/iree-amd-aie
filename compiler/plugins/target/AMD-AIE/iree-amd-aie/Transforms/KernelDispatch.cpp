@@ -224,8 +224,8 @@ FailureOr<ParameterSetting> ParameterSetting::create(
     // Develop a better way to select tile sizes to make the most use of
     // memory while taking all factors (double buffer, elementwise memory usage,
     // lhs/rhs element type, etc) into account.
-    uint32_t maxL1SizeM = 16 * scaleFactor;
-    uint32_t maxL1SizeN = 16 * scaleFactor;
+    uint32_t maxL1SizeM = 8 * scaleFactor; // * scaleFactor;
+    uint32_t maxL1SizeN = 8 * scaleFactor; // 16 * scaleFactor;
     uint32_t M1 = findLargestFactor(M / m1Pack, maxL1SizeM / m1Pack, m1Pack);
     uint32_t N1 = findLargestFactor(N / n1Pack, maxL1SizeN / n1Pack, n1Pack);
 
@@ -248,6 +248,9 @@ FailureOr<ParameterSetting> ParameterSetting::create(
     // instruction size).
     uint32_t m0Pack = (M0 / numRows) % m1Pack == 0 ? (M0 / numRows) : M0;
     uint32_t n0Pack = (N0 / numCols) % n1Pack == 0 ? (N0 / numCols) : N0;
+    k0Pack /= 2;
+    // m0Pack /= 2;
+    // n0Pack /= 2;
 
     return ParameterSetting(M0, N0, K0, M1, N1, K1, m0Pack, n0Pack, k0Pack,
                             m1Pack, n1Pack, k1Pack, M, N, K, nBitsLhs, nBitsRhs,
@@ -398,6 +401,13 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
   if (failed(maybePackPeelTiling)) return failure();
   auto packPeelTiling = maybePackPeelTiling.value();
 
+  llvm::outs() << "m0Pack: " << packPeelTiling.m0Pack
+               << ", n0Pack: " << packPeelTiling.n0Pack
+               << ", k0Pack: " << packPeelTiling.k0Pack
+               << ", m1Pack: " << packPeelTiling.m1Pack
+               << ", n1Pack: " << packPeelTiling.n1Pack
+               << ", k1Pack: " << packPeelTiling.k1Pack << "\n";
+
   AMDAIEDeviceModel deviceModel = getDeviceModel(targetDevice);
 
   // ------------------------------------------------------
@@ -492,7 +502,7 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
   bool fitsInL2 = (l2SizeA + l2SizeB + l2SizeInit) <
                   (deviceModel.getMemTileSizeInBytes() * numCols);
   int64_t scaleL0 = !isBatchMatmul && fitsInL2 ? 2 : 1;
-  SmallVector<int64_t> tileSizeLevel0 = {packPeelTiling.M0 * scaleL0,
+  SmallVector<int64_t> tileSizeLevel0 = {packPeelTiling.M0 * scaleL0 * 2,
                                          packPeelTiling.N0 * scaleL0};
   SmallVector<int64_t> tileSizeLevel1 = {numRows, numCols, 0};
   SmallVector<int64_t> tileSizeLevel2 = {0, 0, 1};

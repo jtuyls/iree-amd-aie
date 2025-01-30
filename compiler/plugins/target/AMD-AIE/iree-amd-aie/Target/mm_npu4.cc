@@ -271,7 +271,8 @@ extern "C" {
 #define zero_fill_combos(X, M, N)  \
   X(bfloat16, bf16, M, N, N/2)     \
   X(float, f32, M, N, N/2)         \
-  X(int32, i32, M, N, N/2)
+  X(int32, i32, M, N, N/2)         \
+  X(int16, i16, M, N, N/2)
 
 #define matmul_vectorized_c_func(lhs_ctype_in, lhs_mlir_type_in,                                                 \
                                  rhs_ctype_in, rhs_mlir_type_in,                                                 \

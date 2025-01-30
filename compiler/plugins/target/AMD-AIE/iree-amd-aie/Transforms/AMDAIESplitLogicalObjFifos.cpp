@@ -226,9 +226,10 @@ LogicalResult collectSplittingDims(
                  << "objFifoSplitDim: " << objFifoSplitDim << "\n");
       LLVM_DEBUG(llvm::dbgs() << "splitStride: " << splitStride << "\n");
       LLVM_DEBUG(llvm::dbgs() << "splitFactor: " << numCols << "\n");
+      int64_t splitFactor = splitDimSize == numCols ? numCols / 2 : numCols;
       dmaSplitInfoMap[dmaOp] = {sourceSplitDim, newSourceStride, targetSplitDim,
-                                1, numCols};
-      objFifoSplitInfoMap[objFifo] = {objFifoSplitDim, numCols, splitStride};
+                                1, splitFactor};
+      objFifoSplitInfoMap[objFifo] = {objFifoSplitDim, splitFactor, splitStride};
     } else if (dmaOp.getSourceObjectFifo() == objFifo) {
       // Find outermost dimension in the access pattern that has stride ==
       // sizeAfterSplit and size != 1.
