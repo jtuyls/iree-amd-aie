@@ -1843,16 +1843,16 @@ class Tests:
                 4096,
                 512,
                 "i8",
-                "i16",
-                use_ukernel=False,
+                "i32",
+                use_ukernel=True,
                 use_chess=False,
                 run_on_target=["npu4"],
                 name_suffix="ukernel_npu4_4x8",
                 aie_compilation_flags=[
                     "--iree-amdaie-num-rows=4",
                     "--iree-amdaie-num-cols=8",
-                    "--iree-amdaie-enable-function-outlining=1",
-                    "--iree-amdaie-replace-outlined-functions-with-empty",
+                    # "--iree-amdaie-enable-function-outlining=all",
+                    # "--iree-amdaie-replace-outlined-functions-with-empty",
                     "--mlir-print-ir-after-all",
                 ],
                 additional_labels=["I8UKernel2"],
@@ -2174,8 +2174,8 @@ class Tests:
             if run_on_target == "npu4":
                 aie_compilation_flags.append("--iree-amdaie-num-rows=4")
                 aie_compilation_flags.append("--iree-amdaie-num-cols=8")
-                # aie_compilation_flags.append("--mlir-print-ir-after-all")
-                # aie_compilation_flags.append("--debug-only=iree-amdaie-controlcode-to-transaction")
+                aie_compilation_flags.append("--mlir-print-ir-after-all")
+                aie_compilation_flags.append("--debug-only=iree-amdaie-split-logical-objectfifos,iree-amdaie-dma-utils")
 
             # This should only be the case for benchmark tests which we expect
             # to not pass numerically.
