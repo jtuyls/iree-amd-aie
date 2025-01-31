@@ -2093,7 +2093,7 @@ class Tests:
                 "N": 4096,
                 "K": 512,
                 "in_dtype": "i8",
-                "out_dtype": "i32",
+                "out_dtype": "i8",
                 "use_ukernel": False,
                 "peano_opt_level": 3,
                 "outline": "all",
@@ -2174,7 +2174,7 @@ class Tests:
             if run_on_target == "npu4":
                 aie_compilation_flags.append("--iree-amdaie-num-rows=4")
                 aie_compilation_flags.append("--iree-amdaie-num-cols=8")
-                aie_compilation_flags.append("--mlir-print-ir-after-all")
+                # aie_compilation_flags.append("--mlir-print-ir-after-all")
                 aie_compilation_flags.append("--debug-only=iree-amdaie-split-logical-objectfifos,iree-amdaie-dma-utils")
 
             # This should only be the case for benchmark tests which we expect

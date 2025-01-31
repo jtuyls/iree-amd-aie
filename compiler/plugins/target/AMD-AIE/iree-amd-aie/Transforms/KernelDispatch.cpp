@@ -502,7 +502,7 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
   bool fitsInL2 = (l2SizeA + l2SizeB + l2SizeInit) <
                   (deviceModel.getMemTileSizeInBytes() * numCols);
   int64_t scaleL0 = !isBatchMatmul && fitsInL2 ? 2 : 1;
-  SmallVector<int64_t> tileSizeLevel0 = {packPeelTiling.M0 * scaleL0,
+  SmallVector<int64_t> tileSizeLevel0 = {packPeelTiling.M0 * scaleL0 * 2,
                                          packPeelTiling.N0 * scaleL0};
   SmallVector<int64_t> tileSizeLevel1 = {numRows, numCols, 0};
   SmallVector<int64_t> tileSizeLevel2 = {0, 0, 1};
