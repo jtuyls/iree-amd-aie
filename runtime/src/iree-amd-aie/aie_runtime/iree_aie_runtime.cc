@@ -857,6 +857,8 @@ getNpu4IntegerMatmulInstructionSizeMap() {
 
       // `vector<8x8xi8>`   | `vector<8x8xi8>`   | `vector<8x8xi32>`
       {getElementTypeKey(8, 8, 32), {8, 8, 8}},
+      {getElementTypeKey(8, 8, 16), {8, 8, 8}},
+      {getElementTypeKey(8, 8, 8), {8, 8, 8}},
 
   };
   return matmulIntSizes;

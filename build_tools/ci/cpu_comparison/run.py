@@ -1787,7 +1787,7 @@ class Tests:
         self.register(
             Matmul(
                 512,
-                512,
+                4096,
                 512,
                 "i8",
                 "i32",
@@ -1835,6 +1835,28 @@ class Tests:
                     "--iree-amdaie-num-cols=8",
                 ],
                 use_chess=True,
+            )
+        )
+        self.register(
+            Matmul(
+                512,
+                4096,
+                512,
+                "i8",
+                "i16",
+                use_ukernel=False,
+                use_chess=False,
+                run_on_target=["npu4"],
+                name_suffix="ukernel_npu4_4x8",
+                aie_compilation_flags=[
+                    "--iree-amdaie-num-rows=4",
+                    "--iree-amdaie-num-cols=8",
+                    "--iree-amdaie-enable-function-outlining=1",
+                    "--iree-amdaie-replace-outlined-functions-with-empty",
+                    "--mlir-print-ir-after-all",
+                ],
+                additional_labels=["I8UKernel2"],
+                tile_pipeline="pack-peel-4-level-tiling",
             )
         )
 
@@ -2052,20 +2074,20 @@ class Tests:
             ##############
             # NPU4 Tests #
             ##############
-            {
-                "M": 512,
-                "N": 4096,
-                "K": 512,
-                "in_dtype": "i8",
-                "out_dtype": "i32",
-                "use_ukernel": True,
-                "peano_opt_level": 3,
-                "outline": "all",
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel",
-                "run_on_target": "npu4",
-            },
+            # {
+            #     "M": 512,
+            #     "N": 4096,
+            #     "K": 512,
+            #     "in_dtype": "i8",
+            #     "out_dtype": "i32",
+            #     "use_ukernel": True,
+            #     "peano_opt_level": 3,
+            #     "outline": "all",
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            #     "tile_pipeline": "pack-peel",
+            #     "run_on_target": "npu4",
+            # },
             {
                 "M": 512,
                 "N": 4096,
@@ -2078,7 +2100,7 @@ class Tests:
                 "outline_to_empty_function": True,
                 "transpose_a": False,
                 "transpose_b": False,
-                "tile_pipeline": "pack-peel",
+                "tile_pipeline": "pack-peel-4-level-tiling",
                 "run_on_target": "npu4",
                 "skip_numerics": True,
             },
@@ -2115,6 +2137,8 @@ class Tests:
             if run_on_target == "npu4":
                 aie_compilation_flags.append("--iree-amdaie-num-rows=4")
                 aie_compilation_flags.append("--iree-amdaie-num-cols=8")
+                aie_compilation_flags.append("--debug-only=iree-amdaie-split-logical-objectfifos")
+                
 
             outline_to_empty_function = False
             empty_key = "outline_to_empty_function"
@@ -2146,6 +2170,12 @@ class Tests:
 
             if tile_pipeline == "pack-peel-4-level-tiling":
                 name_suffix += "_4_level_tiling"
+
+            if run_on_target == "npu4":
+                aie_compilation_flags.append("--iree-amdaie-num-rows=4")
+                aie_compilation_flags.append("--iree-amdaie-num-cols=8")
+                # aie_compilation_flags.append("--mlir-print-ir-after-all")
+                # aie_compilation_flags.append("--debug-only=iree-amdaie-controlcode-to-transaction")
 
             # This should only be the case for benchmark tests which we expect
             # to not pass numerically.
@@ -2181,7 +2211,7 @@ class Tests:
                     additional_labels=["Performance"],
                     use_ukernel=use_ukernel,
                     n_repeats=5,
-                    n_kernel_runs=100,
+                    n_kernel_runs=2000,
                     aie_compilation_flags=aie_compilation_flags,
                     name_suffix=name_suffix,
                 )

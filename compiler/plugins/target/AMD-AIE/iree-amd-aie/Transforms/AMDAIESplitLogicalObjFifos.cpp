@@ -282,6 +282,7 @@ LogicalResult collectSplittingDims(
                  << "objFifoSplitDim: " << objFifoSplitDim << "\n");
       LLVM_DEBUG(llvm::dbgs() << "splitStride: " << splitStride << "\n");
       LLVM_DEBUG(llvm::dbgs() << "splitFactor: " << splitFactor << "\n");
+      splitFactor = splitDimSize == numCols ? numCols / 2 : numCols;
       dmaSplitInfoMap[dmaOp] = {sourceSplitDim, newSourceStride, targetSplitDim,
                                 1, splitFactor};
       objFifoSplitInfoMap[objFifo] = {objFifoSplitDim, splitFactor,
