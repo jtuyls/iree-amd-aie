@@ -163,6 +163,14 @@ LogicalResult convertOp(AMDAIE::NpuTctSyncOp op, TransactionBuilder &builder) {
           op.getRowNum(), op.getColNum(), op.getChannel()))) {
     return failure();
   }
+  // if (static_cast<uint32_t>(op.getDirection()) != 1) {
+  //   if (failed(builder.appendTCTSync(
+  //           op.getCol(), op.getRow(),
+  //           static_cast<uint32_t>(op.getDirection()), op.getRowNum(),
+  //           op.getColNum(), op.getChannel()))) {
+  //     return failure();
+  //   }
+  // }
   return success();
 }
 

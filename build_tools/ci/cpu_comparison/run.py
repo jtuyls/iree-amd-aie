@@ -2089,8 +2089,8 @@ class Tests:
             #     "run_on_target": "npu4",
             # },
             {
-                "M": 512,
-                "N": 4096,
+                "M": 512*2,
+                "N": 4096*8,
                 "K": 512,
                 "in_dtype": "i8",
                 "out_dtype": "i8",
@@ -2137,7 +2137,8 @@ class Tests:
             if run_on_target == "npu4":
                 aie_compilation_flags.append("--iree-amdaie-num-rows=4")
                 aie_compilation_flags.append("--iree-amdaie-num-cols=8")
-                aie_compilation_flags.append("--debug-only=iree-amdaie-split-logical-objectfifos")
+                # aie_compilation_flags.append("--mlir-print-ir-after-all")
+                #  aie_compilation_flags.append("--debug-only=iree-amdaie-assign-tiles") # iree-amdaie-split-logical-objectfifos
                 
 
             outline_to_empty_function = False
@@ -2175,7 +2176,7 @@ class Tests:
                 aie_compilation_flags.append("--iree-amdaie-num-rows=4")
                 aie_compilation_flags.append("--iree-amdaie-num-cols=8")
                 # aie_compilation_flags.append("--mlir-print-ir-after-all")
-                aie_compilation_flags.append("--debug-only=iree-amdaie-split-logical-objectfifos,iree-amdaie-dma-utils")
+                aie_compilation_flags.append("--debug-only=iree-amdaie-assign-tiles")
 
             # This should only be the case for benchmark tests which we expect
             # to not pass numerically.

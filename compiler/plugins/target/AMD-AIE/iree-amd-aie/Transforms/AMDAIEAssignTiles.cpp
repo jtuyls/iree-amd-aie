@@ -233,6 +233,7 @@ class FillTiles
              "of which is chosen for tile assignment, but this might not lead "
              "to good usage of the available resources.";
     }
+    ArrayRef<int64_t> memrefShape = logicalObjectFifo.getMemrefType().getShape();
     uint32_t row = memSpaceRows[0];
     llvm::SmallSetVector<std::pair<int64_t, int64_t>, 16> tileLocations;
     auto createTileLocations =
@@ -246,7 +247,15 @@ class FillTiles
         std::optional<int64_t> column = getConstantIntValue(tile.getCol());
         if (!column)
           return rewriter.notifyMatchFailure(tile, "found non-constant column");
-        tileLocations.insert(std::make_pair(column.value(), row));
+        if (memrefShape.size() >= 2 && memrefShape[0] == 2 && memrefShape[1] == 4) {
+          LLVM_DEBUG(llvm::dbgs() << "Found 2x4 memref\n");
+          tileLocations.insert(std::make_pair(column.value() / 2, row));
+        } else if (memrefShape.size() >= 2 && memrefShape[0] == 4 && memrefShape[1] == 4 && column.value() < 4) {
+          LLVM_DEBUG(llvm::dbgs() << "Found 4x4 memref\n");
+          tileLocations.insert(std::make_pair(4 + column.value(), row));
+        } else {
+          tileLocations.insert(std::make_pair(column.value(), row));
+        }
       }
       return success();
     };
@@ -330,7 +339,7 @@ LogicalResult assignNonLocalTiles(
   if (failed(verify(op, true))) {
     return failure();
   }
-  LLVM_DEBUG(llvm::dbgs() << "After fillTiles: \n" << *op << "\n");
+  // LLVM_DEBUG(llvm::dbgs() << "After fillTiles: \n" << *op << "\n");
 
   // Keep track of the buffer usage on tiles to try distributing buffers evenly
   // over available tile resources.
@@ -364,6 +373,8 @@ LogicalResult assignNonLocalTiles(
           return WalkResult::interrupt();
         }
 
+        LLVM_DEBUG(llvm::dbgs() << "logicalObjectFifo: " << *logicalObjectFifo.getOperation() << "\n");
+
         SmallVector<AMDAIE::TileOp> tiles =
             llvm::map_to_vector(logicalObjectFifo.getTiles(), [](Value tile) {
               return dyn_cast_if_present<TileOp>(tile.getDefiningOp());
@@ -380,9 +391,25 @@ LogicalResult assignNonLocalTiles(
             logicalObjectFifo.getOperation());
         if (fromMemrefOp) {
           Operation *defOp = fromMemrefOp.getMemref().getDefiningOp();
-          if (defOp && uniqueL3L2Pair.contains(defOp))
-            tiles.truncate(
+          LLVM_DEBUG(llvm::dbgs() << "fromMemrefOp: " << fromMemrefOp << "\n");
+          ArrayRef<int64_t> memrefShape = fromMemrefOp.getMemrefType().getShape();
+          if (memrefShape.size() >= 2) {
+            if (memrefShape[0] == 2 && memrefShape[1] == 4 && tiles.size() > 4) {
+              LLVM_DEBUG(llvm::dbgs()<< "test1\n");
+              LLVM_DEBUG(llvm::dbgs()<< "tiles size: " << tiles.size() << "\n");
+              tiles.erase(tiles.begin(), tiles.begin() + 4);
+            } else if (memrefShape[0] == 4 && memrefShape[1] == 4 && tiles.size() > 4) {
+              LLVM_DEBUG(llvm::dbgs() << "test2\n");
+              LLVM_DEBUG(llvm::dbgs()<< "tiles size: " << tiles.size() << "\n");
+              tiles.erase(tiles.begin() + 4, tiles.end());
+            } else 
+            if (defOp && uniqueL3L2Pair.contains(defOp)) {
+              LLVM_DEBUG(llvm::dbgs() << "test3\n");
+              tiles.truncate(
                 std::min((size_t)uniqueL3L2Pair[defOp].size(), tiles.size()));
+            }
+            
+          }
         }
         AMDAIE::TileOp assignedTileOp =
             *std::min_element(tiles.begin(), tiles.end(), tileLocAndUsageCmp);
