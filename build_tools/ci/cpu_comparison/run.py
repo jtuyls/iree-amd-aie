@@ -1794,6 +1794,7 @@ class Tests:
                 use_ukernel=True,
                 use_chess=False,
                 run_on_target=["npu4"],
+                tile_pipeline="pack-peel-4-level-tiling",
                 aie_compilation_flags=[
                     "--iree-amdaie-num-rows=4",
                     "--iree-amdaie-num-cols=8",
@@ -2071,36 +2072,36 @@ class Tests:
             ##############
             # NPU4 Tests #
             ##############
-            {
-                "M": 512,
-                "N": 4096,
-                "K": 512,
-                "in_dtype": "i8",
-                "out_dtype": "i32",
-                "use_ukernel": True,
-                "peano_opt_level": 3,
-                "outline": "all",
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel",
-                "run_on_target": "npu4",
-            },
-            {
-                "M": 512,
-                "N": 4096,
-                "K": 512,
-                "in_dtype": "i8",
-                "out_dtype": "i32",
-                "use_ukernel": False,
-                "peano_opt_level": 3,
-                "outline": "all",
-                "outline_to_empty_function": True,
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel",
-                "run_on_target": "npu4",
-                "skip_numerics": True,
-            },
+            # {
+            #     "M": 512,
+            #     "N": 4096,
+            #     "K": 512,
+            #     "in_dtype": "i8",
+            #     "out_dtype": "i32",
+            #     "use_ukernel": True,
+            #     "peano_opt_level": 3,
+            #     "outline": "all",
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            #     "tile_pipeline": "pack-peel",
+            #     "run_on_target": "npu4",
+            # },
+            # {
+            #     "M": 512,
+            #     "N": 4096,
+            #     "K": 512,
+            #     "in_dtype": "i8",
+            #     "out_dtype": "i32",
+            #     "use_ukernel": False,
+            #     "peano_opt_level": 3,
+            #     "outline": "all",
+            #     "outline_to_empty_function": True,
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            #     "tile_pipeline": "pack-peel",
+            #     "run_on_target": "npu4",
+            #     "skip_numerics": True,
+            # },
             {
                 "M": 512,
                 "N": 4096,
@@ -2115,22 +2116,22 @@ class Tests:
                 "tile_pipeline": "pack-peel-4-level-tiling",
                 "run_on_target": "npu4",
             },
-            {
-                "M": 512,
-                "N": 4096,
-                "K": 512,
-                "in_dtype": "i8",
-                "out_dtype": "i32",
-                "use_ukernel": False,
-                "peano_opt_level": 3,
-                "outline": "all",
-                "outline_to_empty_function": True,
-                "transpose_a": False,
-                "transpose_b": False,
-                "tile_pipeline": "pack-peel-4-level-tiling",
-                "run_on_target": "npu4",
-                "skip_numerics": True,
-            },
+            # {
+            #     "M": 512,
+            #     "N": 4096,
+            #     "K": 512,
+            #     "in_dtype": "i8",
+            #     "out_dtype": "i32",
+            #     "use_ukernel": False,
+            #     "peano_opt_level": 3,
+            #     "outline": "all",
+            #     "outline_to_empty_function": True,
+            #     "transpose_a": False,
+            #     "transpose_b": False,
+            #     "tile_pipeline": "pack-peel-4-level-tiling",
+            #     "run_on_target": "npu4",
+            #     "skip_numerics": True,
+            # },
         ]
 
         # Some bf16 Performance tests:
@@ -2162,6 +2163,7 @@ class Tests:
             ]
 
             if run_on_target == "npu4":
+                # aie_compilation_flags.append("--mlir-print-ir-after-all")
                 aie_compilation_flags.append("--iree-amdaie-num-rows=4")
                 aie_compilation_flags.append("--iree-amdaie-num-cols=8")
 

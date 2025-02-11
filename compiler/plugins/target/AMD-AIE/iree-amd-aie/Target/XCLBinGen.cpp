@@ -527,6 +527,63 @@ LogicalResult assembleFileUsingChess(const std::string &inputFile,
   return runTool(xChessCCExe, args, verbose, env);
 }
 
+std::vector<std::string> makePeanoOptArgs() {
+  return {
+      // peano has no proper vectorization cost model for AIE
+      "-vectorize-loops=false",
+      //
+      "-vectorize-slp=false",
+      // An if-then-else cascade requires at least 5 delay slots for
+      // evaluating the condition and 5 delay slots for one of the
+      // branches, thus speculating 10 instructions should be fine
+      "--two-entry-phi-node-folding-threshold=10",
+      // Make sure to perform most optimizations before mandatory
+      // inlinings, otherwise noalias attributes can get lost and
+      // hurt AA results.
+      "-mandatory-inlining-before-opt=false",
+      // complete AA analysis on phi nodes.
+      "-basic-aa-full-phi-analysis=true",
+      // Extend the max limit of the search depth in BasicAA
+      "-basic-aa-max-lookup-search-depth=10",
+  };
+}
+
+static LogicalResult assembleFileUsingPeano(
+    const std::string &inputFile, const std::string &outputFile,
+    const std::vector<std::string> &extraArgs, Path &_tempDir, Path &peanoDir,
+    const std::string &npuVersion,
+    bool verbose) {
+  std::vector<std::string> args;
+  args.reserve(args.size() + std::distance(extraArgs.begin(), extraArgs.end()));
+  args.insert(args.end(), extraArgs.begin(), extraArgs.end());
+  args.emplace_back("-O2");
+  // TODO(max): pipe target arch in somehow
+  args.emplace_back("--target=aie2p-none-unknown-elf");
+  std::vector<std::string> peanoArgs = makePeanoOptArgs();
+  args.reserve(args.size() + peanoArgs.size());
+  for (const auto &item : peanoArgs) {
+    args.emplace_back("-mllvm");
+    args.emplace_back(item);
+  }
+  args.emplace_back("-fno-use-init-array");
+  // Pass -fno-threadsafe-statics to prevent dependence on lock acquire/release
+  // handling for static local variables.
+  args.emplace_back("-fno-threadsafe-statics");
+  // Don't pull in system headers from /usr/include or /usr/local/include.
+  // All of the basic headers that we need come from the compiler.
+  // args.emplace_back("-nostdsysteminc");
+  args.emplace_back("-c");
+  args.emplace_back(inputFile);
+  args.emplace_back("-o");
+  args.emplace_back(outputFile);
+  if (verbose) args.emplace_back("-v");
+  if (failed(runTool(peanoDir / "bin" / "clang", args, verbose))) {
+    llvm::errs() << "Failed to assemble " << outputFile << ".o with peano";
+    return failure();
+  }
+  return success();
+}
+
 using FileAssemblerT = std::function<decltype(assembleFileUsingChess)>;
 
 FailureOr<Path> assembleStringUsing(
@@ -559,6 +616,11 @@ FailureOr<Path> assembleStringUsing(
 static auto assembleStringUsingChess =
     std::bind(assembleStringUsing, assembleFileUsingChess, _1, _2, _3, _4, _5,
               _6, _7, _8, _9);
+
+static auto assembleStringUsingPeano =
+    std::bind(assembleStringUsing, assembleFileUsingPeano, _1, _2, _3, _4, _5,
+              _6, _7, _8, _9);
+
 
 // Generate the elf files for the core
 LogicalResult generateCoreElfFiles(AIE::DeviceOp deviceOp,
@@ -622,6 +684,15 @@ LogicalResult generateCoreElfFiles(AIE::DeviceOp deviceOp,
             /*workDir=*/tempDir,
             /*vitisDir=*/*maybeVitisDir,
             /*npuVersion*/ npuVersion, verbose);
+        // mmObjectFilePath = assembleStringUsingPeano(
+        //     /*inputFileStr=*/ukernelFileContent,
+        //     /*inputFileName=*/ukernelFileName,
+        //     /*outputFileName=*/ukernelObjectName,
+        //     /*outputDir=*/cwd,
+        //     /*extraArgs*/ std::vector<std::string>{},
+        //     /*workDir=*/tempDir,
+        //     /*vitisDir=*/peanoDir,
+        //     /*npuVersion*/ npuVersion, verbose);
         if (failed(mmObjectFilePath)) return failure();
       } else {
         mmObjectFilePath = cwd / ukernelObjectName;
