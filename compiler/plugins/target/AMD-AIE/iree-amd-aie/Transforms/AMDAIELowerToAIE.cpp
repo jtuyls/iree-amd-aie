@@ -134,10 +134,10 @@ BDDimLayoutAndLength AIEDeviceBuilder::convertSizeStrideToBDDimLayoutArrayAttr(
       sizes.empty()
           ? 0
           : std::accumulate(sizes.begin(), sizes.end(), 1, std::multiplies<>());
-  for (auto [size, stride] : llvm::zip(sizes, strides)) {
-    bdDimLayoutAttr.push_back(
-        AIE::BDDimLayoutAttr::get(rewriter.getContext(), size, stride));
-  }
+  // for (auto [size, stride] : llvm::zip(sizes, strides)) {
+  //   bdDimLayoutAttr.push_back(
+  //       AIE::BDDimLayoutAttr::get(rewriter.getContext(), size, stride));
+  // }
   return std::make_pair(AIE::BDDimLayoutArrayAttr::get(
                             rewriter.getContext(), ArrayRef(bdDimLayoutAttr)),
                         transferLength);

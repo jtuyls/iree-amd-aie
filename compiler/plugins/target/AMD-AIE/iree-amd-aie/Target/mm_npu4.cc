@@ -20,6 +20,16 @@ R"chess(
 
 #include <aie_api/aie.hpp>
 
+template<int M, int N, int r>
+void scale_shift_trunc_vectorized(v32int32 *__restrict in, int64_t offsetIn, int64_t scale, int64_t shift, 
+                                  v32int8 *__restrict out, int64_t offsetOut) {
+  const v32uint16 mulLow = broadcast_u16((uint16)(scale & 0xFFFF));
+  const v32uint16 mulHigh = broadcast_u16((uint16)(scale >> 16));
+  for (unsigned i = 0; i < M * N / r; i++) {
+    out[offsetOut + i] = ssrs((v32acc32)in[offsetIn + i], 7, 0);
+  }
+}
+
 template<typename T, int M, int N, int r>
 void zero_vectorized(T *__restrict pC, unsigned offsetC)
 {
@@ -277,6 +287,9 @@ extern "C" {
   X(float, f32, M, N, N/2)         \
   X(int32, i32, M, N, N/2)
 
+#define scale_shift_trunc_combos_i32_i8(X, M, N)  \
+  X(v32int32, i32, v32int8, i8, M, N, 16)
+
 #define matmul_vectorized_c_func(lhs_ctype_in, lhs_mlir_type_in,                                                 \
                                  rhs_ctype_in, rhs_mlir_type_in,                                                 \
                                  acc_ctype_out, acc_mlir_type_out, M, N, K, r, s, t)                             \
@@ -292,12 +305,21 @@ extern "C" {
     zero_vectorized<ctype_out, M, N, r>(c_out, offsetC);                      \
   }
 
+#define scale_shift_trunc_c_func(ctype_in, mlir_type_in, ctype_out, mlir_type_out, M, N, r)   \
+  void scale_shift_trunc_##mlir_type_in##_##mlir_type_out##_##M##x##N(                        \
+      ctype_in *in, int64_t offsetIn, int64_t scale, int64_t shift,                           \
+      ctype_out *out, int64_t offsetOut) {                                                    \
+    scale_shift_trunc_vectorized<M, N, r>(in, offsetIn, scale, shift, out, offsetOut);                                                 \
+  }
+
 matmul_combos(matmul_vectorized_c_func, 16, 8, 32)
 matmul_combos(matmul_vectorized_c_func, 16, 8, 64)
 matmul_combos(matmul_vectorized_c_func, 16, 16, 32)
 matmul_combos(matmul_vectorized_c_func, 32, 32, 32)
 matmul_combos(matmul_vectorized_c_func, 32, 32, 64)
 matmul_combos(matmul_vectorized_c_func, 64, 64, 64)
+
+scale_shift_trunc_combos_i32_i8(scale_shift_trunc_c_func, 32, 32)
 
 matmul_combos_i8(matmul_vectorized_c_func, 16, 16, 32)
 matmul_combos_i8(matmul_vectorized_c_func, 32, 16, 32)

@@ -6,6 +6,50 @@
 
 R"peano(
 
+
+
+template<int M, int N, int r>
+void scale_shift_trunc_vectorized(v32int32 *__restrict in, int64_t offsetIn, int64_t scale, int64_t shift, 
+                                  v32int8 *__restrict out, int64_t offsetOut) {
+  const v32uint16 mulLow = broadcast_u16((uint16)(scale & 0xFFFF));
+  const v32uint16 mulHigh = broadcast_u16((uint16)(scale >> 16));
+  for (unsigned i = 0; i < M * N / r; i++) {
+    out[offsetOut + i] = ssrs((v32acc32)in[offsetIn + i], 7, 0);
+    // v32int32 vecIn = in[offsetIn + i];
+    // v16uint32 lo = (v16uint32)extract_v16int32(vecIn, 0);
+    // v16uint32 hi = (v16uint32)extract_v16int32(vecIn, 1);
+    // v32uint16 vecInLow = (v32uint16)shuffle((v64int8)lo, (v64int8)hi, 0);
+    // v32uint16 vecInHigh= (v32uint16)shuffle((v64int8)lo, (v64int8)hi, 1);
+
+    // v32acc64 ilMl = mul_elem_32(vecInLow, mulLow);
+    // v32acc64 ilMh = mul_elem_32(vecInLow, mulHigh);
+    // v32acc64 ihMl = mul_elem_32(vecInHigh, mulLow);
+    // v32acc64 ihMh = mul_elem_32(vecInHigh, mulHigh);
+
+    // v32acc64 accLo = ilMl;
+    // accLo += (ilMh * 65536);
+    // accLo += (ihMl * 65536);
+    // accLo += (ihMh * 65536);
+    // v32int16 tmp = ssrs(accLo, shift);
+    // v32acc32 acc = ups_to_v32acc32(tmp, 0);
+
+    // // v16acc64 accLo = ups_to_v16acc64(extract_v16uint32(ilMl, 0), 0);
+    // // accLo += ups_to_v16acc64(extract_v16uint32(ilMh, 0), 16);
+    // // accLo += ups_to_v16acc64(extract_v16uint32(ihMl, 0), 16);
+    // // accLo += ups_to_v16acc64(extract_v16uint32(ihMh, 0), 32);
+    // // v16int32 outLo = lsrs(accLo, shift);
+
+    // // v16acc64 accHi = ups_to_v16acc64(extract_v16uint32(ilMl, 1), 0);
+    // // accHi += ups_to_v16acc64(extract_v16uint32(ilMh, 1), 16);
+    // // accHi += ups_to_v16acc64(extract_v16uint32(ihMl, 1), 16);
+    // // accHi += ups_to_v16acc64(extract_v16uint32(ihMh, 1), 32);
+    // // v16int32 outHi = lsrs(accHi, shift);
+
+    // // v32acc32 acc = (v32acc32)concat(outLo, outHi);
+    // out[offsetOut + i] = ssrs(acc, 0, 0);
+  }
+}
+
 template<int M, int N, int r>
 void zero_vectorized(v16int32 *__restrict pC, unsigned offsetC)
 {
@@ -261,6 +305,9 @@ extern "C" {
 #define zero_fill_combos_i32(X, M, N)  \
   X(v16int32, i32, M, N, 16)
 
+#define scale_shift_trunc_combos_i32_i8(X, M, N)  \
+  X(v32int32, i32, v32int8, i8, M, N, 16)
+
 #define matmul_combos_bfp16(X, M, N, K)                                     \
   X(bfloat16, bf16, bfloat16, bf16, float, f32, M, N, K, 8, 8, 8)
 
@@ -282,10 +329,23 @@ extern "C" {
     zero_vectorized<M, N, r>(c_out, offsetC);                      \
   }
 
+#define scale_shift_trunc_c_func(ctype_in, mlir_type_in, ctype_out, mlir_type_out, M, N, r)   \
+  void scale_shift_trunc_##mlir_type_in##_##mlir_type_out##_##M##x##N(                        \
+      ctype_in *in, int64_t offsetIn, int64_t scale, int64_t shift,                           \
+      ctype_out *out, int64_t offsetOut) {                                                    \
+    scale_shift_trunc_vectorized<M, N, r>(in, offsetIn, scale, shift, out, offsetOut);                                                 \
+  }
+
 matmul_combos_i8(matmul_vectorized_c_func, 32, 32, 32)
 matmul_combos_i8(matmul_vectorized_c_func, 32, 32, 64)
+matmul_combos_i8(matmul_vectorized_c_func, 32, 32, 128)
+matmul_combos_i8(matmul_vectorized_c_func, 64, 64, 128)
 
 zero_fill_combos_i32(zero_vectorized_c_func, 32, 32)
+zero_fill_combos_i32(zero_vectorized_c_func, 64, 64)
+
+scale_shift_trunc_combos_i32_i8(scale_shift_trunc_c_func, 32, 32)
+scale_shift_trunc_combos_i32_i8(scale_shift_trunc_c_func, 64, 64)
 
 matmul_combos_bfp16(matmul_vectorized_c_func, 16, 8, 32)
 matmul_combos_bfp16(matmul_vectorized_c_func, 16, 8, 64)

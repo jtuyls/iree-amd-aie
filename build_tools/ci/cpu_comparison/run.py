@@ -874,10 +874,12 @@ class MatmulScaleTrunci(BaseMatmul):
         K,
         input_type,
         acc_type,
-        lhs,
-        rhs,
-        expected_out,
+        lhs=None,
+        rhs=None,
+        expected_out=None,
         test_params=None,
+        n_kernel_runs=1,
+        additional_labels=None,
     ):
         super().__init__(
             name=f"matmul_scale_trunci_{M}_{N}_{K}_{input_type}_{acc_type}",
@@ -887,17 +889,27 @@ class MatmulScaleTrunci(BaseMatmul):
             K=K,
             input_type=input_type,
             acc_type=acc_type,
+            function_name="matmul_trunci",
+            n_kernel_runs=n_kernel_runs,
         )
         self.labels.append("MatmulScaleTrunci")
+        if additional_labels:
+            self.labels += additional_labels
 
-        # Assertions on shapes: Check that lhs is MxK, rhs is KxN, and expected_out is MxN
-        assert lhs.shape == (M, K)
-        assert rhs.shape == (K, N)
-        assert expected_out.shape == (M, N)
+        self.lhs = lhs if lhs is not None else 2 * np.ones([M, K], dtype=np.int8) # np.random.rand(M, K).astype(input_type)
+        self.rhs = rhs if rhs is not None else 3 * np.ones([K, N], dtype=np.int8) # np.random.rand(K, N).astype(input_type)
+        self.expected_out = expected_out if expected_out is not None else 24 * np.ones([M, N], dtype=np.int8)
 
-        self.lhs = lhs
-        self.rhs = rhs
-        self.expected_out = expected_out
+         # Assertions on shapes: Check that lhs is MxK, rhs is KxN, and expected_out is MxN
+        assert self.lhs.shape == (M, K)
+        assert self.rhs.shape == (K, N)
+        assert self.expected_out.shape == (M, N)
+
+        if self.run_benchmark:
+            self.aie_compilation_flags += [
+                "--iree-amdaie-enable-infinite-loop-around-core-block=true"
+            ]
+            self.labels.append("MatmulBenchmark")
 
     def _execute(self, config):
         matmul_template_dir = config.file_dir / "matmul_template"
@@ -907,6 +919,10 @@ class MatmulScaleTrunci(BaseMatmul):
         input_args = generate_inputs(
             filename, self.get_dir(config), 1, {1: self.lhs, 2: self.rhs}
         )
+        if self.run_benchmark:
+            return self.benchmark(config)
+
+        # return self.vs_cpu(config)
         aie_vs_baseline(
             config=config,
             aie_compilation_flags=self.aie_compilation_flags,
@@ -1817,6 +1833,12 @@ class Tests:
                 test_params=TestParams(
                     tile_pipeline="pack-peel-4-level-tiling",
                     run_on_target=["npu4"],
+                    aie_compilation_flags=[
+                        "--iree-amdaie-num-rows=4",
+                        "--iree-amdaie-num-cols=8",
+                        "--mlir-print-ir-before-all",
+                        "--debug-only=iree-amdaie-lower-to-ukernels",
+                    ],
                     use_chess=False,
                     use_ukernel=True,
                     use_chess_for_ukernel=False,
@@ -2394,6 +2416,8 @@ class Tests:
                 "tile_pipeline": "pack-peel-4-level-tiling",
                 "run_on_target": "npu4",
                 "use_chess_for_ukernel": False,
+                "matmul-scale-trunci": True,
+                "skip_numerics": True,
             },
         ]
 
@@ -2411,6 +2435,7 @@ class Tests:
             tile_pipeline = test.get("tile_pipeline", "pack-peel")
             matmul4d = test.get("matmul4d", False)
             scale_trunc = test.get("scale_trunc", False)
+            matmul_scale_trunci = test.get("matmul-scale-trunci", False)
             use_chess_for_ukernel = test.get("use_chess_for_ukernel", True)
             run_on_target = test.get("run_on_target", "npu1_4col")
             in_dtype = test.get("in_dtype", "bf16")
@@ -2450,7 +2475,9 @@ class Tests:
             if outline != "none":
                 name_suffix += "_outline"
 
-            if matmul4d:
+            if matmul_scale_trunci:
+                TestClass = MatmulScaleTrunci
+            elif matmul4d:
                 TestClass = Matmul4d if scale_trunc is False else Matmul4dScaleTrunci
             elif (transpose_a, transpose_b) == (False, False):
                 TestClass = Matmul
@@ -2503,6 +2530,7 @@ class Tests:
                         run_benchmark=True,
                         n_repeats=n_performance_repeats,
                         use_chess_for_ukernel=use_chess_for_ukernel,
+                        # use_chess=True,
                     ),
                     additional_labels=["Performance"] + additional_labels,
                     n_kernel_runs=n_performance_kernel_runs,

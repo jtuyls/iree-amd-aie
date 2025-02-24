@@ -229,6 +229,111 @@ static FailureOr<IREE::Codegen::UKernelOpInterface> matchFillDAGForUKernel(
       genericMicroKernelOp.getOperation());
 }
 
+std::optional<std::pair<Value, Value>>
+checkIsIntScaleShiftTruncAndReturnScaleAndShift(linalg::LinalgOp linalgOp) {
+  llvm::dbgs() << "checking for scale-shift-trunc op\n";
+  if (!isa<linalg::GenericOp>(linalgOp)) return std::nullopt;
+  Block *body = linalgOp.getBlock();
+  auto yieldOp = cast<linalg::YieldOp>(body->getTerminator());
+  Value yieldVal = yieldOp.getOperand(0);
+  Operation *truncOp = yieldVal.getDefiningOp();
+  if (!isa_and_present<arith::TruncIOp>(truncOp)) return std::nullopt;
+  Operation *shiftOp = truncOp->getOperand(0).getDefiningOp();
+  if (!isa_and_present<arith::ShRSIOp>(shiftOp)) return std::nullopt;
+  Value shiftVal = shiftOp->getOperand(1);
+  Operation *mulIOp = shiftOp->getOperand(0).getDefiningOp();
+  if (!isa_and_present<arith::MulIOp>(mulIOp)) return std::nullopt;
+  BlockArgument lhsBlockArg =
+      getBlockArgumentWithOptionalExtOps(mulIOp->getOperand(0));
+  BlockArgument rhsBlockArg =
+      getBlockArgumentWithOptionalExtOps(mulIOp->getOperand(1));
+  llvm::dbgs() << "lhsBlockArg\n";
+  Value scaleVal;
+  if (lhsBlockArg && lhsBlockArg.getOwner() == body) {
+    if (rhsBlockArg && rhsBlockArg.getOwner() == body) {
+      return std::nullopt;
+    }
+    scaleVal = mulIOp->getOperand(1);
+  } else if (rhsBlockArg && rhsBlockArg.getOwner() == body) {
+    if (lhsBlockArg && lhsBlockArg.getOwner() == body) {
+      return std::nullopt;
+    }
+    scaleVal = mulIOp->getOperand(0);
+  }
+  llvm::dbgs() << "scaleVal\n";
+  return std::make_pair(scaleVal, shiftVal);
+}
+
+static FailureOr<IREE::Codegen::UKernelOpInterface>
+matchScaleShiftTruncDAGForUKernel(RewriterBase &rewriter, Operation *op,
+                                  const std::string &ukernelName,
+                                  const std::string &pathToUkernels) {
+  llvm::dbgs() << "matching scale-shift-trunc op\n";
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
+  if (!linalgOp) {
+    return rewriter.notifyMatchFailure(op, "is not a linalg operation");
+  }
+  auto targetAttr = IREE::HAL::ExecutableTargetAttr::lookup(op);
+  if (!hasUkernel(targetAttr, ukernelName)) {
+    return rewriter.notifyMatchFailure(
+        op, "no ukernel found with name: " + ukernelName);
+  }
+  // TODO check only parallel dimensions
+  llvm::dbgs() << "checking for scale-shift-trunc op 0\n";
+  std::optional<std::pair<Value, Value>> maybeScaleAndShift =
+      checkIsIntScaleShiftTruncAndReturnScaleAndShift(linalgOp);
+  if (!maybeScaleAndShift.has_value()) {
+    llvm::dbgs() << "not a scale-shift-trunc op\n";
+    return rewriter.notifyMatchFailure(op, "is not a scale-shift-trunc op");
+  }
+  Value scaleVal, shiftVal;
+  std::tie(scaleVal, shiftVal) = maybeScaleAndShift.value();
+
+  FailureOr<std::string> maybeUkernelObjectName =
+      fetchUkernelObjectName(targetAttr);
+  if (failed(maybeUkernelObjectName)) {
+    llvm::dbgs() << "no ukernel object name found for the target\n";
+    return rewriter.notifyMatchFailure(
+        op, "no ukernel object name found for the target");
+  }
+
+  llvm::dbgs() << "getDpsInputOperand 0\n";
+
+  Value input = linalgOp.getDpsInputOperand(0)->get();
+  llvm::dbgs() << "getDpsInputOperand 1\n";
+  Value output = linalgOp.getDpsInitOperand(0)->get();
+  llvm::dbgs() << "getType\n";
+  auto inType = llvm::cast<ShapedType>(input.getType());
+  auto outType = llvm::cast<ShapedType>(output.getType());
+  Type inElemType = inType.getElementType();
+  Type outElemType = outType.getElementType();
+
+  llvm::dbgs() << "getTilingInfo\n";
+
+  // Tiling for M x N as well as the corresponding inner tiling intrinsics r x
+  // t.
+  int M, N, r, t;
+  std::tie(M, N, r, t) = getTilingInfo(outType);
+  std::string elemTypeAndSize = typeToString(inElemType) + "_" +
+                                typeToString(outElemType) + "_" +
+                                std::to_string(M) + "x" + std::to_string(N);
+
+  FnNameAndDefAttrs fn =
+      getFnNameAndDefAttrs(rewriter, ukernelName, elemTypeAndSize,
+                           pathToUkernels, *maybeUkernelObjectName);
+
+  // Create UKernel for AMD-AIE.
+  Location loc = linalgOp.getLoc();
+  auto genericMicroKernelOp = rewriter.create<IREE::Codegen::UKernelGenericOp>(
+      loc, outType, fn.name, ValueRange{input, scaleVal, shiftVal}, output,
+      ValueRange{},
+      /*fn_def_attrs=*/rewriter.getDictionaryAttr(fn.defAttrs),
+      /*strided_outer_dims=*/rewriter.getIndexAttr(0));
+
+  return cast<IREE::Codegen::UKernelOpInterface>(
+      genericMicroKernelOp.getOperation());
+}
+
 using TargetPredicate = std::function<bool(IREE::HAL::ExecutableTargetAttr)>;
 using MatchAndReplaceFunction =
     std::function<FailureOr<IREE::Codegen::UKernelOpInterface>(
@@ -273,6 +378,7 @@ struct LowerToUKernelPattern : OpRewritePattern<OpType> {
 
 static constexpr char kMatmulUKernelName[] = "matmul";
 static constexpr char kFillUKernelName[] = "zero";
+static constexpr char kScaleShiftTruncUKernelName[] = "scale_shift_trunc";
 
 void AMDAIELowerToUKernelsPass::runOnOperation() {
   MLIRContext *context = &getContext();
@@ -299,6 +405,9 @@ void AMDAIELowerToUKernelsPass::runOnOperation() {
   patterns.insert<LowerToUKernelPattern<linalg::FillOp>>(
       context, allTargets, matchFillDAGForUKernel, kFillUKernelName,
       pathToUkernels);
+  patterns.insert<LowerToUKernelPattern<linalg::GenericOp>>(
+      context, allTargets, matchScaleShiftTruncDAGForUKernel,
+      kScaleShiftTruncUKernelName, pathToUkernels);
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
     return signalPassFailure();
   }
