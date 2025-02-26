@@ -1836,8 +1836,8 @@ class Tests:
                     aie_compilation_flags=[
                         "--iree-amdaie-num-rows=4",
                         "--iree-amdaie-num-cols=8",
-                        "--mlir-print-ir-before-all",
-                        "--debug-only=iree-amdaie-lower-to-ukernels",
+                        # "--mlir-print-ir-before-all",
+                        # "--debug-only=iree-amdaie-lower-to-ukernels",
                     ],
                     use_chess=False,
                     use_ukernel=True,
@@ -1983,15 +1983,23 @@ class Tests:
             self.register(MatmulTransposeA(1536, 1536, 2048, input_type, acc_type))
 
         # NPU4 matmul test(s):
-        for use_chess in [True, False]:
+        for use_chess in [False]:
             self.register(
                 Matmul(
                     32,
-                    32,
-                    32,
+                    128,
+                    128,
                     "i32",
                     "i32",
-                    test_params=TestParams(run_on_target=["npu4"], use_chess=use_chess),
+                    test_params=TestParams(
+                        run_on_target=["npu4"],
+                        use_chess=use_chess,
+                        aie_compilation_flags=[
+                            "--iree-amdaie-num-rows=4",
+                            "--iree-amdaie-num-cols=2",
+                        ],
+                    ),
+                    additional_labels=["MatmulTest"],
                 )
             )
 

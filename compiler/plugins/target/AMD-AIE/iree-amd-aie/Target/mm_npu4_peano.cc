@@ -6,46 +6,63 @@
 
 R"peano(
 
-
-
 template<int M, int N, int r>
 void scale_shift_trunc_vectorized(v32int32 *__restrict in, int64_t offsetIn, int64_t scale, int64_t shift, 
                                   v32int8 *__restrict out, int64_t offsetOut) {
   const v32uint16 mulLow = broadcast_u16((uint16)(scale & 0xFFFF));
+  // const v32uint16 mulLow = broadcast_u16((uint16)1);
   const v32uint16 mulHigh = broadcast_u16((uint16)(scale >> 16));
   for (unsigned i = 0; i < M * N / r; i++) {
-    out[offsetOut + i] = ssrs((v32acc32)in[offsetIn + i], 7, 0);
-    // v32int32 vecIn = in[offsetIn + i];
-    // v16uint32 lo = (v16uint32)extract_v16int32(vecIn, 0);
-    // v16uint32 hi = (v16uint32)extract_v16int32(vecIn, 1);
-    // v32uint16 vecInLow = (v32uint16)shuffle((v64int8)lo, (v64int8)hi, 0);
-    // v32uint16 vecInHigh= (v32uint16)shuffle((v64int8)lo, (v64int8)hi, 1);
+    // out[offsetOut + i] = ssrs((v32acc32)in[offsetIn + i], 7, 0);
+    v32int32 vecIn = in[offsetIn + i];
+    v16uint32 lo = (v16uint32)extract_v16int32(vecIn, 0);
+    v16uint32 hi = (v16uint32)extract_v16int32(vecIn, 1);
+    v32uint16 vecInLow = (v32uint16)shuffle((v64int8)lo, (v64int8)hi, 0);
+    v32uint16 vecInHigh= (v32uint16)shuffle((v64int8)lo, (v64int8)hi, 1);
 
-    // v32acc64 ilMl = mul_elem_32(vecInLow, mulLow);
+    
+
+    v32acc64 ilMl = mul_elem_32(vecInLow, mulLow);
+    v16uint32 ilMlLo = ulsrs(extract_v16acc64(ilMl, 0), 0, 0);
+    v16uint32 ilMlHi = ulsrs(extract_v16acc64(ilMl, 1), 0, 0);
+    v32acc32 acc = (v32acc32)concat(mulLow, mulHigh);
+    out[offsetOut + i] = ssrs((v32acc32)vecIn, 7, 0);
+
+
     // v32acc64 ilMh = mul_elem_32(vecInLow, mulHigh);
     // v32acc64 ihMl = mul_elem_32(vecInHigh, mulLow);
     // v32acc64 ihMh = mul_elem_32(vecInHigh, mulHigh);
 
-    // v32acc64 accLo = ilMl;
-    // accLo += (ilMh * 65536);
-    // accLo += (ihMl * 65536);
-    // accLo += (ihMh * 65536);
-    // v32int16 tmp = ssrs(accLo, shift);
-    // v32acc32 acc = ups_to_v32acc32(tmp, 0);
+    // v16uint32 ilMlLo = ulsrs(extract_v16acc64(ilMl, 0), 0, 0);
+    // v16uint32 ilMhLo = ulsrs(extract_v16acc64(ilMh, 0), 0, 0);
+    // v16uint32 ihMlLo = ulsrs(extract_v16acc64(ihMl, 0), 0, 0);
+    // v16uint32 ihMhLo = ulsrs(extract_v16acc64(ihMh, 0), 0, 0);
 
-    // // v16acc64 accLo = ups_to_v16acc64(extract_v16uint32(ilMl, 0), 0);
-    // // accLo += ups_to_v16acc64(extract_v16uint32(ilMh, 0), 16);
-    // // accLo += ups_to_v16acc64(extract_v16uint32(ihMl, 0), 16);
-    // // accLo += ups_to_v16acc64(extract_v16uint32(ihMh, 0), 32);
-    // // v16int32 outLo = lsrs(accLo, shift);
+    // // v32acc64 accLo = ilMl;
+    // // accLo += (ilMh * 65536);
+    // // accLo += (ihMl * 65536);
+    // // accLo += (ihMh * 65536);
+    // // v32int16 tmp = ssrs(accLo, shift);
+    // // v32acc32 acc = ups_to_v32acc32(tmp, 0);
 
-    // // v16acc64 accHi = ups_to_v16acc64(extract_v16uint32(ilMl, 1), 0);
-    // // accHi += ups_to_v16acc64(extract_v16uint32(ilMh, 1), 16);
-    // // accHi += ups_to_v16acc64(extract_v16uint32(ihMl, 1), 16);
-    // // accHi += ups_to_v16acc64(extract_v16uint32(ihMh, 1), 32);
-    // // v16int32 outHi = lsrs(accHi, shift);
+    // v16acc64 accLo = ups_to_v16acc64((v16uint32)ilMlLo, 0);
+    // accLo = add(accLo, ups_to_v16acc64((v16uint32)ilMhLo, 16));
+    // accLo = add(accLo, ups_to_v16acc64((v16uint32)ihMlLo, 16));
+    // accLo = add(accLo, ups_to_v16acc64((v16uint32)ihMhLo, 32));
+    // v16int32 outLo = lsrs(accLo, shift);
 
-    // // v32acc32 acc = (v32acc32)concat(outLo, outHi);
+    // v16uint32 ilMlHi = ulsrs(extract_v16acc64(ilMl, 1), 0, 0);
+    // v16uint32 ilMhHi = ulsrs(extract_v16acc64(ilMh, 1), 0, 0);
+    // v16uint32 ihMlHi = ulsrs(extract_v16acc64(ihMl, 1), 0, 0);
+    // v16uint32 ihMhHi = ulsrs(extract_v16acc64(ihMh, 1), 0, 0);
+
+    // v16acc64 accHi = ups_to_v16acc64((v16uint32)ilMlHi, 0);
+    // accHi = add(accHi, ups_to_v16acc64((v16uint32)ilMhHi, 16));
+    // accHi = add(accHi, ups_to_v16acc64((v16uint32)ihMlHi, 16));
+    // accHi = add(accHi, ups_to_v16acc64((v16uint32)ihMhHi, 32));
+    // v16int32 outHi = lsrs(accHi, shift);
+
+    // v32acc32 acc = (v32acc32)concat(outLo, outHi);
     // out[offsetOut + i] = ssrs(acc, 0, 0);
   }
 }
