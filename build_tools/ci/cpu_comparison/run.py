@@ -1591,6 +1591,7 @@ def aie_vs_baseline(
             name,
             output_type,
         )
+        print("aie_output", aie_output)
 
         summary_string = compare(baseline_value, aie_output, rtol, atol)
         if summary_string:
@@ -1827,7 +1828,7 @@ class Tests:
                 128,
                 "i8",
                 "i32",
-                2 * np.ones([256, 128], dtype=np.int8),
+                -2 * np.ones([256, 128], dtype=np.int8),
                 3 * np.ones([128, 256], dtype=np.int8),
                 60 * np.ones([256, 256], dtype=np.int8),
                 test_params=TestParams(

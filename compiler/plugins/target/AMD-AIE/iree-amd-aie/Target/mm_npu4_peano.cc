@@ -9,26 +9,44 @@ R"peano(
 template<int M, int N, int r>
 void scale_shift_trunc_vectorized(v32int32 *__restrict in, int64_t offsetIn, int64_t scale, int64_t shift, 
                                   v32int8 *__restrict out, int64_t offsetOut) {
+  set_sat();
   const v32uint16 mulLow = broadcast_u16((uint16)(scale & 0xFFFF));
-  // const v32uint16 mulLow = broadcast_u16((uint16)1);
   const v32uint16 mulHigh = broadcast_u16((uint16)(scale >> 16));
   for (unsigned i = 0; i < M * N / r; i++) {
     // out[offsetOut + i] = ssrs((v32acc32)in[offsetIn + i], 7, 0);
     v32int32 vecIn = in[offsetIn + i];
-    v16uint32 lo = (v16uint32)extract_v16int32(vecIn, 0);
-    v16uint32 hi = (v16uint32)extract_v16int32(vecIn, 1);
-    v32uint16 vecInLow = (v32uint16)shuffle((v64int8)lo, (v64int8)hi, 0);
-    v32uint16 vecInHigh= (v32uint16)shuffle((v64int8)lo, (v64int8)hi, 1);
+    v16int32 lo = extract_v16int32(vecIn, 0);
+    v16int32 hi = extract_v16int32(vecIn, 1);
+    // v16uint32 signLo = (v16uint32)lo & broadcast_u32(0x80000000);
+    // v16uint32 signHi = (v16uint32)hi & broadcast_u32(0x80000000);
+    // v16int16 signLoMask = lsrs((v16acc32)min(lo, broadcast_s32(-1)), 0, 0); // lsrs((v16acc32)min(max(lo, broadcast_s32(-1)), broadcast_s32(1)), 0, 0);
+    // v16int16 signHiMask = lsrs((v16acc32)min(max(hi, broadcast_s32(-1)), broadcast_s32(1)), 0, 0);
+    unsigned signLoMask = lt(lo, broadcast_s32(0));
+    unsigned signHiMask = lt(hi, broadcast_s32(0));
+    v16int32 t1 = sel(broadcast_s32(1), broadcast_s32(-1), signLoMask);
+    v16int32 t2 = sel(broadcast_s32(1), broadcast_s32(-1), signHiMask);
+    v16uint32 ulo = abs(lo);
+    v16uint32 uhi = abs(hi);
+    v32uint16 vecInLow = (v32uint16)shuffle((v32uint16)ulo, (v32uint16)uhi, 2);
+    v32uint16 vecInHigh= (v32uint16)shuffle((v32uint16)ulo, (v32uint16)uhi, 3);
 
+    v32acc32 acc = (v32acc32)concat(t2, t2);
+    out[offsetOut + i] = ssrs(acc, 0, 0);
+
+    // // v32acc64 test = ups_to_v32acc64(vecInHigh, 0);
+    // // v16uint32 ilMlLo = ulsrs(extract_v16acc64(test, 0), 0, 0);
+    // // v16uint32 ilMlHi = ulsrs(extract_v16acc64(test, 1), 0, 0);
+    // // v32acc32 acc = (v32acc32)concat(mulLow, mulHigh);
+    // // out[offsetOut + i] = ssrs(acc, 7, 0);
     
 
-    v32acc64 ilMl = mul_elem_32(vecInLow, mulLow);
-    v16uint32 ilMlLo = ulsrs(extract_v16acc64(ilMl, 0), 0, 0);
-    v16uint32 ilMlHi = ulsrs(extract_v16acc64(ilMl, 1), 0, 0);
-    v32acc32 acc = (v32acc32)concat(mulLow, mulHigh);
-    out[offsetOut + i] = ssrs((v32acc32)vecIn, 7, 0);
+    // // v32acc64 ilMl = mul_elem_32(mulLow, vecInLow);
+    // // v16uint32 ilMlLo = ulsrs(extract_v16acc64(ilMl, 0), 0, 0);
+    // // v16uint32 ilMlHi = ulsrs(extract_v16acc64(ilMl, 1), 0, 0);
+    // // v32acc32 acc = (v32acc32)concat(ilMlLo, ilMlHi);
+    // // out[offsetOut + i] = ssrs(acc, 7, 0);
 
-
+    // v32acc64 ilMl = mul_elem_32(vecInLow, mulLow);
     // v32acc64 ilMh = mul_elem_32(vecInLow, mulHigh);
     // v32acc64 ihMl = mul_elem_32(vecInHigh, mulLow);
     // v32acc64 ihMh = mul_elem_32(vecInHigh, mulHigh);
@@ -38,18 +56,11 @@ void scale_shift_trunc_vectorized(v32int32 *__restrict in, int64_t offsetIn, int
     // v16uint32 ihMlLo = ulsrs(extract_v16acc64(ihMl, 0), 0, 0);
     // v16uint32 ihMhLo = ulsrs(extract_v16acc64(ihMh, 0), 0, 0);
 
-    // // v32acc64 accLo = ilMl;
-    // // accLo += (ilMh * 65536);
-    // // accLo += (ihMl * 65536);
-    // // accLo += (ihMh * 65536);
-    // // v32int16 tmp = ssrs(accLo, shift);
-    // // v32acc32 acc = ups_to_v32acc32(tmp, 0);
-
     // v16acc64 accLo = ups_to_v16acc64((v16uint32)ilMlLo, 0);
     // accLo = add(accLo, ups_to_v16acc64((v16uint32)ilMhLo, 16));
     // accLo = add(accLo, ups_to_v16acc64((v16uint32)ihMlLo, 16));
     // accLo = add(accLo, ups_to_v16acc64((v16uint32)ihMhLo, 32));
-    // v16int32 outLo = lsrs(accLo, shift);
+    // v16int16 outLo = (v16int16)ssrs(accLo, shift);
 
     // v16uint32 ilMlHi = ulsrs(extract_v16acc64(ilMl, 1), 0, 0);
     // v16uint32 ilMhHi = ulsrs(extract_v16acc64(ilMh, 1), 0, 0);
@@ -60,11 +71,15 @@ void scale_shift_trunc_vectorized(v32int32 *__restrict in, int64_t offsetIn, int
     // accHi = add(accHi, ups_to_v16acc64((v16uint32)ilMhHi, 16));
     // accHi = add(accHi, ups_to_v16acc64((v16uint32)ihMlHi, 16));
     // accHi = add(accHi, ups_to_v16acc64((v16uint32)ihMhHi, 32));
-    // v16int32 outHi = lsrs(accHi, shift);
+    // v16int16 outHi = (v16int16)ssrs(accHi, shift);
 
-    // v32acc32 acc = (v32acc32)concat(outLo, outHi);
-    // out[offsetOut + i] = ssrs(acc, 0, 0);
+    // v32int16 acc = (v32int16)concat(outLo, outHi);
+    // // v32int16 accSign = (v32int16)concat(signLoMask, signHiMask);
+    // // v32acc64 acc64 = mul_elem_32(acc, accSign);
+    // // v32int16 out16 = ssrs(acc64, 0, 0);
+    // out[offsetOut + i] = ssrs(ups_to_v32acc32(acc, 0), 0, 0);
   }
+  clr_sat();
 }
 
 template<int M, int N, int r>
