@@ -202,6 +202,7 @@ class ParameterSetting {
 FailureOr<ParameterSetting> ParameterSetting::create(
     linalg::LinalgOp linalgOp, bool isObjectFifo, AMDAIEDevice targetDevice,
     uint32_t numRows, uint32_t numCols, uint32_t kPackScaleL1) {
+  AMDAIEDeviceModel deviceModel = getDeviceModel(targetDevice);
   auto initType =
       llvm::cast<ShapedType>(linalgOp.getDpsInitOperand(0)->get().getType());
   unsigned nBitsInit = initType.getElementTypeBitWidth();
@@ -235,18 +236,33 @@ FailureOr<ParameterSetting> ParameterSetting::create(
   // Long-term we should use a different approach, one which takes into account
   // the element types of all tensors which need to be allocated in memory
   // simultaneously.
-  FailureOr<unsigned> maybeScaleFactor =
-      isObjectFifo ? getTilingScaleFactor(initType.getElementType())
-                   : getTilingScaleFactor(lhsType.getElementType());
-  if (failed(maybeScaleFactor)) {
-    return linalgOp.emitOpError(
-        "does not have the expected bitwidth (64, 32, 16, or 8), could not "
-        "determine scale factor.");
+  // FailureOr<unsigned> maybeScaleFactor =
+  //     isObjectFifo ? getTilingScaleFactor(initType.getElementType())
+  //                  : getTilingScaleFactor(lhsType.getElementType());
+  // if (failed(maybeScaleFactor)) {
+  //   return linalgOp.emitOpError(
+  //       "does not have the expected bitwidth (64, 32, 16, or 8), could not "
+  //       "determine scale factor.");
+  // }
+
+  // unsigned scaleFactor = maybeScaleFactor.value();
+
+  FailureOr<std::tuple<uint32_t, uint32_t, uint32_t>> maybeTilingSizes =
+      getL1TilingSizes(16, 16, kPackScaleL1 / 2 * 16, nBitsLhs, nBitsRhs, nBitsInit, 
+        deviceModel.getCoreTileLocalMemorySize());
+  if (failed(maybeTilingSizes)) {
+    return linalgOp.emitOpError()
+           << "could not find any possible tiling sizes.";
   }
+  uint32_t maxL1SizeM, maxL1SizeN, maxL1SizeK;
+  std::tie(maxL1SizeM, maxL1SizeN, maxL1SizeK) =
+      std::move(maybeTilingSizes.value());
+  llvm::outs() << "maxL1SizeM: " << maxL1SizeM << "\n";
+  llvm::outs() << "maxL1SizeN: " << maxL1SizeN << "\n";
+  llvm::outs() << "maxL1SizeK: " << maxL1SizeK << "\n";
 
-  unsigned scaleFactor = maybeScaleFactor.value();
-
-  auto maybePackedSize = getPackedSize(linalgOp, M, N, K, targetDevice);
+  auto maybePackedSize =
+      getPackedSize(linalgOp, M, N, K, targetDevice);
   if (failed(maybePackedSize)) return failure();
   auto [m1Pack, n1Pack, k1Pack] = maybePackedSize.value();
 
@@ -271,8 +287,8 @@ FailureOr<ParameterSetting> ParameterSetting::create(
   // Develop a better way to select tile sizes to make the most use of
   // memory while taking all factors (double buffer, elementwise memory usage,
   // lhs/rhs element type, etc) into account.
-  uint32_t maxL1SizeM = 32 * scaleFactor;
-  uint32_t maxL1SizeN = 32 * scaleFactor;
+  // uint32_t maxL1SizeM = 16 * scaleFactor;
+  // uint32_t maxL1SizeN = 16 * scaleFactor;
   uint32_t M1 = findLargestFactor(M / m1Pack, maxL1SizeM / m1Pack, m1Pack);
   uint32_t N1 = findLargestFactor(N / n1Pack, maxL1SizeN / n1Pack, n1Pack);
 
@@ -285,8 +301,8 @@ FailureOr<ParameterSetting> ParameterSetting::create(
   // so set K1 = 0. The packed outer K dimension needs to be 1, so set K0 = 1.
   uint32_t K1 = 0;
   uint32_t K0 = 1;
-  uint32_t maxL1SizeK = 32 * scaleFactor;
-  uint32_t k0Pack = findLargestFactor(K, kPackScaleL1 * maxL1SizeK);
+  // uint32_t maxL1SizeK = 16 * scaleFactor;
+  uint32_t k0Pack = findLargestFactor(K, maxL1SizeK);
 
   // Instead of directly packing to (1, 1, M0, N0), the new strategy is making
   // the pack size as (numRows, numCols, M0/numRows, N0/numCols) to avoid the

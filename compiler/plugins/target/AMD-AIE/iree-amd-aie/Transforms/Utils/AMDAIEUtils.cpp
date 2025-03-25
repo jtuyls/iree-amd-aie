@@ -106,6 +106,24 @@ FailureOr<unsigned> getTilingScaleFactor(Type elemType) {
   return 64 / bitWidth;
 }
 
+FailureOr<std::tuple<uint32_t, uint32_t, uint32_t>> getL1TilingSizes(
+    uint32_t minM, uint32_t minN, uint32_t minK, uint32_t nBitsLhs,
+    uint32_t nBitsRhs, uint32_t nBitsInit, uint32_t maxL1SizeInBytes) {
+  uint32_t maxL1SizeInBits = maxL1SizeInBytes * 8;
+  llvm::outs() << "maxL1SizeInBits: " << maxL1SizeInBits << "\n";
+  // Multiply by '2' for double buffering.
+  uint32_t minL1SizeLhs = (minM * minK) * nBitsLhs * 2;
+  uint32_t minL1SizeRhs = (minN * minK) * nBitsRhs * 2;
+  uint32_t minL1SizeInit = (minM * minN) * nBitsInit * 2;
+  llvm::outs() << "minL1SizeInit: " << minL1SizeInit << "\n";
+  uint32_t minTotalSizeInBits = minL1SizeLhs + minL1SizeRhs + minL1SizeInit;
+  if (minTotalSizeInBits > maxL1SizeInBits) return failure();
+  llvm::outs() << "minTotalSizeInBits: " << minTotalSizeInBits << "\n";
+  uint32_t scaleFactor = std::sqrt(maxL1SizeInBits / minTotalSizeInBits);
+  llvm::outs() << "scaleFactor: " << scaleFactor << "\n";
+  return std::make_tuple(minM * scaleFactor, minN * scaleFactor, minK * scaleFactor);
+}
+
 /// Get the m/n/k dimension of a matmul-like op from its affine map.
 static mlir::AffineExpr getAffineMapDim(ArrayAttr indexingMaps,
                                         uint32_t mapIndex, uint32_t mnkIndex) {

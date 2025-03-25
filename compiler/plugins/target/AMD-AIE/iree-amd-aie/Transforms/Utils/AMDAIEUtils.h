@@ -64,6 +64,10 @@ FailureOr<uint32_t> getAIEMacNumElements(Type inputType, Type outputType);
 /// width.
 FailureOr<unsigned> getTilingScaleFactor(Type elemType);
 
+FailureOr<std::tuple<uint32_t, uint32_t, uint32_t>> getL1TilingSizes(
+    uint32_t minM, uint32_t minN, uint32_t minK, uint32_t nBitsLhs,
+    uint32_t nBitsRhs, uint32_t nBitsInit, uint32_t maxL1Size);
+
 /// Utility to identify whether a linalg op is a matmul op.
 bool isMatmul(linalg::LinalgOp linalgOp);
 
