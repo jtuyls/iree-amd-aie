@@ -223,10 +223,27 @@ class UsageAndColumnBasedTileAllocator final : public TileAllocatorBase {
   /// candidate tile locations and then assign tiles based on a simple
   /// usage-based model that prioritizes tiles that have the least usage.
   LogicalResult assignNonLocalTiles(
-      SmallVector<AMDAIE::LogicalObjFifoOpInterface> &objFifos,
+      SmallVector<AMDAIE::LogicalObjFifoOpInterface> &objFifosTmp,
       uint8_t memSpace, function_ref<InFlightDiagnostic()> emitError) {
     assert((memSpace == 0 || memSpace == 1) &&
            "The memory space of non-local objectFifos should be `0` or `1`");
+    auto getAllocationSize =
+        [](AMDAIE::LogicalObjFifoOpInterface objFifo) -> size_t {
+          LLVM_DEBUG(llvm::dbgs() << "objFifo: " << objFifo << "\n");
+      MemRefType memrefType = objFifo.getMemrefType();
+      LLVM_DEBUG(llvm::dbgs() << "memrefType: " << memrefType << "\n");
+      size_t allocationSizeInBits =
+          memrefType.getNumElements() * memrefType.getElementTypeBitWidth();
+      LLVM_DEBUG(llvm::dbgs()
+                 << "allocationSizeInBits: " << allocationSizeInBits << "\n");
+      assert(allocationSizeInBits % 8 == 0 &&
+             "All objectFifo sizes should be a byte multiple.");
+      LLVM_DEBUG(llvm::dbgs()
+                 << "objFifo.getDepth(): " << std::to_string(objFifo.getDepth()) << "\n");
+                 LLVM_DEBUG(llvm::dbgs()
+                 << "out: " << allocationSizeInBits / 8 * objFifo.getDepth() << "\n");
+      return allocationSizeInBits / 8 * objFifo.getDepth();
+    };
     // Keep track of the buffer usage on tiles to try distributing buffers
     // evenly over available tile resources.
     DenseMap<TileLoc, size_t> tileLocToUsage;
@@ -249,6 +266,15 @@ class UsageAndColumnBasedTileAllocator final : public TileAllocatorBase {
              << "No rows found for the memory space of this logical objFifo";
     }
     uint32_t row = memSpaceRows[0];
+
+    SmallVector<AMDAIE::LogicalObjFifoOpInterface> objFifos = objFifosTmp;
+    for (auto e : objFifos) {\
+      LLVM_DEBUG(llvm::dbgs() << "objFifo: " << e << "\n");
+    }
+    llvm::sort(objFifos, [&](AMDAIE::LogicalObjFifoOpInterface a,
+                             AMDAIE::LogicalObjFifoOpInterface b) {
+      return getAllocationSize(a) > getAllocationSize(b);
+    });
 
     for (AMDAIE::LogicalObjFifoOpInterface objFifo : objFifos) {
       LLVM_DEBUG(llvm::dbgs()
@@ -303,7 +329,9 @@ class UsageAndColumnBasedTileAllocator final : public TileAllocatorBase {
       // Assing a tile location.
       TileLoc assignedTileLoc;
       const auto *tileIt = llvm::find_if(tiles, [&](const TileLoc &tileLoc) {
-        return tileLoc.col == priorityCol;
+        return tileLoc.col == priorityCol &&
+               tileLocToUsage[tileLoc] < deviceModel.getTileMemorySizeInBytes(
+                                              tileLoc.col, tileLoc.row);
       });
       if (tileIt != tiles.end()) {
         assignedTileLoc = *tileIt;
@@ -315,13 +343,21 @@ class UsageAndColumnBasedTileAllocator final : public TileAllocatorBase {
             *std::min_element(tiles.begin(), tiles.end(), tileLocAndUsageCmp);
       }
 
+      LLVM_DEBUG(llvm::dbgs() << "Assigned tile loc usage: "
+                              << tileLocToUsage[assignedTileLoc] << "\n");
+      LLVM_DEBUG(llvm::dbgs() << "Assigned tile loc max mem: "
+                              << deviceModel.getTileMemorySizeInBytes(
+                                     assignedTileLoc.col, assignedTileLoc.row)
+                              << "\n");
+
       // Increase usage of the chosen tile as a new logical objectFifo will be
       // assigned to it. This allows distributing the logical objectFifos
       // evenly across the available tile resources.
       LLVM_DEBUG(llvm::dbgs()
                  << "Assign to tile (col, row): (" << assignedTileLoc.col
                  << ", " << assignedTileLoc.row << ")\n");
-      tileLocToUsage[assignedTileLoc] += 1;
+      size_t allocationSizeInBytes = getAllocationSize(objFifo);
+      tileLocToUsage[assignedTileLoc] += allocationSizeInBytes;
 
       rewriter.setInsertionPoint(objFifo);
       auto getCol = rewriter.create<arith::ConstantIndexOp>(

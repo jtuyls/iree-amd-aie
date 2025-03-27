@@ -132,6 +132,8 @@ struct HalfDmaCpyNdToNpuConverter final
           repeatCount = iterationSize;
         }
       } else {
+        // staticSizes.push_back(0);
+        // staticStrides.push_back(1);
         staticStrides.push_back(
             std::max(stride * elemWidthInBits / minStrideBitWidth, (int64_t)1));
         // Innermost size needs to account for addressing granularity.

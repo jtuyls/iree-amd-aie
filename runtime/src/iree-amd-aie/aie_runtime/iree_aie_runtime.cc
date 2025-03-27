@@ -389,6 +389,22 @@ uint32_t AMDAIEDeviceModel::getMemTileSize(uint8_t col, uint8_t row) const {
   return devInst.DevProp.DevMod[static_cast<uint8_t>(tileType)].MemMod->Size;
 }
 
+uint32_t AMDAIEDeviceModel::getTileMemorySizeInBytes(uint8_t col,
+                                                     uint8_t row) const {
+  AMDAIETileType tileType = getTileType(col, row);
+  switch (tileType) {
+    case AMDAIETileType::AIETILE:
+      return getLocalMemorySize(col, row);
+    case AMDAIETileType::MEMTILE:
+      return getMemTileSize(col, row);
+    case AMDAIETileType::SHIMNOC:
+    case AMDAIETileType::SHIMPL:
+      return std::numeric_limits<uint32_t>::max();
+    default:
+      return 0;
+  }
+}
+
 SmallVector<uint32_t> AMDAIEDeviceModel::getMemSpaceRows(
     uint8_t memSpace) const {
   SmallVector<uint32_t> res;

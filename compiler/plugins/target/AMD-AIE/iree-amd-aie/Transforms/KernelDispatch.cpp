@@ -248,7 +248,7 @@ FailureOr<ParameterSetting> ParameterSetting::create(
   // unsigned scaleFactor = maybeScaleFactor.value();
 
   FailureOr<std::tuple<uint32_t, uint32_t, uint32_t>> maybeTilingSizes =
-      getL1TilingSizes(16, 16, kPackScaleL1 / 2 * 16, nBitsLhs, nBitsRhs, nBitsInit, 
+      getL1TilingSizes(16, 16, kPackScaleL1 * 16, nBitsLhs, nBitsRhs, nBitsInit, 
         deviceModel.getCoreTileLocalMemorySize());
   if (failed(maybeTilingSizes)) {
     return linalgOp.emitOpError()
@@ -518,7 +518,7 @@ static LogicalResult setRootConfigForPackPeel4LevelTilingPipeline(
   llvm::outs() << "fitsInL2: " << fitsInL2 << "\n";
   llvm::outs() << "fitsInL2: " << packPeelTiling.M0 << "\n";
   int64_t scaleL0 = !isBatchMatmul && fitsInL2 ? 2 : 1;
-  int64_t m0Tile = packPeelTiling.M0 * scaleL0;
+  int64_t m0Tile = packPeelTiling.M0 * scaleL0 * 2;
   int64_t n0Tile = packPeelTiling.N0 * scaleL0;
 
   SmallVector<int64_t> tileSizeLevel0(numLoops, 0);

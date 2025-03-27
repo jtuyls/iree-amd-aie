@@ -34,21 +34,45 @@ void matmul_vectorized_i8_i32(const int8 * __restrict pA, unsigned offsetA, cons
   v64int8 A1;
   v64int8 B0;
   v64int8 B1;
+  v64int8 B2;
+  v64int8 B3;
+
   v64acc32 acc_C00;
   v64acc32 acc_C01;
   v64acc32 acc_C10;
   v64acc32 acc_C11;
+  
+  v64acc32 acc_C02;
+  v64acc32 acc_C03;
+  v64acc32 acc_C12;
+  v64acc32 acc_C13;
 
   for (unsigned z = 0; z < rowA; z += 2) {
     v64acc32 *__restrict pC0 = (v64acc32 *)(pC + offsetC + (z)*size_C);
     v64acc32 *__restrict pC1 = (v64acc32 *)(pC + offsetC + ((z + 1)) * size_C);
 
-    for (unsigned j = 0; j < colB; j += 2) {
+    for (unsigned j = 0; j < colB; j += 4) {
       const v64int8 *__restrict pA0 = (v64int8 *)(pA + offsetA + (z)*size_A);
       const v64int8 *__restrict pA1 = (v64int8 *)(pA + offsetA + ((z + 1)) * size_A);
 
       const v64int8 *__restrict pB0 = (v64int8 *)(pB + offsetB + (j)*colA*size_B);
       const v64int8 *__restrict pB1 = (v64int8 *)(pB + offsetB + ((j + 1))*colA * size_B);
+      const v64int8 *__restrict pB2 = (v64int8 *)(pB + offsetB + ((j + 2))*colA * size_B);
+      const v64int8 *__restrict pB3 = (v64int8 *)(pB + offsetB + ((j + 3))*colA * size_B);
+
+      __builtin_aie2p_sched_barrier();
+      
+      acc_C00 = *pC0;
+      acc_C01 = *(pC0 + rowA);
+      acc_C02 = *(pC0 + 2 * rowA);
+      acc_C03 = *(pC0 + 3 * rowA);
+
+      acc_C10 = *pC1;
+      acc_C11 = *(pC1 + rowA);
+      acc_C12 = *(pC1 + 2 * rowA);
+      acc_C13 = *(pC1 + 3 * rowA);
+
+      __builtin_aie2p_sched_barrier();
 
       A0 = *pA0;
       pA0 += rowA;
@@ -57,19 +81,24 @@ void matmul_vectorized_i8_i32(const int8 * __restrict pA, unsigned offsetA, cons
 
       B0 = *pB0++;
       B1 = *pB1++;
-
-      acc_C00 = *pC0;
-      acc_C01 = *(pC0 + rowA);
-
-      acc_C10 = *pC1;
-      acc_C11 = *(pC1 + rowA);
+      B2 = *pB2++;
+      B3 = *pB3++;
 
       acc_C00 = mac_8x8_8x8(A0, B0, acc_C00);
       acc_C01 = mac_8x8_8x8(A0, B1, acc_C01);
       acc_C10 = mac_8x8_8x8(A1, B0, acc_C10);
       acc_C11 = mac_8x8_8x8(A1, B1, acc_C11);
 
+      acc_C02 = mac_8x8_8x8(A0, B2, acc_C02);
+      acc_C03 = mac_8x8_8x8(A0, B3, acc_C03);
+      acc_C12 = mac_8x8_8x8(A1, B2, acc_C12);
+      acc_C13 = mac_8x8_8x8(A1, B3, acc_C13);
+
+      __builtin_aie2p_sched_barrier();
+
       for (unsigned i = 1; i < colA; ++i) {
+
+        __builtin_aie2p_sched_barrier();
         A0 = *pA0;
         pA0 += rowA;
         A1 = *pA1;
@@ -77,14 +106,25 @@ void matmul_vectorized_i8_i32(const int8 * __restrict pA, unsigned offsetA, cons
 
         B0 = *pB0++;
         B1 = *pB1++;
+        B2 = *pB2++;
+        B3 = *pB3++;
 
         acc_C00 = mac_8x8_8x8(A0, B0, acc_C00);
         acc_C01 = mac_8x8_8x8(A0, B1, acc_C01);
         acc_C10 = mac_8x8_8x8(A1, B0, acc_C10);
         acc_C11 = mac_8x8_8x8(A1, B1, acc_C11);
+
+        acc_C02 = mac_8x8_8x8(A0, B2, acc_C02);
+        acc_C03 = mac_8x8_8x8(A0, B3, acc_C03);
+        acc_C12 = mac_8x8_8x8(A1, B2, acc_C12);
+        acc_C13 = mac_8x8_8x8(A1, B3, acc_C13);
+
+        __builtin_aie2p_sched_barrier();
       }
 
       // -----
+
+      __builtin_aie2p_sched_barrier();
 
       v64acc32 * __restrict pOut00 = pC0;
       *pOut00 = acc_C00;
@@ -92,6 +132,14 @@ void matmul_vectorized_i8_i32(const int8 * __restrict pA, unsigned offsetA, cons
 
       v64acc32 * __restrict pOut01 = pC0;
       *pOut01 = acc_C01;
+      pC0 += rowA;
+
+      v64acc32 * __restrict pOut02 = pC0;
+      *pOut02 = acc_C02;
+      pC0 += rowA;
+
+      v64acc32 * __restrict pOut03 = pC0;
+      *pOut03 = acc_C03;
       pC0 += rowA;
 
       // -----
@@ -103,6 +151,16 @@ void matmul_vectorized_i8_i32(const int8 * __restrict pA, unsigned offsetA, cons
       v64acc32 * __restrict pOut11 = pC1;
       *pOut11 = acc_C11;
       pC1 += rowA;
+
+      v64acc32 * __restrict pOut12 = pC1;
+      *pOut12 = acc_C12;
+      pC1 += rowA;
+
+      v64acc32 * __restrict pOut13 = pC1;
+      *pOut13 = acc_C13;
+      pC1 += rowA;
+
+      __builtin_aie2p_sched_barrier();
     }
   }
 }
