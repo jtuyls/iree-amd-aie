@@ -2504,6 +2504,7 @@ class Tests:
                 "scale_trunc": True,
                 "tile_pipeline": "pack-peel-4-level-tiling",
                 "run_on_target": "npu4",
+                "use_chess": False,
                 "use_chess_for_ukernel": False,
                 "peano_opt_level": 1,
                 # "outline": "all",
@@ -2546,6 +2547,7 @@ class Tests:
             tile_pipeline = test.get("tile_pipeline", "pack-peel")
             matmul4d = test.get("matmul4d", False)
             scale_trunc = test.get("scale_trunc", False)
+            use_chess = test.get("use_chess", False)
             use_chess_for_ukernel = test.get("use_chess_for_ukernel", True)
             run_on_target = test.get("run_on_target", "npu1_4col")
             in_dtype = test.get("in_dtype", "bf16")
@@ -2627,6 +2629,7 @@ class Tests:
                             name_suffix=name_suffix,
                             n_repeats=2,
                             use_chess_for_ukernel=use_chess_for_ukernel,
+                            use_chess=use_chess,
                         ),
                         additional_labels=["PerformanceCorrectness"]
                         + additional_labels,
@@ -2649,6 +2652,7 @@ class Tests:
                         run_benchmark=True,
                         n_repeats=n_performance_repeats,
                         use_chess_for_ukernel=use_chess_for_ukernel,
+                        use_chess=use_chess,
                     ),
                     additional_labels=["Performance"] + additional_labels,
                     n_kernel_runs=n_performance_kernel_runs,

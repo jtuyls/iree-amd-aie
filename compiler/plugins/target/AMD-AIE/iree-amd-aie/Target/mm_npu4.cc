@@ -20,6 +20,14 @@ R"chess(
 
 #include <aie_api/aie.hpp>
 
+template<int M, int N, int r>
+void trunci_vectorized(v32int32 *__restrict in, int64_t offsetIn, int64_t shift,
+                       v32int8 *__restrict out, int64_t offsetOut) {
+  for (unsigned i = 0; i < M * N / r; i++) {
+    out[offsetOut + i] = ssrs((v32acc32)in[offsetIn + i], shift, 0);
+  }
+}
+
 template<typename T, int M, int N, int r>
 void zero_vectorized(T *__restrict pC, unsigned offsetC)
 {
@@ -170,83 +178,212 @@ void matmul_vectorized_i8_i32(const int8 * __restrict pA, unsigned offsetA, cons
   const unsigned size_A = L0_M * L0_K;
   const unsigned size_B = L0_K * L0_N;
   const unsigned size_C = L0_M * L0_N;
-  using MMUL = aie::mmul<L0_M, L0_K, L0_N, int8, int8, acc32>;
 
-  for (unsigned z = 0; z < rowA; z += 2)
-    chess_loop_range(4, ) {
-      int32 *__restrict pC0 = pC + offsetC + (z)*size_C;
-      int32 *__restrict pC1 = pC + offsetC + ((z + 1)) * size_C;
+  v64int8 A0;
+  v64int8 A1;
+  v64int8 B0;
+  v64int8 B1;
+  v64int8 B2;
+  v64int8 B3;
 
-      for (unsigned j = 0; j < colB; j += 2)
-        chess_prepare_for_pipelining chess_loop_range(4, ) {
-          const int8 *__restrict pA0 = pA + offsetA + (z)*size_A;
-          const int8 *__restrict pA1 = pA + offsetA + ((z + 1)) * size_A;
-          const int8 *__restrict pB0 = pB + offsetB + (j)*colA*size_B;
-          const int8 *__restrict pB1 = pB + offsetB + ((j + 1))*colA * size_B;
+  v64acc32 acc_C00;
+  v64acc32 acc_C01;
+  v64acc32 acc_C10;
+  v64acc32 acc_C11;
+  
+  v64acc32 acc_C02;
+  v64acc32 acc_C03;
+  v64acc32 acc_C12;
+  v64acc32 acc_C13;
 
-          aie::vector<int8, size_A> A0 = aie::load_v<size_A>(pA0);
-          pA0 += rowA * size_A;
-          aie::vector<int8, size_A> A1 = aie::load_v<size_A>(pA1);
-          pA1 += rowA * size_A;
-          aie::vector<int8, size_A> B0 = aie::load_v<size_A>(pB0);
-          pB0 += size_B;
-          aie::vector<int8, size_B> B1 = aie::load_v<size_A>(pB1);
-          pB1 += size_B;
+  for (unsigned z = 0; z < rowA; z += 2) {
+    v64acc32 *__restrict pC0 = (v64acc32 *)(pC + offsetC + (z)*size_C);
+    v64acc32 *__restrict pC1 = (v64acc32 *)(pC + offsetC + ((z + 1)) * size_C);
 
-          aie::accum<acc32, size_C>  acc_C00 = load_v64<int32, acc32>(pC0);
-          aie::accum<acc32, size_C>  acc_C01 = load_v64<int32, acc32>(pC0 + size_C * rowA);
-          aie::accum<acc32, size_C>  acc_C10 = load_v64<int32, acc32>(pC1);
-          aie::accum<acc32, size_C>  acc_C11 = load_v64<int32, acc32>(pC1 + size_C * rowA);
+    for (unsigned j = 0; j < colB; j += 4) {
+      const v64int8 *__restrict pA0 = (v64int8 *)(pA + offsetA + (z)*size_A);
+      const v64int8 *__restrict pA1 = (v64int8 *)(pA + offsetA + ((z + 1)) * size_A);
 
-          MMUL C00(acc_C00);
-          MMUL C01(acc_C01);
-          MMUL C10(acc_C10);
-          MMUL C11(acc_C11);
+      const v64int8 *__restrict pB0 = (v64int8 *)(pB + offsetB + (j)*colA*size_B);
+      const v64int8 *__restrict pB1 = (v64int8 *)(pB + offsetB + ((j + 1))*colA * size_B);
+      const v64int8 *__restrict pB2 = (v64int8 *)(pB + offsetB + ((j + 2))*colA * size_B);
+      const v64int8 *__restrict pB3 = (v64int8 *)(pB + offsetB + ((j + 3))*colA * size_B);
+      
+      acc_C00 = *pC0;
+      acc_C01 = *(pC0 + rowA);
+      acc_C02 = *(pC0 + 2 * rowA);
+      acc_C03 = *(pC0 + 3 * rowA);
 
-          C00.mac(A0, B0);
-          C01.mac(A0, B1);
-          C10.mac(A1, B0);
-          C11.mac(A1, B1);
+      acc_C10 = *pC1;
+      acc_C11 = *(pC1 + rowA);
+      acc_C12 = *(pC1 + 2 * rowA);
+      acc_C13 = *(pC1 + 3 * rowA);
 
-          for (unsigned i = 1; i < colA; ++i)
-            chess_prepare_for_pipelining chess_loop_range(7, ) {
-              A0 = aie::load_v<size_A>(pA0);
-              pA0 += rowA * size_A;
-              A1 = aie::load_v<size_A>(pA1);
-              pA1 += rowA * size_A;
-              B0 = aie::load_v<size_A>(pB0);
-              pB0 += size_B;
-              B1 = aie::load_v<size_A>(pB1);
-              pB1 += size_B;
+      A0 = *pA0;
+      pA0 += rowA;
+      A1 = *pA1;
+      pA1 += rowA;
 
-              C00.mac(A0, B0);
-              C01.mac(A0, B1);
-              C10.mac(A1, B0);
-              C11.mac(A1, B1);
-          }
+      B0 = *pB0++;
+      B1 = *pB1++;
+      B2 = *pB2++;
+      B3 = *pB3++;
 
-          v32int32 * __restrict pOut00 = (v32int32 *) pC0;
-          *pOut00++ = (v32int32)(C00.to_accum().template extract<32>(0));
-          *pOut00++ = (v32int32)(C00.to_accum().template extract<32>(1));
-          pC0 += size_C * rowA;
+      acc_C00 = mac_8x8_8x8(A0, B0, acc_C00);
+      acc_C01 = mac_8x8_8x8(A0, B1, acc_C01);
+      acc_C10 = mac_8x8_8x8(A1, B0, acc_C10);
+      acc_C11 = mac_8x8_8x8(A1, B1, acc_C11);
 
-          v32int32 * __restrict pOut01 = (v32int32 *) pC0;
-          *pOut01++ = (v32int32)(C01.to_accum().template extract<32>(0));
-          *pOut01++ = (v32int32)(C01.to_accum().template extract<32>(1));
-          pC0 += size_C * rowA;
+      acc_C02 = mac_8x8_8x8(A0, B2, acc_C02);
+      acc_C03 = mac_8x8_8x8(A0, B3, acc_C03);
+      acc_C12 = mac_8x8_8x8(A1, B2, acc_C12);
+      acc_C13 = mac_8x8_8x8(A1, B3, acc_C13);
 
-          v32int32 * __restrict pOut10 = (v32int32 *) pC1;
-          *pOut10++ = (v32int32)(C10.to_accum().template extract<32>(0));
-          *pOut10++ = (v32int32)(C10.to_accum().template extract<32>(1));
-          pC1 += size_C * rowA;
+      for (unsigned i = 1; i < colA; ++i) {
+        A0 = *pA0;
+        pA0 += rowA;
+        A1 = *pA1;
+        pA1 += rowA;
 
-          v32int32 * __restrict pOut11 = (v32int32 *) pC1;
-          *pOut11++ = (v32int32)(C11.to_accum().template extract<32>(0));
-          *pOut11++ = (v32int32)(C11.to_accum().template extract<32>(1));
-          pC1 += size_C * rowA;
-        }
+        B0 = *pB0++;
+        B1 = *pB1++;
+        B2 = *pB2++;
+        B3 = *pB3++;
+
+        acc_C00 = mac_8x8_8x8(A0, B0, acc_C00);
+        acc_C01 = mac_8x8_8x8(A0, B1, acc_C01);
+        acc_C10 = mac_8x8_8x8(A1, B0, acc_C10);
+        acc_C11 = mac_8x8_8x8(A1, B1, acc_C11);
+
+        acc_C02 = mac_8x8_8x8(A0, B2, acc_C02);
+        acc_C03 = mac_8x8_8x8(A0, B3, acc_C03);
+        acc_C12 = mac_8x8_8x8(A1, B2, acc_C12);
+        acc_C13 = mac_8x8_8x8(A1, B3, acc_C13);
+      }
+
+      // -----
+
+      v64acc32 * __restrict pOut00 = pC0;
+      *pOut00 = acc_C00;
+      pC0 += rowA;
+
+      v64acc32 * __restrict pOut01 = pC0;
+      *pOut01 = acc_C01;
+      pC0 += rowA;
+
+      v64acc32 * __restrict pOut02 = pC0;
+      *pOut02 = acc_C02;
+      pC0 += rowA;
+
+      v64acc32 * __restrict pOut03 = pC0;
+      *pOut03 = acc_C03;
+      pC0 += rowA;
+
+      // -----
+
+      v64acc32 * __restrict pOut10 = pC1;
+      *pOut10 = acc_C10;
+      pC1 += rowA;
+
+      v64acc32 * __restrict pOut11 = pC1;
+      *pOut11 = acc_C11;
+      pC1 += rowA;
+
+      v64acc32 * __restrict pOut12 = pC1;
+      *pOut12 = acc_C12;
+      pC1 += rowA;
+
+      v64acc32 * __restrict pOut13 = pC1;
+      *pOut13 = acc_C13;
+      pC1 += rowA;
     }
+  }
 }
+
+
+// template<unsigned rowA, unsigned colA, unsigned colB, unsigned L0_M, unsigned L0_K, unsigned L0_N>
+// void matmul_vectorized_i8_i32(const int8 * __restrict pA, unsigned offsetA, const int8 * __restrict pB, unsigned offsetB, int32 * __restrict pC, unsigned offsetC)
+// {
+//   const unsigned size_A = L0_M * L0_K;
+//   const unsigned size_B = L0_K * L0_N;
+//   const unsigned size_C = L0_M * L0_N;
+//   using MMUL = aie::mmul<L0_M, L0_K, L0_N, int8, int8, acc32>;
+
+//   for (unsigned z = 0; z < rowA; z += 2)
+//     chess_loop_range(4, ) {
+//       int32 *__restrict pC0 = pC + offsetC + (z)*size_C;
+//       int32 *__restrict pC1 = pC + offsetC + ((z + 1)) * size_C;
+
+//       for (unsigned j = 0; j < colB; j += 2)
+//         chess_prepare_for_pipelining chess_loop_range(4, ) {
+//           const int8 *__restrict pA0 = pA + offsetA + (z)*size_A;
+//           const int8 *__restrict pA1 = pA + offsetA + ((z + 1)) * size_A;
+//           const int8 *__restrict pB0 = pB + offsetB + (j)*colA*size_B;
+//           const int8 *__restrict pB1 = pB + offsetB + ((j + 1))*colA * size_B;
+
+//           aie::vector<int8, size_A> A0 = aie::load_v<size_A>(pA0);
+//           pA0 += rowA * size_A;
+//           aie::vector<int8, size_A> A1 = aie::load_v<size_A>(pA1);
+//           pA1 += rowA * size_A;
+//           aie::vector<int8, size_A> B0 = aie::load_v<size_A>(pB0);
+//           pB0 += size_B;
+//           aie::vector<int8, size_B> B1 = aie::load_v<size_A>(pB1);
+//           pB1 += size_B;
+
+//           aie::accum<acc32, size_C>  acc_C00 = load_v64<int32, acc32>(pC0);
+//           aie::accum<acc32, size_C>  acc_C01 = load_v64<int32, acc32>(pC0 + size_C * rowA);
+//           aie::accum<acc32, size_C>  acc_C10 = load_v64<int32, acc32>(pC1);
+//           aie::accum<acc32, size_C>  acc_C11 = load_v64<int32, acc32>(pC1 + size_C * rowA);
+
+//           MMUL C00(acc_C00);
+//           MMUL C01(acc_C01);
+//           MMUL C10(acc_C10);
+//           MMUL C11(acc_C11);
+
+//           C00.mac(A0, B0);
+//           C01.mac(A0, B1);
+//           C10.mac(A1, B0);
+//           C11.mac(A1, B1);
+
+//           for (unsigned i = 1; i < colA; ++i)
+//             chess_prepare_for_pipelining chess_loop_range(7, ) {
+//               A0 = aie::load_v<size_A>(pA0);
+//               pA0 += rowA * size_A;
+//               A1 = aie::load_v<size_A>(pA1);
+//               pA1 += rowA * size_A;
+//               B0 = aie::load_v<size_A>(pB0);
+//               pB0 += size_B;
+//               B1 = aie::load_v<size_A>(pB1);
+//               pB1 += size_B;
+
+//               C00.mac(A0, B0);
+//               C01.mac(A0, B1);
+//               C10.mac(A1, B0);
+//               C11.mac(A1, B1);
+//           }
+
+//           v32int32 * __restrict pOut00 = (v32int32 *) pC0;
+//           *pOut00++ = (v32int32)(C00.to_accum().template extract<32>(0));
+//           *pOut00++ = (v32int32)(C00.to_accum().template extract<32>(1));
+//           pC0 += size_C * rowA;
+
+//           v32int32 * __restrict pOut01 = (v32int32 *) pC0;
+//           *pOut01++ = (v32int32)(C01.to_accum().template extract<32>(0));
+//           *pOut01++ = (v32int32)(C01.to_accum().template extract<32>(1));
+//           pC0 += size_C * rowA;
+
+//           v32int32 * __restrict pOut10 = (v32int32 *) pC1;
+//           *pOut10++ = (v32int32)(C10.to_accum().template extract<32>(0));
+//           *pOut10++ = (v32int32)(C10.to_accum().template extract<32>(1));
+//           pC1 += size_C * rowA;
+
+//           v32int32 * __restrict pOut11 = (v32int32 *) pC1;
+//           *pOut11++ = (v32int32)(C11.to_accum().template extract<32>(0));
+//           *pOut11++ = (v32int32)(C11.to_accum().template extract<32>(1));
+//           pC1 += size_C * rowA;
+//         }
+//     }
+// }
 
 template <unsigned m, unsigned k, unsigned n>
 void matmul_vectorized_8x8x8_i8_i8_i32(const int8 *__restrict pA,
@@ -277,6 +414,9 @@ extern "C" {
   X(float, f32, M, N, N/2)         \
   X(int32, i32, M, N, N/2)
 
+#define trunci_combos_i32_i8(X, M, N)  \
+  X(v32int32, i32, v32int8, i8, M, N, 32)
+
 #define matmul_vectorized_c_func(lhs_ctype_in, lhs_mlir_type_in,                                                 \
                                  rhs_ctype_in, rhs_mlir_type_in,                                                 \
                                  acc_ctype_out, acc_mlir_type_out, M, N, K, r, s, t)                             \
@@ -290,6 +430,12 @@ extern "C" {
 #define zero_vectorized_c_func(ctype_out, mlir_type_out, M, N, r)             \
   void zero_##mlir_type_out##_##M##x##N(ctype_out *c_out, unsigned offsetC) { \
     zero_vectorized<ctype_out, M, N, r>(c_out, offsetC);                      \
+  }
+
+#define trunci_c_func(ctype_in, mlir_type_in, ctype_out, mlir_type_out, M, N, r)                  \
+  void trunci_##mlir_type_in##_##mlir_type_out##_##M##x##N(                                       \
+      ctype_in *in, int64_t offsetIn, int64_t shift, ctype_out *out, int64_t offsetOut) {         \
+    trunci_vectorized<M, N, r>(in, offsetIn, shift, out, offsetOut);                              \
   }
 
 matmul_combos(matmul_vectorized_c_func, 16, 8, 32)
@@ -306,6 +452,12 @@ matmul_combos_i8(matmul_vectorized_c_func, 32, 32, 8)
 matmul_combos_i8(matmul_vectorized_c_func, 32, 32, 32)
 matmul_combos_i8(matmul_vectorized_c_func, 32, 32, 64)
 matmul_combos_i8(matmul_vectorized_c_func, 64, 64, 64)
+matmul_combos_i8(matmul_vectorized_c_func, 64, 64, 128)
+
+trunci_combos_i32_i8(trunci_c_func, 32, 32)
+trunci_combos_i32_i8(trunci_c_func, 64, 64)
+trunci_combos_i32_i8(trunci_c_func, 32, 64)
+trunci_combos_i32_i8(trunci_c_func, 64, 32)
 
 zero_fill_combos(zero_vectorized_c_func, 16, 8)
 zero_fill_combos(zero_vectorized_c_func, 16, 16)
