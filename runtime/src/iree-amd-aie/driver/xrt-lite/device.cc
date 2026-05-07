@@ -10,6 +10,7 @@
 #include "iree-amd-aie/driver/xrt-lite/api.h"
 #include "iree-amd-aie/driver/xrt-lite/device.h"
 #include "iree-amd-aie/driver/xrt-lite/direct_command_buffer.h"
+#include "iree-amd-aie/driver/xrt-lite/nop_event.h"
 #include "iree-amd-aie/driver/xrt-lite/nop_executable_cache.h"
 #include "iree-amd-aie/driver/xrt-lite/nop_semaphore.h"
 #include "iree-amd-aie/driver/xrt-lite/util.h"
@@ -262,11 +263,10 @@ static iree_status_t iree_hal_xrt_lite_device_create_channel(
 static iree_status_t iree_hal_xrt_lite_device_create_event(
     iree_hal_device_t* base_device, iree_hal_queue_affinity_t queue_affinity,
     iree_hal_event_flags_t flags, iree_hal_event_t** out_event) {
-  (void)base_device;
-  (void)queue_affinity;
-  (void)flags;
-  (void)out_event;
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED, "events not implemented");
+  iree_hal_xrt_lite_device* device = IREE_HAL_XRT_LITE_CHECKED_VTABLE_CAST(
+      base_device, iree_hal_xrt_lite_device_vtable, iree_hal_xrt_lite_device);
+  return iree_hal_xrt_lite_event_create(queue_affinity, flags,
+                                        device->host_allocator, out_event);
 }
 
 static iree_status_t iree_hal_xrt_lite_device_import_file(
@@ -567,6 +567,10 @@ const iree_hal_device_vtable_t iree_hal_xrt_lite_device_vtable = {
     .create_semaphore = iree_hal_xrt_lite_device_create_semaphore,
     .query_semaphore_compatibility =
         iree_hal_xrt_lite_device_query_semaphore_compatibility,
+    // Pool-backed queue alloca is not supported. Returning UNIMPLEMENTED here
+    // makes pool-using tests fail gracefully instead of NULL-deref crashing
+    // through the vtable.
+    .query_queue_pool_backend = unimplemented,
     .queue_alloca = iree_hal_xrt_lite_device_queue_alloca,
     .queue_dealloca = iree_hal_xrt_lite_device_queue_dealloca,
     .queue_fill = iree_hal_xrt_lite_device_queue_fill,

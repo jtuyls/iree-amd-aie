@@ -31,6 +31,8 @@ iree_cc_library(
     driver.cc
     executable.cc
     executable.h
+    nop_event.cc
+    nop_event.h
     nop_executable_cache.cc
     nop_executable_cache.h
     nop_semaphore.cc
