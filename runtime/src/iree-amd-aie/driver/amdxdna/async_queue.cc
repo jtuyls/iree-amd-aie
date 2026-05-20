@@ -471,7 +471,12 @@ void iree_hal_amdxdna_async_queue_destroy(
 
   iree_atomic_store(&queue->shutdown_requested, 1, iree_memory_order_release);
   iree_notification_post(&queue->worker_notification, IREE_ALL_WAITERS);
-  iree_thread_join(queue->worker_thread);
+  // iree_thread_release() joins the worker on the final reference (see
+  // iree_thread_delete). Calling iree_thread_join() here as well double-joins
+  // the pthread-backed handle, which is undefined behavior and aborts under
+  // ASan ("Joining already joined thread"). The shutdown request + worker
+  // notification above guarantee the worker will exit, so the release-side
+  // join is sufficient to wait for completion.
   iree_thread_release(queue->worker_thread);
 
   iree_slim_mutex_deinitialize(&queue->inflight_mutex);
