@@ -241,7 +241,8 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
         options.enableCoalescingLoops, options.enableCollapsingUnitDims,
         options.enableFunctionOutlining, options.callReplication,
         options.insertLoopAroundCoreBlock, options.enableCtrlPkt,
-        options.coreStackSize, options.reprogramDmas);
+        options.coreStackSize, options.reprogramDmas,
+        options.lofSubsumeLoops);
   }
 
   void buildLinkingPassPipeline(OpPassManager &passManager) override {

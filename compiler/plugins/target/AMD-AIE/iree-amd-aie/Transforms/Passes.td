@@ -612,6 +612,10 @@ def AMDAIELoweringStrategy :
       [{::llvm::cl::values(
         clEnumValN(mlir::iree_compiler::AMDAIE::LowerToAIEPassPipeline::ObjectFifo, "objectFifo",
                    "Use the IREE lowering to objectFifos"),
+        clEnumValN(mlir::iree_compiler::AMDAIE::LowerToAIEPassPipeline::PlacedObjectFifo, "placed-objectfifo",
+                   "Lower hand-authored placed object-fifo IR through only the mechanical tail"),
+        clEnumValN(mlir::iree_compiler::AMDAIE::LowerToAIEPassPipeline::LogicalObjectFifo, "lof",
+                   "Lower hand-authored logical object-fifo IR through the experimental LOF pipeline (placed tail; reorderable, e.g. loop subsumption before unroll)"),
         clEnumValN(mlir::iree_compiler::AMDAIE::LowerToAIEPassPipeline::AIR, "air",
                    "Use the IREE lowering through AIR")
       )}]>,

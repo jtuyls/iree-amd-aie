@@ -161,18 +161,20 @@ struct CombineStridedOps
 
   template <typename T>
   static FailureOr<T> findNextDmaOpWithSameConnection(T dmaOp, Block *block) {
-    T nextDmaOp;
+    // Sequential walk so we can observe `amdaie.npu.barrier` boundaries: a
+    // barrier is the hand-authored signal "stop fold/chain/combine across me"
+    // (already honored by FoldDmaWaits and InsertDmaBdChain). The original
+    // walk visited only ops of type T (skipping barriers entirely), which
+    // let the combiner merge DMAs across phase boundaries — incorrectly
+    // collapsing per-tile execution-order semantics (workspace F21).
     Block::iterator begin = std::next(dmaOp->getIterator());
-    block->walk(begin, block->end(), [&](T other) {
-      if (dmaOp.getConnection() != other.getConnection())
-        return WalkResult::advance();
-      Block *otherBlock = other->getBlock();
-      if (!otherBlock) return WalkResult::advance();
-      if (otherBlock != block) return WalkResult::interrupt();
-      nextDmaOp = other;
-      return WalkResult::interrupt();
-    });
-    if (nextDmaOp) return nextDmaOp;
+    for (auto &otherOp : llvm::make_range(begin, block->end())) {
+      if (isa<AMDAIE::NpuBarrierOp>(otherOp)) return failure();
+      auto candidate = dyn_cast<T>(otherOp);
+      if (!candidate) continue;
+      if (dmaOp.getConnection() != candidate.getConnection()) continue;
+      return candidate;
+    }
     return failure();
   }
 };
