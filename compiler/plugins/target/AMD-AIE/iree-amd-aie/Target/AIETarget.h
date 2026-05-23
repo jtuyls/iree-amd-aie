@@ -67,6 +67,15 @@ struct AMDAIEOptions {
   // Enable/Disable reprogramming of DMAs.
   bool reprogramDmas{false};
 
+  // For the experimental LOF pipeline only (lower-to-aie-pipeline=lof):
+  // prepend the loop-subsumption stage (ControlCodeForallToFor + DmaComposition
+  // + AssignNpuDmaBdIds) before the shared placed tail.
+  // Default: ON. Subsumption is perf/size, not correctness. The combiner inside
+  // DmaComposition now respects `npu.barrier` boundaries (F22), so it no
+  // longer regresses multi-tile barrier-separated kernels. Turn OFF only to
+  // debug a subsumed kernel by reading the unrolled form.
+  bool lofSubsumeLoops{true};
+
   // The number of rows for the compiler to target. '0' denotes 'all'.
  private:
   unsigned AMDAIENumRows{0};
@@ -173,7 +182,15 @@ struct AMDAIEOptions {
             clEnumValN(LowerToAIEPassPipeline::AIR, "air",
                        "Use the IREE lowering through AIR"),
             clEnumValN(LowerToAIEPassPipeline::ObjectFifo, "objectFifo",
-                       "Use the IREE lowering to objectFifos")));
+                       "Use the IREE lowering to objectFifos"),
+            clEnumValN(
+                LowerToAIEPassPipeline::PlacedObjectFifo, "placed-objectfifo",
+                "Lower hand-authored placed object-fifo IR through only the "
+                "mechanical tail"),
+            clEnumValN(
+                LowerToAIEPassPipeline::LogicalObjectFifo, "lof",
+                "Lower hand-authored logical object-fifo IR through the "
+                "experimental LOF pipeline (placed tail; reorderable)")));
 
     /// Command line option for selecting the lowering pipeline to use tiling
     /// computations and packing data.
@@ -266,6 +283,19 @@ struct AMDAIEOptions {
             "Flag used to enable/disable reprogramming of DMAs. "
             "By default it'll be disabled, so we would have circular "
             "DMAs for L2/L1 cache."));
+
+    binder.opt<bool>(
+        "iree-amdaie-lof-subsume-loops", lofSubsumeLoops,
+        llvm::cl::cat(category),
+        llvm::cl::desc(
+            "For --iree-amdaie-lower-to-aie-pipeline=lof only: prepend the "
+            "loop-subsumption stage (ControlCodeForallToFor + DmaComposition "
+            "+ AssignNpuDmaBdIds) before the shared placed tail, so a "
+            "hand-authored scf.for over strided DMAs is folded into the BD "
+            "access pattern (one iterated BD) instead of unrolled. Default "
+            "ON; barrier-aware combiner (F22) keeps multi-tile unrolled "
+            "kernels correct. Turn OFF to debug a subsumed kernel by reading "
+            "the unrolled form."));
 
     /// Command line option for selecting the target AIE device.
     binder.opt<AMDAIEDevice>(

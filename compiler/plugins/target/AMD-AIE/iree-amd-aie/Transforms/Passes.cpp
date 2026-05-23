@@ -34,6 +34,7 @@
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/Passes.h"
 
 #define DEBUG_TYPE "iree-amdaie-lowering-pass-pipeline"
@@ -670,8 +671,33 @@ void buildAMDAIETransformPassPipeline(
     PacketFlowStrategy packetFlowStrategy, bool enableCoalescingLoops,
     bool enableCollapsingUnitDims, OutliningStrategy enableFunctionOutlining,
     int callReplication, bool insertLoopAroundCoreBlock, bool enableCtrlPkt,
-    uint32_t coreStackSize, bool reprogramDmas) {
+    uint32_t coreStackSize, bool reprogramDmas, bool lofSubsumeLoops) {
   OpPassManager &modulePassManager = variantPassManager.nest<ModuleOp>();
+
+  // For hand-authored "placed object-fifo" IR, skip the entire front-end
+  // (tiling/packing/vectorization/distribution/splitting/depth/channel
+  // assignment) and lower through only the mechanical tail.
+  if (useLowerToAIEPipeline == LowerToAIEPassPipeline::PlacedObjectFifo ||
+      useLowerToAIEPipeline == LowerToAIEPassPipeline::LogicalObjectFifo) {
+    if (useLowerToAIEPipeline == LowerToAIEPassPipeline::LogicalObjectFifo) {
+      addAMDAIELogicalObjectFifoLoweringPasses(
+          modulePassManager, insertLoopAroundCoreBlock, reprogramDmas,
+          useTilePipeline, lofSubsumeLoops);
+    } else {
+      addAMDAIEPlacedObjectFifoToAIEPasses(modulePassManager,
+                                           insertLoopAroundCoreBlock,
+                                           reprogramDmas, useTilePipeline);
+    }
+    modulePassManager.addPass(createReconcileTranslationInfoPass());
+    variantPassManager.addPass(createAMDAIELowerWorkgroupCountPass());
+    LLVM_DEBUG({
+      llvm::dbgs() << "Using AMDAIE pass pipeline:\n";
+      variantPassManager.printAsTextualPipeline(llvm::dbgs());
+      llvm::dbgs() << "\n";
+    });
+    return;
+  }
+
   {
     FunctionLikeNest funcPassManager(modulePassManager);
     funcPassManager.addPass(createTypePropagationPass)
@@ -861,6 +887,19 @@ void addAMDAIEObjectFifoLoweringPasses(
   passManager.addPass(createCanonicalizerPass());
 
   passManager.addPass(createAMDAIEAssignNpuDmaBdIdsPass());
+
+  // The remainder of the pipeline operates on "placed object-fifo" IR (logical
+  // objectFifos already assigned to tiles/channels/connections/BD-ids). This is
+  // factored into its own entry point so that hand-authored placed object-fifo
+  // IR can be lowered through only this mechanical tail.
+  addAMDAIEPlacedObjectFifoToAIEPasses(passManager, insertLoopAroundCoreBlock,
+                                       reprogramDmas, useTilePipeline);
+}
+
+void addAMDAIEPlacedObjectFifoToAIEPasses(OpPassManager &passManager,
+                                          bool insertLoopAroundCoreBlock,
+                                          bool reprogramDmas,
+                                          TilePassPipeline useTilePipeline) {
   passManager.addPass(createCSEPass());
   passManager.addPass(createCanonicalizerPass());
 
@@ -911,6 +950,33 @@ void addAMDAIEObjectFifoLoweringPasses(
 
   // Now lower using the AIE passes from MLIR-AIE.
   addMLIRAIELoweringPasses(passManager, useTilePipeline);
+}
+
+void addAMDAIELogicalObjectFifoLoweringPasses(
+    OpPassManager &passManager, bool insertLoopAroundCoreBlock,
+    bool reprogramDmas, TilePassPipeline useTilePipeline, bool subsumeLoops) {
+  // Experimental "logical object-fifo" (LOF) pipeline. Dedicated entry point
+  // for hand-authored placed object-fifo IR so we can reorder the tail without
+  // disturbing the validated `placed-objectfifo` path.
+  //
+  // When `subsumeLoops` is true: prepend the front-end's loop-subsumption stage
+  // (ControlCodeForallToFor + DmaComposition) so an `scf.for` over strided DMAs
+  // in the hand-authored controlcode is folded into the BD access pattern (one
+  // iterated BD) instead of being unrolled by `ControlCodeLoopUnroll` (the
+  // first pass of the shared tail). Subsumption changes the DMA count, so the
+  // hand-written `amdaie.bd_id` ops go stale — re-run `AssignNpuDmaBdIds` after.
+  if (subsumeLoops) {
+    passManager.addPass(createAMDAIEControlCodeForallToForPass());
+    passManager.addPass(createCSEPass());
+    passManager.addPass(createCanonicalizerPass());
+    passManager.addPass(createAMDAIEDmaCompositionPass());
+    passManager.addPass(createCSEPass());
+    passManager.addPass(createCanonicalizerPass());
+    passManager.addPass(createAMDAIEDmaCSEPass());
+    passManager.addPass(createAMDAIEAssignNpuDmaBdIdsPass());
+  }
+  addAMDAIEPlacedObjectFifoToAIEPasses(passManager, insertLoopAroundCoreBlock,
+                                       reprogramDmas, useTilePipeline);
 }
 
 void addMLIRAIELoweringPasses(OpPassManager &pm,
@@ -1169,6 +1235,51 @@ namespace {
 void registerAMDAIEPasses() {
   // Generated.
   registerPasses();
+
+  // Named pipeline to lower hand-authored "placed object-fifo" IR (logical
+  // objectFifos already assigned to tiles/channels/connections/BD-ids) through
+  // only the mechanical tail of the object-fifo lowering, producing `aie.device`
+  // IR and beyond.
+  PassPipelineRegistration<>(
+      "iree-amdaie-lower-placed-objectfifo",
+      "Lower hand-authored placed object-fifo IR through only the mechanical "
+      "tail of the object-fifo lowering pipeline",
+      [](OpPassManager &pm) {
+        addAMDAIEPlacedObjectFifoToAIEPasses(
+            pm, /*insertLoopAroundCoreBlock=*/false, /*reprogramDmas=*/false,
+            TilePassPipeline::PackPeel4LevelTilingPipeline);
+      });
+
+  // Experimental "logical object-fifo" (LOF) pipeline: a dedicated, reorderable
+  // entry point for hand-authored placed object-fifo IR. Use for parameterized-
+  // kernel experimentation so the validated `iree-amdaie-lower-placed-objectfifo`
+  // path is never disturbed. Options:
+  //   subsume-loops={true|false} (default true): prepend the loop-subsumption
+  //     stage so a hand-authored scf.for over strided DMAs is folded into the
+  //     BD access pattern (one iterated BD) instead of unrolled. Required for
+  //     in-kernel DDR K-streaming and rolled per-tile phases (F16, F11). Safe
+  //     to leave on for unrolled kernels too since the combiner inside
+  //     DmaComposition now respects `npu.barrier` boundaries (F22). Turn OFF
+  //     to debug a subsumed kernel by reading the unrolled form.
+  // Usage: --iree-amdaie-lower-lof{subsume-loops=false}
+  struct LofOptions : public PassPipelineOptions<LofOptions> {
+    Option<bool> subsumeLoops{
+        *this, "subsume-loops",
+        ::llvm::cl::desc("Prepend the DMA loop-subsumption stage (default ON, "
+                         "barrier-aware combiner F22 makes it safe across "
+                         "multi-tile barrier-separated kernels)."),
+        ::llvm::cl::init(true)};
+  };
+  PassPipelineRegistration<LofOptions>(
+      "iree-amdaie-lower-lof",
+      "Lower hand-authored logical object-fifo IR through the experimental LOF "
+      "pipeline (placed tail; reorderable; supports subsume-loops={true|false})",
+      [](OpPassManager &pm, const LofOptions &opts) {
+        addAMDAIELogicalObjectFifoLoweringPasses(
+            pm, /*insertLoopAroundCoreBlock=*/false, /*reprogramDmas=*/false,
+            TilePassPipeline::PackPeel4LevelTilingPipeline,
+            /*subsumeLoops=*/opts.subsumeLoops);
+      });
 }
 
 }  // namespace mlir::iree_compiler::AMDAIE

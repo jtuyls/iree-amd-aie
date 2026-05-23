@@ -474,11 +474,21 @@ struct SubsumeLoopIntoDMA
     if (!isa<LoopLikeOpInterface>(parentOp))
       return rewriter.notifyMatchFailure(op, "Parent is not a loop-like op");
 
+    // Treat `amdaie.npu.circular_dma_cpy_nd` as a non-competing user: it is the
+    // persistent L2 destination access-pattern setup for the connection, runs
+    // once at the head of controlcode, and doesn't issue data movement of its
+    // own. Skipping it here lets a hand-authored `scf.for` over `dma_cpy_nd` on
+    // the same connection (the LOF pipeline's K-streaming pattern) become
+    // eligible for subsumption — the resulting iterated BD still respects the
+    // circular's L2 destination layout. Without this, the check below over-
+    // -conservatively rejects subsumption whenever a connection has its
+    // persistent L2 setup op in the same scope.
     auto hasOtherUsersInSameScope = [&](Value result) -> bool {
       for (Operation *userOp : result.getUsers()) {
-        if (userOp != op.getOperation() && parentOp->isProperAncestor(userOp)) {
-          return true;
-        }
+        if (userOp == op.getOperation()) continue;
+        if (!parentOp->isProperAncestor(userOp)) continue;
+        if (isa<AMDAIE::NpuCircularDmaCpyNdOp>(userOp)) continue;
+        return true;
       }
       return false;
     };

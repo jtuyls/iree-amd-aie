@@ -22,6 +22,33 @@ void addAMDAIEObjectFifoLoweringPasses(
     bool insertLoopAroundCoreBlock, uint32_t numCols, bool emitCtrlPkt,
     uint32_t coreStackSize, bool reprogramDmas);
 
+/// Add the mechanical tail of the object-fifo lowering pipeline, which operates
+/// on "placed object-fifo" IR (logical objectFifos already assigned to
+/// tiles/channels/connections/BD-ids, i.e. the IR right after
+/// `createAMDAIEAssignNpuDmaBdIdsPass`). This shared definition is used both as
+/// the end of `addAMDAIEObjectFifoLoweringPasses` and as the entry point for
+/// lowering hand-authored placed object-fifo IR.
+void addAMDAIEPlacedObjectFifoToAIEPasses(OpPassManager &passManager,
+                                          bool insertLoopAroundCoreBlock,
+                                          bool reprogramDmas,
+                                          TilePassPipeline useTilePipeline);
+
+/// Add the experimental "logical object-fifo" (LOF) lowering pipeline: a
+/// dedicated entry point for hand-authored placed object-fifo IR that we own
+/// and can reorder freely. When `subsumeLoops` is true, prepends the
+/// loop-subsumption stage (`ControlCodeForallToFor` + `DmaComposition` +
+/// re-`AssignNpuDmaBdIds`) before the shared placed tail, so any hand-authored
+/// `scf.for` over strided DMAs gets folded into the BD access pattern (one
+/// iterated BD) instead of being unrolled by `ControlCodeLoopUnroll` which is
+/// the first pass of the shared tail. When false, this is byte-identical to
+/// `addAMDAIEPlacedObjectFifoToAIEPasses`. Kept separate from that function so
+/// the validated placed path is never disturbed by experimentation.
+void addAMDAIELogicalObjectFifoLoweringPasses(OpPassManager &passManager,
+                                              bool insertLoopAroundCoreBlock,
+                                              bool reprogramDmas,
+                                              TilePassPipeline useTilePipeline,
+                                              bool subsumeLoops = true);
+
 /// Add passes to lower from MLIR-AIR through AIE. This is
 /// currently the default passes used for lowering after IREEs tiling.
 void addMLIRAIRLoweringPasses(OpPassManager &passManager, AMDAIEDevice device,
@@ -45,7 +72,8 @@ void buildAMDAIETransformPassPipeline(
     PacketFlowStrategy packetFlowStrategy, bool enableCoalescingLoops,
     bool enableCollapsingUnitDims, OutliningStrategy enableFunctionOutlining,
     int outliningLoopInCallCount, bool insertLoopAroundCoreBlock,
-    bool emitCtrlPkt, uint32_t coreStackSize, bool reprogramDmas);
+    bool emitCtrlPkt, uint32_t coreStackSize, bool reprogramDmas,
+    bool lofSubsumeLoops = true);
 
 /// Populates passes needed to lower the IR via a Pack-Peel based approach.
 void addPackPeelBasedPassPipeline(OpPassManager &passManager,
