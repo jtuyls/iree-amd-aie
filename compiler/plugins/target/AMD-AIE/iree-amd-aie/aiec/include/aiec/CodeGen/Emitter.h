@@ -21,11 +21,10 @@ namespace aiec {
 // Returns the MLIR text. Reports errors via `diag` (and returns empty
 // string if there were any). `sourceDir` is the directory of the .aiec
 // source, used to resolve relative `extern fn ... impl "path"` templates.
-// When `wrap` is true, the output is a self-contained hal.executable-sources
-// module (device global + executable + export + host stub) that can be fed
-// straight to `iree-compile --compile-from=executable-sources` with no
-// external --ref wrapper. When false, only the placed kernel module is
-// emitted (for the splice-based flow).
+// Emits the placed kernel module (for the splice-based flow: wrap via
+// aie_compile.py --ref). `wrap` (self-contained hal.executable-sources
+// wrapper minting) is NOT implemented here yet — passing wrap=true reports
+// an error rather than silently emitting an unwrapped module.
 std::string emitModule(const KModuleDecl *mod,
                        const std::map<std::string, int64_t> &params,
                        DiagnosticEngine &diag,

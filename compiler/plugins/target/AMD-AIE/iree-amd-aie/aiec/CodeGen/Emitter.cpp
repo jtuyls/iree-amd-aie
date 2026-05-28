@@ -176,6 +176,17 @@ public:
     if (!k) return {};
     k_ = k;
 
+    // Enforce the kernel's `where` constraints against the bound template
+    // params before emitting — a violated constraint must be a hard error,
+    // not silently-wrong IR (e.g. K_mm1 not a multiple of 64).
+    for (KExpr *c : k->getWhereConstraints()) {
+      if (!eval_.evalBool(c)) {
+        diag_.report(c->getLocation(), diag::err_where_violated)
+            << "constraint is false for these parameters";
+        return {};
+      }
+    }
+
     OpBuilder &b = builder_;
     Location loc = b.getUnknownLoc();
     auto module = ModuleOp::create(loc);
@@ -349,11 +360,17 @@ private:
     for (auto *d : mod->getDecls()) {
       auto *fn = dyn_cast<KExternFnDecl>(d);
       if (!fn || fn->getImplPath().empty()) continue;
+      externFns_.insert(fn->getName());
       std::string path =
           sourceDir_.empty() ? fn->getImplPath()
                              : sourceDir_ + "/" + fn->getImplPath();
       std::ifstream in(path);
-      if (!in) continue;
+      if (!in) {
+        diag_.report(fn->getLocation(), diag::err_expected)
+            << ("readable impl file for extern fn '" + fn->getName() +
+                "' (cannot open '" + path + "')");
+        continue;
+      }
       std::stringstream ss;
       ss << in.rdbuf();
       std::string tmpl = ss.str();
@@ -378,12 +395,16 @@ private:
       }
       // Parse `func.func ...` (wrap in a module to parse, then move the fn).
       auto parsed = parseSourceString<ModuleOp>(text, &ctx_);
-      if (!parsed) continue;
+      if (!parsed) {
+        diag_.report(fn->getLocation(), diag::err_expected)
+            << ("parsable MLIR in impl template for extern fn '" +
+                fn->getName() + "' ('" + path + "')");
+        continue;
+      }
       OpBuilder &b = builder_;
       b.setInsertionPointToEnd(module_.getBody());
       for (auto &op : llvm::make_early_inc_range(parsed->getBody()->getOperations()))
         op.moveBefore(module_.getBody(), module_.getBody()->end());
-      matmulName_ = fn->getName();
     }
   }
 
@@ -811,6 +832,11 @@ private:
                 walk(red->getBody());
               }
             } else if (auto *call = dyn_cast<KCallStmt>(s)) {
+              if (!externFns_.count(call->getCallee())) {
+                diag_.report(call->getLocation(), diag::err_undefined_identifier)
+                    << call->getCallee();
+                continue;
+              }
               SmallVector<Value> args;
               bool ok = true;
               for (auto &a : call->getArgs()) {
@@ -820,7 +846,8 @@ private:
               }
               if (!ok) continue;
               func::CallOp::create(b, loc, TypeRange{},
-                                   SymbolRefAttr::get(&ctx_, matmulName_), args);
+                                   SymbolRefAttr::get(&ctx_, call->getCallee()),
+                                   args);
             } else if (auto *am = dyn_cast<KAssignMulStmt>(s)) {
               auto it = handles.find(am->getHandle());
               if (it == handles.end()) continue;
@@ -1246,7 +1273,7 @@ private:
   std::vector<Value> l1Allocs_, l2Allocs_;
   std::string sourceDir_;
   ModuleOp module_;
-  std::string matmulName_ = "matmul";
+  std::set<std::string> externFns_;  // declared extern fn names (call targets)
 };
 
 } // namespace
@@ -1255,7 +1282,16 @@ std::string emitModule(const KModuleDecl *mod,
                        const std::map<std::string, int64_t> &params,
                        DiagnosticEngine &diag, const std::string &sourceDir,
                        bool wrap) {
-  (void)wrap;
+  if (wrap) {
+    // Self-contained hal.executable-sources wrapper minting is not implemented
+    // in the in-tree OpBuilder emitter. Fail loudly rather than silently emit
+    // a bare placed module that the caller will misuse. Use the splice flow
+    // (aie_compile.py --ref) for the wrapped output.
+    diag.report(SourceLocation{}, diag::err_expected)
+        << "--emit-wrapper is not implemented in the in-tree emitter; emit the "
+           "placed module (no --emit-wrapper) and wrap via aie_compile.py --ref";
+    return {};
+  }
   OpBuilderEmitter e(params, diag, sourceDir);
   return e.run(mod);
 }

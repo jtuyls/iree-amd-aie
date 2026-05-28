@@ -46,18 +46,23 @@ bool slurpFile(const std::string &path, std::string &contents) {
 } // namespace
 
 int CompilerInstance::runParseOnly() {
-  // Load the input source so future parser has something to chew on.
-  // Today: confirms the file exists, prints a friendly message.
   std::string contents;
   if (!slurpFile(invocation_.inputPath, contents)) {
     diagOut_ << "aiec-compile: cannot read input '" << invocation_.inputPath
              << "'\n";
     return 1;
   }
-  FileID f = sm_.addBuffer(invocation_.inputPath, contents);
-  (void)f; // suppress unused warning
-  diagOut_ << "aiec-compile: parse-only OK ("
-           << contents.size() << " bytes; parser to be implemented)\n";
+  FileID file = sm_.addBuffer(invocation_.inputPath, contents);
+  Lexer lex(file, sm_, diag_);
+  KASTContext ctx;
+  Parser parser(lex, ctx, diag_);
+  KModuleDecl *mod = parser.parseFile();
+  if (!mod || diag_.hasErrors()) {
+    diagOut_ << "aiec-compile: parse failed\n";
+    return 1;
+  }
+  diagOut_ << "aiec-compile: parse OK (" << mod->getDecls().size()
+           << " top-level decls)\n";
   return 0;
 }
 
