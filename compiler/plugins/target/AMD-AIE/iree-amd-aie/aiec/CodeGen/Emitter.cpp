@@ -872,19 +872,8 @@ private:
               if (it == handles.end()) continue;
               AMDAIE::LogicalObjectFifoRelease::create(b, loc, it->second.conn,
                                                        it->second.port);
-            }
-          }
-        };
-
-    // Emit the core-body top level: `forall` becomes an scf.forall; a `for`
-    // (output-pass / tile loop) is unrolled, re-emitting its body per iter
-    // (the data per pass is sequenced by the controlcode + objectfifo cycling,
-    // so the unrolled foralls are structurally identical — each consumes one
-    // pass). barrier is a phase delimiter (no op here).
-    std::function<void(const std::vector<KStmt *> &)> emitTop =
-        [&](const std::vector<KStmt *> &stmts) {
-          for (auto *st : stmts) {
-            if (auto *f = dyn_cast<KForallStmt>(st)) {
+            } else if (auto *f = dyn_cast<KForallStmt>(s)) {
+              // `forall` → scf.forall (parallel output-tile iteration).
               auto &dims = f->getDims();
               SmallVector<OpFoldResult> ubs;
               for (auto *e : dims) ubs.push_back(b.getIndexAttr(eval_.evalInt(e)));
@@ -893,18 +882,24 @@ private:
               OpBuilder::InsertionGuard g(b);
               b.setInsertionPointToStart(forall.getBody());
               walk(f->getBody());
-            } else if (auto *fr = dyn_cast<KForStmt>(st)) {
+            } else if (auto *fr = dyn_cast<KForStmt>(s)) {
+              // `for` (output-pass / tile loop) → unrolled, re-emitting the
+              // body per iter (data per pass sequenced by controlcode +
+              // objectfifo cycling). barrier is a phase delimiter (no-op).
               int64_t lo = eval_.evalInt(fr->getLo());
               int64_t hi = eval_.evalInt(fr->getHi());
               for (int64_t v = lo; v < hi; ++v) {
                 ConstExprScope sc(eval_);
                 eval_.bind(fr->getIndVar(), v);
-                emitTop(fr->getBody());
+                walk(fr->getBody());
               }
             }
           }
         };
-    emitTop(onCore->getBody());
+    // The core body is emitted by a single walk: bare statements (the
+    // output-stationary form holds accumulators directly, no forall), foralls,
+    // and for-loops are all handled uniformly.
+    walk(onCore->getBody());
     AMDAIE::EndOp::create(b, loc);
   }
 
