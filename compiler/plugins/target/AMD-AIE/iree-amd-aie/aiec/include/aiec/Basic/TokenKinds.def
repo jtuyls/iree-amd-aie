@@ -1,0 +1,98 @@
+//===-- TokenKinds.def - aiec Token Kinds X-macro --------------*- C++ -*-===//
+
+#ifndef TOK
+#define TOK(X)
+#endif
+#ifndef KEYWORD
+#define KEYWORD(X) TOK(kw_##X)
+#endif
+#ifndef PUNCT
+#define PUNCT(NAME, SPELLING) TOK(NAME)
+#endif
+
+// Literals and identifiers
+TOK(unknown)
+TOK(eof)
+TOK(identifier)
+TOK(numeric_literal)
+TOK(string_literal)
+
+// Structural keywords
+KEYWORD(module)
+KEYWORD(kernel)
+KEYWORD(where)
+KEYWORD(fn)
+KEYWORD(extern)
+KEYWORD(buffer)
+KEYWORD(route)
+KEYWORD(on)
+KEYWORD(controller)
+KEYWORD(core)
+KEYWORD(shim)
+KEYWORD(memtile)
+KEYWORD(tile)
+KEYWORD(in)
+KEYWORD(when)
+KEYWORD(packet)
+KEYWORD(circuit)
+KEYWORD(via)
+KEYWORD(let)
+KEYWORD(acquire)
+KEYWORD(release)
+KEYWORD(zero)
+KEYWORD(forall)
+KEYWORD(reduce)
+KEYWORD(barrier)
+KEYWORD(issue)
+KEYWORD(wait)
+KEYWORD(for)
+KEYWORD(if)
+KEYWORD(else)
+KEYWORD(true)
+KEYWORD(false)
+KEYWORD(Consume)
+KEYWORD(Produce)
+KEYWORD(memref)
+// Type keywords
+KEYWORD(i8)
+KEYWORD(i16)
+KEYWORD(i32)
+KEYWORD(bf16)
+KEYWORD(f32)
+
+// Punctuation
+PUNCT(l_paren,    "(")
+PUNCT(r_paren,    ")")
+PUNCT(l_brace,    "{")
+PUNCT(r_brace,    "}")
+PUNCT(l_square,   "[")
+PUNCT(r_square,   "]")
+PUNCT(l_angle,    "<")
+PUNCT(r_angle,    ">")
+PUNCT(comma,      ",")
+PUNCT(semi,       ";")
+PUNCT(colon,      ":")
+PUNCT(dot,        ".")
+PUNCT(dotdot,     "..")
+PUNCT(arrow,      "->")
+PUNCT(equal,      "=")
+PUNCT(equalequal, "==")
+PUNCT(bangequal,  "!=")
+PUNCT(lessequal,  "<=")
+PUNCT(greaterequal, ">=")
+PUNCT(plus,       "+")
+PUNCT(minus,      "-")
+PUNCT(star,       "*")
+PUNCT(slash,      "/")
+PUNCT(percent,    "%")
+PUNCT(question,   "?")
+PUNCT(coloneq,    ":=")
+PUNCT(amp,        "&")
+PUNCT(amp_amp,    "&&")
+PUNCT(pipe,       "|")
+PUNCT(pipe_pipe,  "||")
+PUNCT(bang,       "!")
+
+#undef TOK
+#undef KEYWORD
+#undef PUNCT

@@ -38,6 +38,7 @@ iree_compiler_register_plugin(
 )
 
 add_subdirectory(IR)
+add_subdirectory(aiec)
 add_subdirectory(Target)
 add_subdirectory(Transforms)
 add_subdirectory(Test/samples)

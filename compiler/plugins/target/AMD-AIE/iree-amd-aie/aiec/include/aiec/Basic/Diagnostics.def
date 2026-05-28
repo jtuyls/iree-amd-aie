@@ -1,0 +1,48 @@
+//===-- Diagnostics.def - aiec diagnostic IDs ------------------*- C++ -*-===//
+//
+// X-macro listing every diagnostic the compiler can emit.
+// Used by DiagnosticIDs.h to generate the enum and the lookup tables.
+//
+// Mirrors clang's per-component DiagnosticXKinds.def files.
+//
+// Format: DIAG(id, severity, "format string with %0, %1, ...")
+//===----------------------------------------------------------------------===//
+
+#ifndef DIAG
+#define DIAG(ID, SEVERITY, FORMAT)
+#endif
+
+// Lex
+DIAG(err_unterminated_block_comment, Error, "unterminated /* */ block comment")
+DIAG(err_invalid_character,          Error, "invalid character '%0'")
+DIAG(err_numeric_literal_too_big,    Error, "numeric literal too large for int64")
+
+// Parse
+DIAG(err_expected,                   Error, "expected %0")
+DIAG(err_expected_after,             Error, "expected %0 after %1")
+DIAG(err_unexpected_token,           Error, "unexpected token %0")
+DIAG(err_unbalanced_braces,          Error, "unbalanced braces")
+
+// Sema
+DIAG(err_undefined_identifier,       Error, "use of undeclared identifier '%0'")
+DIAG(err_duplicate_declaration,      Error, "redeclaration of '%0'")
+DIAG(err_missing_dim_label,          Error, "buffer type uses positional dim %0; dim labels are mandatory (see § 3.3)")
+DIAG(err_unknown_dim_label,          Error, "unknown dim label '%0' (vocabulary: ping, kblock, sub, om, on, ok, m, n, k)")
+DIAG(err_where_violated,             Error, "instantiation violates 'where' clause: %0")
+DIAG(err_tile_out_of_device,         Error, "tile (%0, %1) is not on device %2")
+
+// CodeGen / Verifier
+DIAG(err_slice_size_mismatch,        Error, "slice covers %0 elements but target buffer holds %1")
+DIAG(err_slice_union_gaps,           Error, "slices across cols do not cover tensor along axis %0")
+DIAG(err_channel_collision,          Error, "channel %0 on tile (%1, %2) %3 claimed by two routes")
+DIAG(err_barrier_misalign,           Error, "on core has %0 barriers but on controller has %1")
+DIAG(err_via_mismatch,               Error, "via clause tiles do not match from/to placements")
+
+// Notes (always severity Note)
+DIAG(note_declared_here,             Note,  "'%0' declared here")
+DIAG(note_buffer_size_breakdown,     Note,  "buffer size = %0 (ping=%1 × kblock=%2 × m=%3 × k=%4)")
+
+// Warnings
+DIAG(warn_pinned_channel,            Warning, "pinned channel %0 may conflict with allocator policy")
+
+#undef DIAG
