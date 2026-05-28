@@ -11,9 +11,16 @@
 
 #include "aiec/CodeGen/Emitter.h"
 
+#include <fstream>
+#include <functional>
+#include <map>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "aiec/AST/KDecl.h"
 #include "aiec/CodeGen/ConstExpr.h"
-
 #include "iree-amd-aie/IR/AMDAIEDialect.h"
 #include "iree-amd-aie/IR/AMDAIEOps.h"
 #include "iree-amd-aie/IR/AMDAIETypes.h"
@@ -21,9 +28,11 @@
 #include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
-
+#include "llvm/Support/raw_ostream.h"
+#include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -32,18 +41,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
-#include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Parser/Parser.h"
-#include "llvm/Support/raw_ostream.h"
-
-#include <fstream>
-#include <sstream>
-
-#include <functional>
-#include <map>
-#include <string>
-#include <utility>
-#include <vector>
 
 using namespace mlir;
 using namespace mlir::iree_compiler;  // brings AMDAIE and IREE::HAL into scope
@@ -52,6 +50,145 @@ namespace aiec {
 namespace {
 
 std::string itos(int64_t v) { return std::to_string(v); }
+
+// ─── Loop induction-variable use analysis ──────────────────────────────
+//
+// A loop lowers to a rolled `scf.for` unless its body references the
+// induction variable. A loop whose iv appears in a hardware-instance
+// subscript (`a_l3_l2[r]`, `core[c, r]`) selects a distinct hardware object
+// per iteration and *must* be unrolled to produce valid IR; a loop whose iv
+// only feeds offsets/sizes could roll, but materializing the iv there needs a
+// runtime (SSA) value the emitter doesn't yet produce — so for now any iv use
+// keeps the loop unrolled. Compute (core) loops are iv-independent (data is
+// cycled by the object-fifos, not indexed by the iv), so they roll — which is
+// what keeps the core program within instruction memory at scale.
+//
+// Unknown expression kinds conservatively report a reference, so an
+// unrecognized iv use never causes an incorrect roll.
+bool exprRefsName(const KExpr *e, const std::string &name) {
+  if (!e) return false;
+  if (auto *id = dyn_cast<KIdentExpr>(e)) return id->getName() == name;
+  if (auto *bo = dyn_cast<KBinOpExpr>(e))
+    return exprRefsName(bo->getLHS(), name) || exprRefsName(bo->getRHS(), name);
+  if (auto *u = dyn_cast<KUnaryOpExpr>(e))
+    return exprRefsName(u->getOperand(), name);
+  if (auto *t = dyn_cast<KTernaryExpr>(e))
+    return exprRefsName(t->getCond(), name) ||
+           exprRefsName(t->getThen(), name) || exprRefsName(t->getElse(), name);
+  if (auto *c = dyn_cast<KCallExpr>(e)) {
+    if (exprRefsName(c->getReceiver(), name)) return true;
+    for (auto *a : c->getArgs())
+      if (exprRefsName(a, name)) return true;
+    return false;
+  }
+  if (auto *na = dyn_cast<KNamedArgExpr>(e))
+    return exprRefsName(na->getValue(), name);
+  if (auto *r = dyn_cast<KRangeExpr>(e))
+    return exprRefsName(r->getLo(), name) || exprRefsName(r->getHi(), name);
+  if (auto *idx = dyn_cast<KIndexExpr>(e)) {
+    if (exprRefsName(idx->getBase(), name)) return true;
+    for (auto *i : idx->getIndices())
+      if (exprRefsName(i, name)) return true;
+    return false;
+  }
+  if (auto *l = dyn_cast<KListLitExpr>(e)) {
+    for (auto *el : l->getElements())
+      if (exprRefsName(el, name)) return true;
+    return false;
+  }
+  if (isa<KIntLitExpr>(e) || isa<KWildcardExpr>(e)) return false;
+  return true;  // unrecognized kind: assume it references the name
+}
+
+bool bodyRefsName(const std::vector<KStmt *> &body, const std::string &name);
+
+bool stmtRefsName(const KStmt *s, const std::string &name) {
+  if (auto *l = dyn_cast<KLetStmt>(s))
+    return exprRefsName(l->getBufRef(), name);
+  if (auto *am = dyn_cast<KAssignMulStmt>(s))
+    return exprRefsName(am->getRHS(), name);
+  if (auto *red = dyn_cast<KReduceStmt>(s))
+    return exprRefsName(red->getLo(), name) ||
+           exprRefsName(red->getHi(), name) ||
+           bodyRefsName(red->getBody(), name);
+  if (auto *f = dyn_cast<KForStmt>(s))
+    return exprRefsName(f->getLo(), name) || exprRefsName(f->getHi(), name) ||
+           bodyRefsName(f->getBody(), name);
+  if (auto *fa = dyn_cast<KForallStmt>(s)) {
+    for (auto *d : fa->getDims())
+      if (exprRefsName(d, name)) return true;
+    return bodyRefsName(fa->getBody(), name);
+  }
+  if (auto *iss = dyn_cast<KIssueStmt>(s)) {
+    for (auto *i : iss->getIndices())
+      if (exprRefsName(i, name)) return true;
+    for (auto *o : iss->getOffsets())
+      if (exprRefsName(o, name)) return true;
+    for (auto *sz : iss->getSizes())
+      if (exprRefsName(sz, name)) return true;
+    for (auto *st : iss->getStrides())
+      if (exprRefsName(st, name)) return true;
+    return exprRefsName(iss->getBdId(), name);
+  }
+  if (auto *w = dyn_cast<KWaitStmt>(s))
+    return exprRefsName(w->getIdxLo(), name) ||
+           exprRefsName(w->getIdxHi(), name);
+  // Zero / Release / Call (args are handle names) / Barrier: no iv-bearing
+  // expr.
+  return false;
+}
+
+bool bodyRefsName(const std::vector<KStmt *> &body, const std::string &name) {
+  for (auto *s : body)
+    if (stmtRefsName(s, name)) return true;
+  return false;
+}
+
+// A loop is *spatial* iff its induction variable selects a distinct hardware
+// instance — i.e. it appears in a route/instance subscript (`issue(route[iv])`,
+// `wait(route[iv])`). Such a loop must be unrolled at instantiation (each
+// iteration is a different `amdaie.connection`, which can't be a runtime loop).
+// Every other loop is *temporal* and rolls to `scf.for` (iv-dependent
+// offsets/sizes are materialized as SSA). Only spatial loops unroll.
+bool loopIsSpatial(const std::string &iv, const std::vector<KStmt *> &body) {
+  for (auto *s : body) {
+    if (auto *iss = dyn_cast<KIssueStmt>(s)) {
+      for (auto *i : iss->getIndices())
+        if (exprRefsName(i, iv)) return true;
+    } else if (auto *w = dyn_cast<KWaitStmt>(s)) {
+      if (exprRefsName(w->getIdxLo(), iv) || exprRefsName(w->getIdxHi(), iv))
+        return true;
+    } else if (auto *f = dyn_cast<KForStmt>(s)) {
+      if (loopIsSpatial(iv, f->getBody())) return true;
+    }
+  }
+  return false;
+}
+
+// Build an `scf.for` carrying the `llvm.loop.unroll.disable` annotation so
+// Peano keeps the core loop rolled (otherwise LLVM re-unrolls it and the core
+// program overflows instruction memory). Mirrors
+// AMDAIE::createForOpWithUnrollingDisabled, kept local so the frontend tool
+// need not link the Transforms pass library.
+scf::ForOp createRolledForOp(OpBuilder &b, Location loc, int64_t lo,
+                             int64_t hi) {
+  Value lb = arith::ConstantIndexOp::create(b, loc, lo);
+  Value ub = arith::ConstantIndexOp::create(b, loc, hi);
+  Value step = arith::ConstantIndexOp::create(b, loc, 1);
+  auto forOp = scf::ForOp::create(b, loc, lb, ub, step);
+  auto unroll = LLVM::LoopUnrollAttr::get(
+      b.getContext(), /*disable=*/b.getBoolAttr(true), /*count=*/{},
+      /*runtimeDisable=*/{}, /*full=*/{}, /*followupUnrolled=*/{},
+      /*followupRemainder=*/{}, /*followupAll=*/{});
+  auto ann = LLVM::LoopAnnotationAttr::get(
+      b.getContext(), /*disableNonforced=*/{}, /*vectorize=*/{},
+      /*interleave=*/{}, /*unroll=*/unroll, /*unrollAndJam=*/{}, /*licm=*/{},
+      /*distribute=*/{}, /*pipeline=*/{}, /*peeled=*/{}, /*unswitch=*/{},
+      /*mustProgress=*/{}, /*isVectorized=*/{}, /*startLoc=*/{}, /*endLoc=*/{},
+      /*parallelAccesses=*/{});
+  forOp->setAttr("loop_annotation", ann);
+  return forOp;
+}
 
 // ─── Resolution structs (dialect-independent) ──────────────────────────
 
@@ -83,16 +220,21 @@ struct PlacementInst {
   std::vector<int64_t> axisValues;
 };
 
-std::vector<PlacementInst>
-resolvePlacement(const KPlacement &pl,
-                 const std::map<CatalogKind, ResolvedCatalogEntry> &catalog,
-                 ConstExprEvaluator &eval) {
+std::vector<PlacementInst> resolvePlacement(
+    const KPlacement &pl,
+    const std::map<CatalogKind, ResolvedCatalogEntry> &catalog,
+    ConstExprEvaluator &eval) {
   CatalogKind ck;
-  if (pl.catalog == "shim") ck = CatalogKind::Shim;
-  else if (pl.catalog == "memtile") ck = CatalogKind::Memtile;
-  else if (pl.catalog == "core") ck = CatalogKind::Core;
-  else if (pl.catalog == "controller") ck = CatalogKind::Controller;
-  else return {};
+  if (pl.catalog == "shim")
+    ck = CatalogKind::Shim;
+  else if (pl.catalog == "memtile")
+    ck = CatalogKind::Memtile;
+  else if (pl.catalog == "core")
+    ck = CatalogKind::Core;
+  else if (pl.catalog == "controller")
+    ck = CatalogKind::Controller;
+  else
+    return {};
   auto cit = catalog.find(ck);
   if (cit == catalog.end()) return {};
   const auto &e = cit->second;
@@ -153,16 +295,18 @@ struct RouteInst {
 // ─── Emitter ────────────────────────────────────────────────────────────
 
 class OpBuilderEmitter {
-public:
+ public:
   OpBuilderEmitter(const std::map<std::string, int64_t> &params,
                    DiagnosticEngine &diag, std::string sourceDir)
-      : diag_(diag), eval_(diag), builder_(&ctx_),
+      : diag_(diag),
+        eval_(diag),
+        builder_(&ctx_),
         sourceDir_(std::move(sourceDir)) {
     ctx_.loadDialect<AMDAIE::AMDAIEDialect, func::FuncDialect,
                      arith::ArithDialect, memref::MemRefDialect,
                      scf::SCFDialect, vector::VectorDialect,
                      linalg::LinalgDialect, IREE::HAL::HALDialect,
-                     IREE::Codegen::IREECodegenDialect>();
+                     IREE::Codegen::IREECodegenDialect, LLVM::LLVMDialect>();
     for (auto &kv : params) {
       params_[kv.first] = kv.second;
       eval_.bindGlobal(kv.first, kv.second);
@@ -243,7 +387,7 @@ public:
     return os.str();
   }
 
-private:
+ private:
   // ── Resolution (ported verbatim from the textual emitter) ──
   void resolveCatalog(const KKernelDecl *k) {
     catalog_.clear();
@@ -265,17 +409,24 @@ private:
     }
     auto core = catalog_.find(CatalogKind::Core);
     if (core != catalog_.end()) {
-      cols_ = (int)(core->second.ranges[0].second - core->second.ranges[0].first);
-      rows_ = (int)(core->second.ranges[1].second - core->second.ranges[1].first);
+      cols_ =
+          (int)(core->second.ranges[0].second - core->second.ranges[0].first);
+      rows_ =
+          (int)(core->second.ranges[1].second - core->second.ranges[1].first);
     }
   }
 
-  void rangeOf(const std::vector<std::string> &ivars,
-               std::vector<int64_t> &lo, std::vector<int64_t> &hi) {
+  void rangeOf(const std::vector<std::string> &ivars, std::vector<int64_t> &lo,
+               std::vector<int64_t> &hi) {
     for (auto &iv : ivars) {
       auto it = indexRanges_.find(iv);
-      if (it != indexRanges_.end()) { lo.push_back(it->second.first); hi.push_back(it->second.second); }
-      else { lo.push_back(0); hi.push_back(1); }
+      if (it != indexRanges_.end()) {
+        lo.push_back(it->second.first);
+        hi.push_back(it->second.second);
+      } else {
+        lo.push_back(0);
+        hi.push_back(1);
+      }
     }
   }
 
@@ -307,8 +458,12 @@ private:
         bi.placement = resolvePlacement(b->getPlacement(), catalog_, eval_);
         bufferInsts_.push_back(std::move(bi));
       };
-      if (idx.empty()) doInst();
-      else { doInst(); while (step()) doInst(); }
+      if (idx.empty())
+        doInst();
+      else {
+        doInst();
+        while (step()) doInst();
+      }
     }
   }
 
@@ -337,9 +492,11 @@ private:
         RouteInst ri;
         ri.decl = r;
         ri.idxVals = idx;
-        auto srcInsts = resolvePlacement(r->getViaSource().placement, catalog_, eval_);
+        auto srcInsts =
+            resolvePlacement(r->getViaSource().placement, catalog_, eval_);
         if (!srcInsts.empty()) ri.viaSrc = srcInsts[0];
-        ri.viaDstAll = resolvePlacement(r->getViaTarget().placement, catalog_, eval_);
+        ri.viaDstAll =
+            resolvePlacement(r->getViaTarget().placement, catalog_, eval_);
         if (!ri.viaDstAll.empty()) ri.viaDst = ri.viaDstAll[0];
         if (r->getViaSource().channelId)
           ri.srcChannel = (int)eval_.evalInt(r->getViaSource().channelId);
@@ -347,8 +504,12 @@ private:
           ri.dstChannel = (int)eval_.evalInt(r->getViaTarget().channelId);
         routeInsts_.push_back(std::move(ri));
       };
-      if (idx.empty()) doInst();
-      else { doInst(); while (step()) doInst(); }
+      if (idx.empty())
+        doInst();
+      else {
+        doInst();
+        while (step()) doInst();
+      }
     }
   }
 
@@ -361,8 +522,8 @@ private:
       auto *fn = dyn_cast<KExternFnDecl>(d);
       if (!fn || fn->getImplPath().empty()) continue;
       externFns_.insert(fn->getName());
-      std::string path =
-          sourceDir_.empty() ? fn->getImplPath()
+      std::string path = sourceDir_.empty()
+                             ? fn->getImplPath()
                              : sourceDir_ + "/" + fn->getImplPath();
       std::ifstream in(path);
       if (!in) {
@@ -391,7 +552,8 @@ private:
           std::string key = tmpl.substr(i + 2, end - (i + 2));
           text += subs.count(key) ? subs[key] : "";
           i = end + 1;
-        } else text += tmpl[i++];
+        } else
+          text += tmpl[i++];
       }
       // Parse `func.func ...` (wrap in a module to parse, then move the fn).
       auto parsed = parseSourceString<ModuleOp>(text, &ctx_);
@@ -403,7 +565,8 @@ private:
       }
       OpBuilder &b = builder_;
       b.setInsertionPointToEnd(module_.getBody());
-      for (auto &op : llvm::make_early_inc_range(parsed->getBody()->getOperations()))
+      for (auto &op :
+           llvm::make_early_inc_range(parsed->getBody()->getOperations()))
         op.moveBefore(module_.getBody(), module_.getBody()->end());
     }
   }
@@ -472,10 +635,13 @@ private:
       Value alloc;
       if (ms == 2) {
         auto it = l1Alloc.find(bi.decl->getName());
-        if (it != l1Alloc.end()) alloc = it->second;
-        else { alloc = memref::AllocOp::create(b, loc, memrefTy);
-               l1Alloc[bi.decl->getName()] = alloc;
-               l1Allocs_.push_back(alloc); }
+        if (it != l1Alloc.end())
+          alloc = it->second;
+        else {
+          alloc = memref::AllocOp::create(b, loc, memrefTy);
+          l1Alloc[bi.decl->getName()] = alloc;
+          l1Allocs_.push_back(alloc);
+        }
       } else {
         alloc = memref::AllocOp::create(b, loc, memrefTy);
         l2Allocs_.push_back(alloc);
@@ -516,16 +682,18 @@ private:
         continue;
       if (!rd->getSource().has_value() || !rd->getTarget().has_value())
         continue;
-      const BufferInst *srcBi = findBufferInst(rd->getSource()->bufName, ri.idxVals);
+      const BufferInst *srcBi =
+          findBufferInst(rd->getSource()->bufName, ri.idxVals);
       if (!srcBi) srcBi = findBufferInst(rd->getSource()->bufName, {});
-      const BufferInst *tgtBi = findBufferInst(rd->getTarget()->bufName, ri.idxVals);
+      const BufferInst *tgtBi =
+          findBufferInst(rd->getTarget()->bufName, ri.idxVals);
       if (!tgtBi) tgtBi = findBufferInst(rd->getTarget()->bufName, {});
       if (!srcBi || !tgtBi || !srcBi->lof || !tgtBi->lof) continue;
 
       Value mtTile = getTile(ri.viaSrc.tile.col, ri.viaSrc.tile.row);
-      Value srcCh = AMDAIE::ChannelOp::create(
-          b, loc, mtTile, ri.srcChannel, AMDAIE::StrmSwPortType::DMA,
-          AMDAIE::DMAChannelDir::MM2S);
+      Value srcCh = AMDAIE::ChannelOp::create(b, loc, mtTile, ri.srcChannel,
+                                              AMDAIE::StrmSwPortType::DMA,
+                                              AMDAIE::DMAChannelDir::MM2S);
       SmallVector<Value> dstChs;
       for (auto &dt : ri.viaDstAll) {
         Value coTile = getTile(dt.tile.col, dt.tile.row);
@@ -535,7 +703,8 @@ private:
       }
       ri.conn = AMDAIE::ConnectionOp::create(
           b, loc, tgtBi->lof, dstChs, srcBi->lof, ValueRange(srcCh),
-          AMDAIE::ConnectionTypeAttr::get(&ctx_, AMDAIE::ConnectionType::Circuit),
+          AMDAIE::ConnectionTypeAttr::get(&ctx_,
+                                          AMDAIE::ConnectionType::Circuit),
           /*flow=*/nullptr);
     }
   }
@@ -549,8 +718,10 @@ private:
           for (auto *s : stmts) {
             if (auto *iss = dyn_cast<KIssueStmt>(s)) {
               if (iss->getRouteName() == routeName && bindName.empty()) {
-                if (!iss->getSrcBinding().empty()) bindName = iss->getSrcBinding();
-                else if (!iss->getDstBinding().empty()) bindName = iss->getDstBinding();
+                if (!iss->getSrcBinding().empty())
+                  bindName = iss->getSrcBinding();
+                else if (!iss->getDstBinding().empty())
+                  bindName = iss->getDstBinding();
               }
             } else if (auto *f = dyn_cast<KForStmt>(s)) {
               walk(f->getBody());
@@ -589,9 +760,11 @@ private:
 
       if (rd->getParameterization() ==
           RouteParameterization::SourceParameterized) {
-        // Push: target = L2 buffer (memtile S2MM), source = placeholder (shim MM2S).
+        // Push: target = L2 buffer (memtile S2MM), source = placeholder (shim
+        // MM2S).
         if (!rd->getTarget().has_value()) continue;
-        const BufferInst *bi = findBufferInst(rd->getTarget()->bufName, ri.idxVals);
+        const BufferInst *bi =
+            findBufferInst(rd->getTarget()->bufName, ri.idxVals);
         if (!bi) bi = findBufferInst(rd->getTarget()->bufName, {});
         if (!bi || !bi->lof) continue;
         Value shTile = getTile(ri.viaSrc.tile.col, ri.viaSrc.tile.row);
@@ -607,14 +780,16 @@ private:
         // The control-packet overlay reuses these shim-source DMA channels as
         // its packet feeds (keyed by column + channel index).
         shimDmaCh_[{ri.viaSrc.tile.col, ri.srcChannel}] = shCh;
-        ri.conn = AMDAIE::ConnectionOp::create(b, loc, bi->lof, ValueRange(mtCh),
-                                               ph, ValueRange(shCh), connTy,
-                                               /*flow=*/nullptr);
+        ri.conn = AMDAIE::ConnectionOp::create(
+            b, loc, bi->lof, ValueRange(mtCh), ph, ValueRange(shCh), connTy,
+            /*flow=*/nullptr);
       } else if (rd->getParameterization() ==
                  RouteParameterization::TargetParameterized) {
-        // Drain: source = L2 buffer (memtile MM2S), target = placeholder (shim S2MM).
+        // Drain: source = L2 buffer (memtile MM2S), target = placeholder (shim
+        // S2MM).
         if (!rd->getSource().has_value()) continue;
-        const BufferInst *bi = findBufferInst(rd->getSource()->bufName, ri.idxVals);
+        const BufferInst *bi =
+            findBufferInst(rd->getSource()->bufName, ri.idxVals);
         if (!bi) bi = findBufferInst(rd->getSource()->bufName, {});
         if (!bi || !bi->lof) continue;
         Value mtTile = getTile(ri.viaSrc.tile.col, ri.viaSrc.tile.row);
@@ -627,9 +802,9 @@ private:
         Value shCh = AMDAIE::ChannelOp::create(b, loc, shTile, ri.dstChannel,
                                                AMDAIE::StrmSwPortType::DMA,
                                                AMDAIE::DMAChannelDir::S2MM);
-        ri.conn = AMDAIE::ConnectionOp::create(b, loc, ph, ValueRange(shCh),
-                                               bi->lof, ValueRange(mtCh), connTy,
-                                               /*flow=*/nullptr);
+        ri.conn = AMDAIE::ConnectionOp::create(
+            b, loc, ph, ValueRange(shCh), bi->lof, ValueRange(mtCh), connTy,
+            /*flow=*/nullptr);
       }
     }
   }
@@ -653,7 +828,10 @@ private:
       const auto &ivars = ri.decl->getIndexVars();
       for (size_t i = 0; i < ivars.size() && i < ri.idxVals.size(); ++i) {
         int64_t v;
-        if (!eval_.lookup(ivars[i], v) || v != ri.idxVals[i]) { match = false; break; }
+        if (!eval_.lookup(ivars[i], v) || v != ri.idxVals[i]) {
+          match = false;
+          break;
+        }
       }
       if (match) return ri.conn;
     }
@@ -684,17 +862,22 @@ private:
         eval_.bind("c", c);
         eval_.bind("r", r);
 
-        // Drain connection (out_l1[c,r] -> c_l2[c]) via core MM2S, memtile S2MM.
+        // Drain connection (out_l1[c,r] -> c_l2[c]) via core MM2S, memtile
+        // S2MM.
         for (auto &ri : routeInsts_) {
           const auto &rd = ri.decl;
           if (!(rd->getViaSource().placement.catalog == "core" &&
                 rd->getViaTarget().placement.catalog == "memtile"))
             continue;
-          if (ri.idxVals.size() != 2 || ri.idxVals[0] != c || ri.idxVals[1] != r)
+          if (ri.idxVals.size() != 2 || ri.idxVals[0] != c ||
+              ri.idxVals[1] != r)
             continue;
-          if (!rd->getSource().has_value() || !rd->getTarget().has_value()) continue;
-          const BufferInst *src = findBufferInst(rd->getSource()->bufName, ri.idxVals);
-          const BufferInst *tgt = findBufferInst(rd->getTarget()->bufName, {(int64_t)c});
+          if (!rd->getSource().has_value() || !rd->getTarget().has_value())
+            continue;
+          const BufferInst *src =
+              findBufferInst(rd->getSource()->bufName, ri.idxVals);
+          const BufferInst *tgt =
+              findBufferInst(rd->getTarget()->bufName, {(int64_t)c});
           if (!src || !tgt || !src->lof || !tgt->lof) continue;
           Tile ct = coreTile(c, r);
           Value coTile = getTile(ct.col, ct.row);
@@ -707,7 +890,8 @@ private:
                                                  AMDAIE::DMAChannelDir::S2MM);
           ri.conn = AMDAIE::ConnectionOp::create(
               b, loc, tgt->lof, ValueRange(mtCh), src->lof, ValueRange(coCh),
-              AMDAIE::ConnectionTypeAttr::get(&ctx_, AMDAIE::ConnectionType::Circuit),
+              AMDAIE::ConnectionTypeAttr::get(&ctx_,
+                                              AMDAIE::ConnectionType::Circuit),
               /*flow=*/nullptr);
         }
 
@@ -724,8 +908,11 @@ private:
     std::vector<std::vector<const KStmt *>> segs;
     std::vector<const KStmt *> cur;
     for (auto *s : onCore->getBody()) {
-      if (isa<KBarrierStmt>(s)) { segs.push_back(cur); cur.clear(); }
-      else cur.push_back(s);
+      if (isa<KBarrierStmt>(s)) {
+        segs.push_back(cur);
+        cur.clear();
+      } else
+        cur.push_back(s);
     }
     segs.push_back(cur);
 
@@ -733,8 +920,9 @@ private:
     SmallVector<Value> inList, outList;
     std::set<void *> outSeen;
     const KBufferDecl *produceBuf = nullptr;
-    std::function<void(const std::vector<const KStmt *> &, std::set<void *> &)> scan =
-        [&](const std::vector<const KStmt *> &body, std::set<void *> &segIn) {
+    std::function<void(const std::vector<const KStmt *> &, std::set<void *> &)>
+        scan = [&](const std::vector<const KStmt *> &body,
+                   std::set<void *> &segIn) {
           for (auto *s : body) {
             if (auto *l = dyn_cast<KLetStmt>(s)) {
               bool produce = l->getRole() == AcquireRole::Produce;
@@ -745,23 +933,30 @@ private:
               if (produce) {
                 if (outSeen.insert(conn.getAsOpaquePointer()).second)
                   outList.push_back(conn);
-                if (!produceBuf) produceBuf = findBufferDecl(bufRef(l->getBufRef()));
+                if (!produceBuf)
+                  produceBuf = findBufferDecl(bufRef(l->getBufRef()));
               } else if (segIn.insert(conn.getAsOpaquePointer()).second) {
                 inList.push_back(conn);
               }
             } else if (auto *red = dyn_cast<KReduceStmt>(s)) {
-              std::vector<const KStmt *> bb(red->getBody().begin(), red->getBody().end());
+              std::vector<const KStmt *> bb(red->getBody().begin(),
+                                            red->getBody().end());
               scan(bb, segIn);
             } else if (auto *f = dyn_cast<KForallStmt>(s)) {
-              std::vector<const KStmt *> bb(f->getBody().begin(), f->getBody().end());
+              std::vector<const KStmt *> bb(f->getBody().begin(),
+                                            f->getBody().end());
               scan(bb, segIn);
             } else if (auto *fr = dyn_cast<KForStmt>(s)) {
-              std::vector<const KStmt *> bb(fr->getBody().begin(), fr->getBody().end());
+              std::vector<const KStmt *> bb(fr->getBody().begin(),
+                                            fr->getBody().end());
               scan(bb, segIn);
             }
           }
         };
-    for (auto &seg : segs) { std::set<void *> segIn; scan(seg, segIn); }
+    for (auto &seg : segs) {
+      std::set<void *> segIn;
+      scan(seg, segIn);
+    }
 
     Tile ct = coreTile(c, r);
     auto tileOp = cast<AMDAIE::TileOp>(getTile(ct.col, ct.row).getDefiningOp());
@@ -777,20 +972,66 @@ private:
     Value zeroCst;
     if (produceBuf) {
       SmallVector<int64_t> shape;
-      for (auto *e : produceBuf->getType().dims) shape.push_back(eval_.evalInt(e));
+      for (auto *e : produceBuf->getType().dims)
+        shape.push_back(eval_.evalInt(e));
       auto vecTy = VectorType::get(shape, b.getI32Type());
       zeroCst = arith::ConstantOp::create(
           b, loc, vecTy, DenseElementsAttr::get(vecTy, b.getI32IntegerAttr(0)));
     }
 
-    struct Handle { Value mem; Value conn; AMDAIE::LogicalObjectFifoPort port;
-                    const KMemrefType *type; };
+    struct Handle {
+      Value mem;
+      Value conn;
+      AMDAIE::LogicalObjectFifoPort port;
+      const KMemrefType *type;
+    };
     std::map<std::string, Handle> handles;
 
     std::function<void(const std::vector<KStmt *> &)> walk =
         [&](const std::vector<KStmt *> &body) {
           for (auto *s : body) {
             if (auto *l = dyn_cast<KLetStmt>(s)) {
+              if (l->isSubview()) {
+                // `let name = base[indices]`: a sub-tile view of an already
+                // acquired buffer handle. Reinterpret the base buffer at the
+                // sub-tile's flat offset so the 4 micro-tile matmuls write into
+                // one acquired output buffer (depth 2) instead of 4 separate
+                // fifo acquires (which forced out_l1 depth-4 → q/p unroll-4).
+                auto *idx = dyn_cast<KIndexExpr>(l->getBufRef());
+                auto *baseId =
+                    idx ? dyn_cast<KIdentExpr>(idx->getBase()) : nullptr;
+                if (!idx || !baseId) continue;
+                auto bit = handles.find(baseId->getName());
+                if (bit == handles.end()) continue;
+                auto baseTy = cast<MemRefType>(bit->second.mem.getType());
+                ArrayRef<int64_t> shape = baseTy.getShape();
+                int nIdx = (int)idx->getIndices().size();
+                SmallVector<int64_t> subSizes(shape.begin() + nIdx,
+                                              shape.end());
+                int64_t subElems = 1;
+                for (int64_t d : subSizes) subElems *= d;
+                int64_t flatIdx = 0;
+                for (int i = 0; i < nIdx; ++i) {
+                  int64_t iv = eval_.evalInt(idx->getIndices()[i]);
+                  int64_t prod = 1;
+                  for (int j = i + 1; j < nIdx; ++j) prod *= shape[j];
+                  flatIdx += iv * prod;
+                }
+                int64_t offset = flatIdx * subElems;
+                SmallVector<int64_t> subStrides(subSizes.size(), 1);
+                for (int i = (int)subSizes.size() - 2; i >= 0; --i)
+                  subStrides[i] = subStrides[i + 1] * subSizes[i + 1];
+                auto subTy = MemRefType::get(
+                    subSizes, baseTy.getElementType(),
+                    StridedLayoutAttr::get(&ctx_, offset, subStrides),
+                    baseTy.getMemorySpace());
+                Value sub = memref::ReinterpretCastOp::create(
+                    b, loc, subTy, bit->second.mem, offset, subSizes,
+                    subStrides);
+                handles[l->getName()] = {sub, bit->second.conn,
+                                         bit->second.port, bit->second.type};
+                continue;
+              }
               const KBufferDecl *bd = findBufferDecl(bufRef(l->getBufRef()));
               if (!bd) continue;
               bool produce = l->getRole() == AcquireRole::Produce;
@@ -829,14 +1070,26 @@ private:
             } else if (auto *red = dyn_cast<KReduceStmt>(s)) {
               int64_t lo = eval_.evalInt(red->getLo());
               int64_t hi = eval_.evalInt(red->getHi());
-              for (int64_t kv = lo; kv < hi; ++kv) {
-                ConstExprScope ks(eval_);
-                eval_.bind(red->getIndVar(), kv);
+              if (bodyRefsName(red->getBody(), red->getIndVar())) {
+                // iv used in the body (e.g. an instance subscript) → unroll.
+                for (int64_t kv = lo; kv < hi; ++kv) {
+                  ConstExprScope ks(eval_);
+                  eval_.bind(red->getIndVar(), kv);
+                  walk(red->getBody());
+                }
+              } else {
+                // iv-independent → roll to scf.for (data cycled by fifos).
+                // Disable LLVM unrolling so Peano keeps the loop rolled and the
+                // core program stays within instruction memory.
+                auto forOp = createRolledForOp(b, loc, lo, hi);
+                OpBuilder::InsertionGuard g(b);
+                b.setInsertionPointToStart(forOp.getBody());
                 walk(red->getBody());
               }
             } else if (auto *call = dyn_cast<KCallStmt>(s)) {
               if (!externFns_.count(call->getCallee())) {
-                diag_.report(call->getLocation(), diag::err_undefined_identifier)
+                diag_.report(call->getLocation(),
+                             diag::err_undefined_identifier)
                     << call->getCallee();
                 continue;
               }
@@ -844,7 +1097,10 @@ private:
               bool ok = true;
               for (auto &a : call->getArgs()) {
                 auto h = handles.find(a);
-                if (h == handles.end()) { ok = false; break; }
+                if (h == handles.end()) {
+                  ok = false;
+                  break;
+                }
                 args.push_back(h->second.mem);
               }
               if (!ok) continue;
@@ -857,7 +1113,8 @@ private:
               int64_t scale = eval_.evalInt(am->getRHS());
               int nd = (int)it->second.type->dims.size();
               auto idMap = AffineMap::getMultiDimIdentityMap(nd, &ctx_);
-              SmallVector<utils::IteratorType> iters(nd, utils::IteratorType::parallel);
+              SmallVector<utils::IteratorType> iters(
+                  nd, utils::IteratorType::parallel);
               linalg::GenericOp::create(
                   b, loc, TypeRange{}, ValueRange{}, ValueRange{it->second.mem},
                   ArrayRef<AffineMap>{idMap}, iters,
@@ -876,21 +1133,30 @@ private:
               // `forall` → scf.forall (parallel output-tile iteration).
               auto &dims = f->getDims();
               SmallVector<OpFoldResult> ubs;
-              for (auto *e : dims) ubs.push_back(b.getIndexAttr(eval_.evalInt(e)));
+              for (auto *e : dims)
+                ubs.push_back(b.getIndexAttr(eval_.evalInt(e)));
               auto forall = scf::ForallOp::create(b, loc, ubs, ValueRange{},
                                                   std::nullopt);
               OpBuilder::InsertionGuard g(b);
               b.setInsertionPointToStart(forall.getBody());
               walk(f->getBody());
             } else if (auto *fr = dyn_cast<KForStmt>(s)) {
-              // `for` (output-pass / tile loop) → unrolled, re-emitting the
-              // body per iter (data per pass sequenced by controlcode +
-              // objectfifo cycling). barrier is a phase delimiter (no-op).
+              // `for` (output-pass / tile loop). Rolled to scf.for when the
+              // body is iv-independent (data per pass sequenced by controlcode
+              // + objectfifo cycling); unrolled when the iv is referenced
+              // (e.g. an instance subscript). barrier is a phase delimiter.
               int64_t lo = eval_.evalInt(fr->getLo());
               int64_t hi = eval_.evalInt(fr->getHi());
-              for (int64_t v = lo; v < hi; ++v) {
-                ConstExprScope sc(eval_);
-                eval_.bind(fr->getIndVar(), v);
+              if (bodyRefsName(fr->getBody(), fr->getIndVar())) {
+                for (int64_t v = lo; v < hi; ++v) {
+                  ConstExprScope sc(eval_);
+                  eval_.bind(fr->getIndVar(), v);
+                  walk(fr->getBody());
+                }
+              } else {
+                auto forOp = createRolledForOp(b, loc, lo, hi);
+                OpBuilder::InsertionGuard g(b);
+                b.setInsertionPointToStart(forOp.getBody());
                 walk(fr->getBody());
               }
             }
@@ -917,8 +1183,10 @@ private:
         [&](const std::vector<KStmt *> &stmts) {
           for (auto *s : stmts) {
             if (auto *iss = dyn_cast<KIssueStmt>(s)) {
-              if (!iss->getDstBinding().empty()) rw.insert(iss->getDstBinding());
-            } else if (auto *f = dyn_cast<KForStmt>(s)) walk(f->getBody());
+              if (!iss->getDstBinding().empty())
+                rw.insert(iss->getDstBinding());
+            } else if (auto *f = dyn_cast<KForStmt>(s))
+              walk(f->getBody());
           }
         };
     for (auto *d : k->getBody())
@@ -949,15 +1217,15 @@ private:
     // Pipeline layout: one binding per tensor arg; read-write iff drained to.
     SmallVector<IREE::HAL::PipelineBindingAttr> binds;
     for (auto *a : tensors) {
-      auto flags = rw.count(a->name)
-                       ? IREE::HAL::DescriptorFlags::Indirect
-                       : (IREE::HAL::DescriptorFlags::ReadOnly |
-                          IREE::HAL::DescriptorFlags::Indirect);
+      auto flags = rw.count(a->name) ? IREE::HAL::DescriptorFlags::Indirect
+                                     : (IREE::HAL::DescriptorFlags::ReadOnly |
+                                        IREE::HAL::DescriptorFlags::Indirect);
       binds.push_back(IREE::HAL::PipelineBindingAttr::get(
           &ctx_, IREE::HAL::DescriptorType::StorageBuffer, flags));
     }
     auto layout = IREE::HAL::PipelineLayoutAttr::get(
-        &ctx_, binds, /*constants=*/0, IREE::HAL::PipelineLayoutFlags::Indirect);
+        &ctx_, binds, /*constants=*/0,
+        IREE::HAL::PipelineLayoutFlags::Indirect);
 
     Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
     int bIdx = 0;
@@ -975,8 +1243,7 @@ private:
           b, loc, memTy, layout, b.getIndexAttr(bIdx), c0,
           /*dynamic_dims=*/ValueRange{}, b.getIndexAttr(64),
           IREE::HAL::DescriptorFlagsAttr::get(&ctx_, descFlags));
-      Value aligned =
-          memref::AssumeAlignmentOp::create(b, loc, subspan, 64);
+      Value aligned = memref::AssumeAlignmentOp::create(b, loc, subspan, 64);
       auto flatLofTy = AMDAIE::LogicalObjectFifoType::get(
           MemRefType::get({flat}, b.getI32Type()));
       for (int c = 0; c < cols_; ++c) {
@@ -989,7 +1256,8 @@ private:
     }
   }
 
-  Value findRouteConn(const std::string &name, const std::vector<int64_t> &idx) {
+  Value findRouteConn(const std::string &name,
+                      const std::vector<int64_t> &idx) {
     for (auto &ri : routeInsts_)
       if (ri.decl->getName() == name && ri.idxVals == idx) return ri.conn;
     return Value();
@@ -1004,6 +1272,61 @@ private:
     SmallVector<int64_t> v;
     for (auto *e : es) v.push_back(eval_.evalInt(e));
     return v;
+  }
+
+  // True if `e` references any loop induction variable currently bound to an
+  // SSA value (i.e. a rolled controlcode loop). Such expressions must be
+  // emitted as runtime arithmetic, not folded to a constant.
+  bool exprUsesSsaIv(const KExpr *e) {
+    for (auto &kv : ssaIvs_)
+      if (exprRefsName(e, kv.first)) return true;
+    return false;
+  }
+
+  // Emit `e` as an `index` SSA value: a rolled loop's iv resolves to its
+  // induction variable; everything else is constexpr-evaluated to a constant.
+  Value emitExprValue(OpBuilder &b, Location loc, const KExpr *e) {
+    if (auto *il = dyn_cast<KIntLitExpr>(e))
+      return arith::ConstantIndexOp::create(b, loc, il->getValue());
+    if (auto *id = dyn_cast<KIdentExpr>(e)) {
+      auto it = ssaIvs_.find(id->getName());
+      if (it != ssaIvs_.end()) return it->second;
+      return arith::ConstantIndexOp::create(b, loc, eval_.evalInt(e));
+    }
+    if (auto *bo = dyn_cast<KBinOpExpr>(e)) {
+      Value l = emitExprValue(b, loc, bo->getLHS());
+      Value r = emitExprValue(b, loc, bo->getRHS());
+      switch (bo->getOp()) {
+        case BinOpKind::Add:
+          return arith::AddIOp::create(b, loc, l, r);
+        case BinOpKind::Sub:
+          return arith::SubIOp::create(b, loc, l, r);
+        case BinOpKind::Mul:
+          return arith::MulIOp::create(b, loc, l, r);
+        case BinOpKind::Div:
+          return arith::DivSIOp::create(b, loc, l, r);
+        case BinOpKind::Mod:
+          return arith::RemSIOp::create(b, loc, l, r);
+        default:
+          break;
+      }
+    }
+    if (auto *u = dyn_cast<KUnaryOpExpr>(e)) {
+      if (u->getOp() == UnaryOpKind::Neg) {
+        Value z = arith::ConstantIndexOp::create(b, loc, 0);
+        return arith::SubIOp::create(b, loc, z,
+                                     emitExprValue(b, loc, u->getOperand()));
+      }
+    }
+    // Fallback: anything else must be constexpr in this context.
+    return arith::ConstantIndexOp::create(b, loc, eval_.evalInt(e));
+  }
+
+  // An offset/size/stride entry: a static attr when constexpr, or a dynamic
+  // SSA value when it depends on a rolled loop's induction variable.
+  OpFoldResult emitExprOFR(OpBuilder &b, Location loc, const KExpr *e) {
+    if (exprUsesSsaIv(e)) return emitExprValue(b, loc, e);
+    return b.getIndexAttr(eval_.evalInt(e));
   }
 
   // Free the buffer allocations at the end of the workgroup body (L1 shared
@@ -1029,8 +1352,8 @@ private:
     OpBuilder &b = builder_;
     auto dynMemref = MemRefType::get({ShapedType::kDynamic}, b.getI32Type());
     auto lofTy = AMDAIE::LogicalObjectFifoType::get(dynMemref);
-    return AMDAIE::LogicalObjectFifoPlaceholderOp::create(
-        b, b.getUnknownLoc(), lofTy, tileVals);
+    return AMDAIE::LogicalObjectFifoPlaceholderOp::create(b, b.getUnknownLoc(),
+                                                          lofTy, tileVals);
   }
   AMDAIE::ChannelOp ctrlChannel(Value tile, AMDAIE::StrmSwPortType port,
                                 AMDAIE::DMAChannelDir dir) {
@@ -1078,21 +1401,17 @@ private:
       Value ch1 = ctrlFeedCh(c, 1);
 
       // Shim CTRL feed (fed by shim DMA channel 0).
-      AMDAIE::ChannelOp shCtrlS2mm =
-          ctrlChannel(shTile, AMDAIE::StrmSwPortType::CTRL,
-                      AMDAIE::DMAChannelDir::S2MM);
+      AMDAIE::ChannelOp shCtrlS2mm = ctrlChannel(
+          shTile, AMDAIE::StrmSwPortType::CTRL, AMDAIE::DMAChannelDir::S2MM);
       shPh[c] = ctrlPlaceholder({shTile});
-      ctrlShConns_[c] =
-          ctrlConn(shPh[c], {shCtrlS2mm}, shPh[c], {ch0},
-                   AMDAIE::ConnectionType::Packet);
+      ctrlShConns_[c] = ctrlConn(shPh[c], {shCtrlS2mm}, shPh[c], {ch0},
+                                 AMDAIE::ConnectionType::Packet);
       // Memtile CTRL feed (fed by shim DMA channel 1).
-      AMDAIE::ChannelOp mtCtrlS2mm =
-          ctrlChannel(mtTile, AMDAIE::StrmSwPortType::CTRL,
-                      AMDAIE::DMAChannelDir::S2MM);
+      AMDAIE::ChannelOp mtCtrlS2mm = ctrlChannel(
+          mtTile, AMDAIE::StrmSwPortType::CTRL, AMDAIE::DMAChannelDir::S2MM);
       Value mtPh = ctrlPlaceholder({mtTile});
-      ctrlMtConns_[c] =
-          ctrlConn(mtPh, {mtCtrlS2mm}, shPh[c], {ch1},
-                   AMDAIE::ConnectionType::Packet);
+      ctrlMtConns_[c] = ctrlConn(mtPh, {mtCtrlS2mm}, shPh[c], {ch1},
+                                 AMDAIE::ConnectionType::Packet);
     }
 
     // Compute-tile CTRL ports: one broadcast packet feed (col-major) fed by
@@ -1109,22 +1428,18 @@ private:
     }
     Value coPh = ctrlPlaceholder(coTiles);
     Value feed0 = ctrlFeedCh(0, 0);
-    ctrlCoConn_ =
-        ctrlConn(coPh, coChs, shPh.empty() ? Value() : shPh[0], {feed0},
-                 AMDAIE::ConnectionType::Packet);
+    ctrlCoConn_ = ctrlConn(coPh, coChs, shPh.empty() ? Value() : shPh[0],
+                           {feed0}, AMDAIE::ConnectionType::Packet);
 
     // Per-column SOUTH circuit return (CTRL MM2S -> SOUTH S2MM on the shim).
     for (int c = 0; c < cols_; ++c) {
       Value shTile = shimTileVal(c);
-      AMDAIE::ChannelOp shCtrlMm2s =
-          ctrlChannel(shTile, AMDAIE::StrmSwPortType::CTRL,
-                      AMDAIE::DMAChannelDir::MM2S);
-      AMDAIE::ChannelOp southS2mm =
-          ctrlChannel(shTile, AMDAIE::StrmSwPortType::SOUTH,
-                      AMDAIE::DMAChannelDir::S2MM);
-      southConns_[c] =
-          ctrlConn(shPh[c], {southS2mm}, shPh[c], {shCtrlMm2s},
-                   AMDAIE::ConnectionType::Circuit);
+      AMDAIE::ChannelOp shCtrlMm2s = ctrlChannel(
+          shTile, AMDAIE::StrmSwPortType::CTRL, AMDAIE::DMAChannelDir::MM2S);
+      AMDAIE::ChannelOp southS2mm = ctrlChannel(
+          shTile, AMDAIE::StrmSwPortType::SOUTH, AMDAIE::DMAChannelDir::S2MM);
+      southConns_[c] = ctrlConn(shPh[c], {southS2mm}, shPh[c], {shCtrlMm2s},
+                                AMDAIE::ConnectionType::Circuit);
     }
   }
 
@@ -1156,12 +1471,17 @@ private:
         ss = evalList(ri.decl->getSource()->sizes);
         sst = evalList(ri.decl->getSource()->strides);
       }
-      AMDAIE::NpuCircularDmaCpyNdOp::create(b, loc, ri.conn, to, ts, tst, so, ss,
-                                            sst);
+      AMDAIE::NpuCircularDmaCpyNdOp::create(b, loc, ri.conn, to, ts, tst, so,
+                                            ss, sst);
     }
 
     // Outstanding issued transfers, for `wait` resolution.
-    struct Out { Value token; bool isSource; std::string route; int64_t idx; };
+    struct Out {
+      Value token;
+      bool isSource;
+      std::string route;
+      int64_t idx;
+    };
     std::vector<Out> outstanding;
     std::map<std::string, int> bdNext;
 
@@ -1171,10 +1491,27 @@ private:
             if (auto *forS = dyn_cast<KForStmt>(s)) {
               int64_t lo = eval_.evalInt(forS->getLo());
               int64_t hi = eval_.evalInt(forS->getHi());
-              for (int64_t v = lo; v < hi; ++v) {
-                ConstExprScope sc(eval_);
-                eval_.bind(forS->getIndVar(), v);
+              if (loopIsSpatial(forS->getIndVar(), forS->getBody())) {
+                // Spatial loop: each iteration selects a distinct connection;
+                // must unroll (constexpr-bind the iv, re-emit per iteration).
+                for (int64_t v = lo; v < hi; ++v) {
+                  ConstExprScope sc(eval_);
+                  eval_.bind(forS->getIndVar(), v);
+                  walk(forS->getBody());
+                }
+              } else {
+                // Temporal loop: roll to scf.for so AssignNpuDmaBdIds cycles
+                // the BD ids. The iv is bound to the SSA induction variable;
+                // iv-dependent offsets become runtime arithmetic.
+                Value lb = arith::ConstantIndexOp::create(b, loc, lo);
+                Value ub = arith::ConstantIndexOp::create(b, loc, hi);
+                Value step = arith::ConstantIndexOp::create(b, loc, 1);
+                auto forOp = scf::ForOp::create(b, loc, lb, ub, step);
+                OpBuilder::InsertionGuard g(b);
+                b.setInsertionPointToStart(forOp.getBody());
+                ssaIvs_[forS->getIndVar()] = forOp.getInductionVar();
                 walk(forS->getBody());
+                ssaIvs_.erase(forS->getIndVar());
               }
             } else if (auto *iss = dyn_cast<KIssueStmt>(s)) {
               std::vector<int64_t> idx;
@@ -1182,8 +1519,8 @@ private:
               const RouteInst *ri = findRouteInst(iss->getRouteName(), idx);
               if (!ri || !ri->conn) continue;
               bool isSource = !iss->getSrcBinding().empty();
-              std::string bind = isSource ? iss->getSrcBinding()
-                                          : iss->getDstBinding();
+              std::string bind =
+                  isSource ? iss->getSrcBinding() : iss->getDstBinding();
               int col = idx.empty() ? 0 : (int)idx[0];
               auto lofIt = ddrLofs_.find(bind + "_" + itos(col));
               if (lofIt == ddrLofs_.end()) continue;
@@ -1197,7 +1534,7 @@ private:
                   b, loc, getTile(bdt.col, bdt.row), bdConst);
               auto toOFR = [&](const std::vector<KExpr *> &es) {
                 SmallVector<OpFoldResult> v;
-                for (auto *e : es) v.push_back(b.getIndexAttr(eval_.evalInt(e)));
+                for (auto *e : es) v.push_back(emitExprOFR(b, loc, e));
                 return v;
               };
               auto offs = toOFR(iss->getOffsets());
@@ -1207,22 +1544,23 @@ private:
               if (isSource) {
                 auto tokTy = AMDAIE::AsyncSourceTokenType::get(&ctx_);
                 tok = AMDAIE::NpuDmaCpyNdOp::create(
-                          b, loc, TypeRange{tokTy}, ri->conn, /*target=*/Value{},
+                          b, loc, TypeRange{tokTy}, ri->conn,
+                          /*target=*/Value{}, ArrayRef<OpFoldResult>{},
                           ArrayRef<OpFoldResult>{}, ArrayRef<OpFoldResult>{},
-                          ArrayRef<OpFoldResult>{}, /*target_bd_id=*/Value{}, ddr,
-                          offs, szs, sts, bdId)
+                          /*target_bd_id=*/Value{}, ddr, offs, szs, sts, bdId)
                           .getResult(0);
               } else {
                 auto tokTy = AMDAIE::AsyncTargetTokenType::get(&ctx_);
-                tok = AMDAIE::NpuDmaCpyNdOp::create(
-                          b, loc, TypeRange{tokTy}, ri->conn, ddr, offs, szs, sts,
-                          bdId, /*source=*/Value{}, ArrayRef<OpFoldResult>{},
-                          ArrayRef<OpFoldResult>{}, ArrayRef<OpFoldResult>{},
-                          /*source_bd_id=*/Value{})
-                          .getResult(0);
+                tok =
+                    AMDAIE::NpuDmaCpyNdOp::create(
+                        b, loc, TypeRange{tokTy}, ri->conn, ddr, offs, szs, sts,
+                        bdId, /*source=*/Value{}, ArrayRef<OpFoldResult>{},
+                        ArrayRef<OpFoldResult>{}, ArrayRef<OpFoldResult>{},
+                        /*source_bd_id=*/Value{})
+                        .getResult(0);
               }
-              outstanding.push_back(
-                  {tok, isSource, iss->getRouteName(), idx.empty() ? 0 : idx[0]});
+              outstanding.push_back({tok, isSource, iss->getRouteName(),
+                                     idx.empty() ? 0 : idx[0]});
             } else if (auto *w = dyn_cast<KWaitStmt>(s)) {
               bool haveLo = w->getIdxLo() != nullptr;
               bool haveHi = w->getIdxHi() != nullptr;
@@ -1238,12 +1576,13 @@ private:
               SmallVector<Value> toks;
               std::vector<Out> rest;
               for (auto &o : outstanding) {
-                if (matches(o)) toks.push_back(o.token);
-                else rest.push_back(o);
+                if (matches(o))
+                  toks.push_back(o.token);
+                else
+                  rest.push_back(o);
               }
               outstanding = std::move(rest);
-              if (!toks.empty())
-                AMDAIE::NpuDmaWaitOp::create(b, loc, toks);
+              if (!toks.empty()) AMDAIE::NpuDmaWaitOp::create(b, loc, toks);
             } else if (isa<KBarrierStmt>(s)) {
               AMDAIE::NpuBarrierOp::create(b, loc);
             }
@@ -1270,6 +1609,9 @@ private:
   ConstExprEvaluator eval_;
   OpBuilder builder_;
   std::map<std::string, int64_t> params_;
+  // Loop induction variables currently bound to an SSA value (rolled scf.for
+  // in the controlcode), as opposed to constexpr values bound in `eval_`.
+  std::map<std::string, Value> ssaIvs_;
 
   const KKernelDecl *k_ = nullptr;
   std::map<CatalogKind, ResolvedCatalogEntry> catalog_;
@@ -1291,7 +1633,7 @@ private:
   std::set<std::string> externFns_;  // declared extern fn names (call targets)
 };
 
-} // namespace
+}  // namespace
 
 std::string emitModule(const KModuleDecl *mod,
                        const std::map<std::string, int64_t> &params,
@@ -1304,11 +1646,12 @@ std::string emitModule(const KModuleDecl *mod,
     // (aie_compile.py --ref) for the wrapped output.
     diag.report(SourceLocation{}, diag::err_expected)
         << "--emit-wrapper is not implemented in the in-tree emitter; emit the "
-           "placed module (no --emit-wrapper) and wrap via aie_compile.py --ref";
+           "placed module (no --emit-wrapper) and wrap via aie_compile.py "
+           "--ref";
     return {};
   }
   OpBuilderEmitter e(params, diag, sourceDir);
   return e.run(mod);
 }
 
-} // namespace aiec
+}  // namespace aiec

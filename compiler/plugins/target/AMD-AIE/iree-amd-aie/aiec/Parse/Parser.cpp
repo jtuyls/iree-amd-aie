@@ -198,7 +198,8 @@ KKernelDecl *Parser::parseKernel() {
       ka.scalarType = tokText();
       advance();
     } else {
-      diag_.report(tokLoc(), diag::err_expected) << "'memref<...>' or scalar type";
+      diag_.report(tokLoc(), diag::err_expected)
+          << "'memref<...>' or scalar type";
       return nullptr;
     }
     kargs.push_back(std::move(ka));
@@ -241,8 +242,10 @@ KKernelDecl *Parser::parseKernel() {
       d = parseCatalog();
     } else if (at(tok::kw_on)) {
       advance();
-      if (at(tok::kw_core)) d = parseOnCore();
-      else if (at(tok::kw_controller)) d = parseOnController();
+      if (at(tok::kw_core))
+        d = parseOnCore();
+      else if (at(tok::kw_controller))
+        d = parseOnController();
       else {
         diag_.report(tokLoc(), diag::err_expected) << "'core' or 'controller'";
         return nullptr;
@@ -269,10 +272,14 @@ KKernelDecl *Parser::parseKernel() {
 KCatalogDecl *Parser::parseCatalog() {
   SourceLocation loc = tokLoc();
   CatalogKind ck;
-  if (consume(tok::kw_shim))         ck = CatalogKind::Shim;
-  else if (consume(tok::kw_memtile)) ck = CatalogKind::Memtile;
-  else if (consume(tok::kw_core))    ck = CatalogKind::Core;
-  else if (consume(tok::kw_controller)) ck = CatalogKind::Controller;
+  if (consume(tok::kw_shim))
+    ck = CatalogKind::Shim;
+  else if (consume(tok::kw_memtile))
+    ck = CatalogKind::Memtile;
+  else if (consume(tok::kw_core))
+    ck = CatalogKind::Core;
+  else if (consume(tok::kw_controller))
+    ck = CatalogKind::Controller;
   else {
     diag_.report(tokLoc(), diag::err_unexpected_token) << tokText();
     return nullptr;
@@ -370,12 +377,23 @@ KBufferDecl *Parser::parseBuffer() {
 
 KPlacement Parser::parsePlacement() {
   KPlacement pl;
-  if (at(tok::kw_shim))         { pl.catalog = "shim"; advance(); }
-  else if (at(tok::kw_memtile)) { pl.catalog = "memtile"; advance(); }
-  else if (at(tok::kw_core))    { pl.catalog = "core"; advance(); }
-  else if (at(tok::kw_controller)) { pl.catalog = "controller"; advance(); return pl; }
-  else if (atIdentLike())       { pl.catalog = tokText(); advance(); }
-  else {
+  if (at(tok::kw_shim)) {
+    pl.catalog = "shim";
+    advance();
+  } else if (at(tok::kw_memtile)) {
+    pl.catalog = "memtile";
+    advance();
+  } else if (at(tok::kw_core)) {
+    pl.catalog = "core";
+    advance();
+  } else if (at(tok::kw_controller)) {
+    pl.catalog = "controller";
+    advance();
+    return pl;
+  } else if (atIdentLike()) {
+    pl.catalog = tokText();
+    advance();
+  } else {
     diag_.report(tokLoc(), diag::err_expected) << "catalog name";
     return pl;
   }
@@ -399,8 +417,8 @@ KPlacement Parser::parsePlacement() {
 
 // ─── route ──────────────────────────────────────────────────────────────
 
-std::optional<KRouteSide>
-Parser::tryParseRouteSide(const std::string &keyword) {
+std::optional<KRouteSide> Parser::tryParseRouteSide(
+    const std::string &keyword) {
   // Expecting: source(buf=NAME[idx], offsets=[...], sizes=[...], strides=[...])
   // OR: target(...)
   // Caller has already verified tok_.rawText() == keyword.
@@ -438,7 +456,8 @@ Parser::tryParseRouteSide(const std::string &keyword) {
       if (!list) return std::nullopt;
       auto *ll = cast<KListLitExpr>(list);
       auto &target = (field == "offsets") ? rs.offsets
-                     : (field == "sizes") ? rs.sizes : rs.strides;
+                     : (field == "sizes") ? rs.sizes
+                                          : rs.strides;
       target = ll->getElements();
     } else {
       diag_.report(tokLoc(), diag::err_unexpected_token) << field;
@@ -495,8 +514,10 @@ KRouteDecl *Parser::parseRoute() {
   }
   if (!expect(tok::colon, "':'")) return nullptr;
   RouteType rt;
-  if (consume(tok::kw_packet)) rt = RouteType::Packet;
-  else if (consume(tok::kw_circuit)) rt = RouteType::Circuit;
+  if (consume(tok::kw_packet))
+    rt = RouteType::Packet;
+  else if (consume(tok::kw_circuit))
+    rt = RouteType::Circuit;
   else {
     diag_.report(tokLoc(), diag::err_expected) << "'packet' or 'circuit'";
     return nullptr;
@@ -512,8 +533,10 @@ KRouteDecl *Parser::parseRoute() {
     }
     std::string p = tokText();
     advance();
-    if (p == "source_parameterized")      param = RouteParameterization::SourceParameterized;
-    else if (p == "target_parameterized") param = RouteParameterization::TargetParameterized;
+    if (p == "source_parameterized")
+      param = RouteParameterization::SourceParameterized;
+    else if (p == "target_parameterized")
+      param = RouteParameterization::TargetParameterized;
     else {
       diag_.report(tokLoc(), diag::err_unexpected_token) << p;
       return nullptr;
@@ -524,8 +547,10 @@ KRouteDecl *Parser::parseRoute() {
   // free).
   std::optional<KRouteSide> src, tgt;
   while (atIdentLike() && (tokText() == "source" || tokText() == "target")) {
-    if (tokText() == "source") src = tryParseRouteSide("source");
-    else                        tgt = tryParseRouteSide("target");
+    if (tokText() == "source")
+      src = tryParseRouteSide("source");
+    else
+      tgt = tryParseRouteSide("target");
   }
 
   if (!expect(tok::kw_via, "'via'")) return nullptr;
@@ -679,7 +704,8 @@ KStmt *Parser::parseStmt() {
       std::string lhsHandle = tokText();
       advance();
       if (lhsHandle != name) {
-        diag_.report(loc, diag::err_unexpected_token) << "expected self-mul pattern";
+        diag_.report(loc, diag::err_unexpected_token)
+            << "expected self-mul pattern";
         return nullptr;
       }
       if (!expect(tok::star, "'*'")) return nullptr;
@@ -767,6 +793,17 @@ KStmt *Parser::parseLetOrAssign() {
   std::string name = tokText();
   advance();
   if (!expect(tok::equal, "'='")) return nullptr;
+  // `let name = base[indices]` — a sub-tile view of an already-acquired buffer
+  // handle (no `acquire`). Lets the 4 micro-tile matmuls write into one
+  // acquired output buffer instead of four separate fifo acquires.
+  if (!at(tok::kw_acquire)) {
+    KExpr *sv = parsePrimary();
+    if (!sv) return nullptr;
+    sv = parsePostfix(sv);
+    if (!sv) return nullptr;
+    return ctx_.create<KLetStmt>(loc, std::move(name), sv, AcquireRole::Produce,
+                                 /*subview=*/true);
+  }
   if (!consume(tok::kw_acquire)) {
     diag_.report(tokLoc(), diag::err_expected) << "'acquire'";
     return nullptr;
@@ -782,8 +819,10 @@ KStmt *Parser::parseLetOrAssign() {
   if (!base) return nullptr;
   if (!expect(tok::comma, "','")) return nullptr;
   AcquireRole role;
-  if (consume(tok::kw_Consume))      role = AcquireRole::Consume;
-  else if (consume(tok::kw_Produce)) role = AcquireRole::Produce;
+  if (consume(tok::kw_Consume))
+    role = AcquireRole::Consume;
+  else if (consume(tok::kw_Produce))
+    role = AcquireRole::Produce;
   else {
     diag_.report(tokLoc(), diag::err_expected) << "'Consume' or 'Produce'";
     return nullptr;
@@ -868,7 +907,8 @@ KIssueStmt *Parser::parseIssue() {
       if (!list) return nullptr;
       auto *ll = cast<KListLitExpr>(list);
       auto &dst = (field == "offsets") ? offsets
-                  : (field == "sizes") ? sizes : strides;
+                  : (field == "sizes") ? sizes
+                                       : strides;
       dst = ll->getElements();
     } else if (field == "bd") {
       bdId = parseExpr();
@@ -944,13 +984,17 @@ KExpr *Parser::parseEquality(bool allowRel) {
 KExpr *Parser::parseRelational(bool allowRel) {
   KExpr *lhs = parseAdditive();
   if (!allowRel) return lhs;
-  while (lhs && (at(tok::l_angle) || at(tok::r_angle) ||
-                 at(tok::lessequal) || at(tok::greaterequal))) {
+  while (lhs && (at(tok::l_angle) || at(tok::r_angle) || at(tok::lessequal) ||
+                 at(tok::greaterequal))) {
     BinOpKind op;
-    if (at(tok::l_angle))            op = BinOpKind::Lt;
-    else if (at(tok::r_angle))       op = BinOpKind::Gt;
-    else if (at(tok::lessequal))     op = BinOpKind::Le;
-    else                              op = BinOpKind::Ge;
+    if (at(tok::l_angle))
+      op = BinOpKind::Lt;
+    else if (at(tok::r_angle))
+      op = BinOpKind::Gt;
+    else if (at(tok::lessequal))
+      op = BinOpKind::Le;
+    else
+      op = BinOpKind::Ge;
     SourceLocation loc = tokLoc();
     advance();
     KExpr *rhs = parseAdditive();
@@ -977,9 +1021,12 @@ KExpr *Parser::parseMultiplicative() {
   KExpr *lhs = parseUnary();
   while (lhs && (at(tok::star) || at(tok::slash) || at(tok::percent))) {
     BinOpKind op;
-    if (at(tok::star))        op = BinOpKind::Mul;
-    else if (at(tok::slash))  op = BinOpKind::Div;
-    else                       op = BinOpKind::Mod;
+    if (at(tok::star))
+      op = BinOpKind::Mul;
+    else if (at(tok::slash))
+      op = BinOpKind::Div;
+    else
+      op = BinOpKind::Mod;
     SourceLocation loc = tokLoc();
     advance();
     KExpr *rhs = parseUnary();
@@ -1082,8 +1129,8 @@ KExpr *Parser::parsePostfix(KExpr *base) {
       if (!expect(tok::l_paren, "'('")) return nullptr;
       std::vector<KExpr *> args = parseCallArgs();
       expect(tok::r_paren, "')'");
-      base = ctx_.create<KCallExpr>(loc, base, std::move(method),
-                                     std::move(args));
+      base =
+          ctx_.create<KCallExpr>(loc, base, std::move(method), std::move(args));
       continue;
     }
     break;
@@ -1102,4 +1149,4 @@ std::vector<KExpr *> Parser::parseCallArgs() {
   return args;
 }
 
-} // namespace aiec
+}  // namespace aiec
