@@ -57,21 +57,31 @@ struct KExternFnArg {
 class KExternFnDecl : public KDecl {
 public:
   KExternFnDecl(SourceLocation loc, std::string name,
-                std::vector<KExternFnArg> args, std::string implPath = {})
+                std::vector<KExternFnArg> args, std::string implPath = {},
+                std::string linkWith = {})
       : KDecl(Kind::ExternFn, loc), name_(std::move(name)),
-        args_(std::move(args)), implPath_(std::move(implPath)) {}
+        args_(std::move(args)), implPath_(std::move(implPath)),
+        linkWith_(std::move(linkWith)) {}
   const std::string &getName() const { return name_; }
   const std::vector<KExternFnArg> &getArgs() const { return args_; }
   // Path (relative to the .aiec) to the MLIR template that implements this
   // function, or empty if none. The frontend emits the template verbatim
   // with placeholder substitution — it has no knowledge of the body.
   const std::string &getImplPath() const { return implPath_; }
+  // Object file (e.g. "matmul.o") for a precompiled bareptr ukernel, or empty.
+  // When set, the fn is emitted as a `func.func private` declaration with the
+  // bareptr ABI (each arg -> (memref<elem, space>, index); link_with attr) and
+  // call sites pass extract_strided_metadata (base, offset) pairs. Used for
+  // bf16/i8 matmul ukernels, which cannot be pure-vectorized.
+  const std::string &getLinkWith() const { return linkWith_; }
+  bool isBareptr() const { return !linkWith_.empty(); }
   static bool classof(const KDecl *d) { return d->getKind() == Kind::ExternFn; }
 
 private:
   std::string name_;
   std::vector<KExternFnArg> args_;
   std::string implPath_;
+  std::string linkWith_;
 };
 
 // Catalog entries: shim [c in 0..COLS] -> tile(c, 0)

@@ -346,11 +346,15 @@ class OpBuilderEmitter {
 
     b.setInsertionPointToEnd(module.getBody());
     // Dispatch export name the splice/wrapper expects: derived from the
-    // output element count (M*N).
+    // output element count (M*N) and the OUTPUT binding dtype, so the minted
+    // wrapper's ref (a dummy `@fused` elementwise) matches for any dtype.
     int64_t mn = (params_.count("M") ? params_["M"] : 0) *
                  (params_.count("N") ? params_["N"] : 0);
+    auto targs = tensorArgs(k);
+    std::string outDtype =
+        targs.empty() ? "i32" : targs.back()->type.elemType;
     auto fn = func::FuncOp::create(
-        b, loc, "fused_dispatch_0_elementwise_" + itos(mn) + "_i32",
+        b, loc, "fused_dispatch_0_elementwise_" + itos(mn) + "_" + outDtype,
         b.getFunctionType({}, {}));
     // Mark as a pre-placed (Custom) dispatch so the lof pipeline runs only
     // the mechanical tail. Parsed (avoids a hard dep on the codegen dialect).
@@ -520,8 +524,32 @@ class OpBuilderEmitter {
   void emitExternFns(const KModuleDecl *mod) {
     for (auto *d : mod->getDecls()) {
       auto *fn = dyn_cast<KExternFnDecl>(d);
-      if (!fn || fn->getImplPath().empty()) continue;
+      if (!fn) continue;
       externFns_.insert(fn->getName());
+      externFnDecls_[fn->getName()] = fn;
+      if (fn->isBareptr()) {
+        // Precompiled bareptr ukernel (bf16/i8 matmul, zero_fill, ...): emit a
+        // `func.func private` declaration with the bareptr ABI — each arg
+        // becomes (memref<elem, space>, index); link_with names the object.
+        OpBuilder &b = builder_;
+        SmallVector<Type> inTys;
+        for (auto &a : fn->getArgs()) {
+          Attribute msAttr = a.type.memSpace
+                                 ? b.getI32IntegerAttr(a.type.memSpace)
+                                 : Attribute{};
+          inTys.push_back(MemRefType::get({}, mlirElemType(a.type.elemType),
+                                          MemRefLayoutAttrInterface{}, msAttr));
+          inTys.push_back(b.getIndexType());
+        }
+        b.setInsertionPointToEnd(module_.getBody());
+        auto f = func::FuncOp::create(b, b.getUnknownLoc(), fn->getName(),
+                                      b.getFunctionType(inTys, {}));
+        f.setPrivate();
+        f->setAttr("link_with", b.getStringAttr(fn->getLinkWith()));
+        f->setAttr("llvm.bareptr", b.getBoolAttr(true));
+        continue;
+      }
+      if (fn->getImplPath().empty()) continue;
       std::string path = sourceDir_.empty()
                              ? fn->getImplPath()
                              : sourceDir_ + "/" + fn->getImplPath();
@@ -585,6 +613,20 @@ class OpBuilderEmitter {
     return t;
   }
 
+  // Map a .aiec element-type string to an MLIR type. The frontend is
+  // dtype-generic: buffers/routes carry their own elemType, threaded through
+  // every memref/vector the emitter synthesizes. (i32 is special only in that
+  // its matmul vectorizes without a ukernel; bf16/i8 need the bareptr ukernel.)
+  Type mlirElemType(StringRef et) {
+    OpBuilder &b = builder_;
+    if (et == "i8") return b.getI8Type();
+    if (et == "i16") return b.getIntegerType(16);
+    if (et == "i32") return b.getI32Type();
+    if (et == "bf16") return b.getBF16Type();
+    if (et == "f32") return b.getF32Type();
+    return b.getI32Type();  // fallback (parser restricts to the set above)
+  }
+
   // The logicalobjectfifo type for a buffer: a FLAT 1-D memref (the DMA
   // slice strides in the .aiec are written against the flattened layout;
   // the compute body reinterpret_casts back to the packed shape on access).
@@ -595,7 +637,7 @@ class OpBuilderEmitter {
     int64_t flat = memrefFlat(ty, eval_);
     Attribute msAttr =
         ty.memSpace ? b.getI32IntegerAttr(ty.memSpace) : Attribute{};
-    auto memrefTy = MemRefType::get({flat}, b.getI32Type(),
+    auto memrefTy = MemRefType::get({flat}, mlirElemType(ty.elemType),
                                     MemRefLayoutAttrInterface{}, msAttr);
     return AMDAIE::LogicalObjectFifoType::get(memrefTy, depth);
   }
@@ -613,8 +655,8 @@ class OpBuilderEmitter {
     for (auto *e : ty.dims) shape.push_back(eval_.evalInt(e));
     Attribute msAttr =
         ty.memSpace ? b.getI32IntegerAttr(ty.memSpace) : Attribute{};
-    return MemRefType::get(shape, b.getI32Type(), MemRefLayoutAttrInterface{},
-                           msAttr);
+    return MemRefType::get(shape, mlirElemType(ty.elemType),
+                           MemRefLayoutAttrInterface{}, msAttr);
   }
 
   // Build, per buffer instance: an allocation + a logicalobjectfifo view on
@@ -630,7 +672,7 @@ class OpBuilderEmitter {
       for (auto *e : ty.dims) shape.push_back(eval_.evalInt(e));
       int ms = ty.memSpace;
       Attribute msAttr = ms ? b.getI32IntegerAttr(ms) : Attribute{};
-      auto memrefTy = MemRefType::get(shape, b.getI32Type(),
+      auto memrefTy = MemRefType::get(shape, mlirElemType(ty.elemType),
                                       MemRefLayoutAttrInterface{}, msAttr);
       Value alloc;
       if (ms == 2) {
@@ -751,7 +793,7 @@ class OpBuilderEmitter {
       if (!bind) continue;
       SmallVector<int64_t> shape;
       for (auto *e : bind->type.dims) shape.push_back(eval_.evalInt(e));
-      auto phMemref = MemRefType::get(shape, b.getI32Type());
+      auto phMemref = MemRefType::get(shape, mlirElemType(bind->type.elemType));
       auto phLofTy = AMDAIE::LogicalObjectFifoType::get(phMemref);
       auto connTy = AMDAIE::ConnectionTypeAttr::get(
           &ctx_, rd->getRouteType() == RouteType::Packet
@@ -974,9 +1016,13 @@ class OpBuilderEmitter {
       SmallVector<int64_t> shape;
       for (auto *e : produceBuf->getType().dims)
         shape.push_back(eval_.evalInt(e));
-      auto vecTy = VectorType::get(shape, b.getI32Type());
+      Type et = mlirElemType(produceBuf->getType().elemType);
+      auto vecTy = VectorType::get(shape, et);
+      Attribute zeroAttr = isa<FloatType>(et)
+                               ? (Attribute)b.getFloatAttr(et, 0.0)
+                               : (Attribute)b.getIntegerAttr(et, 0);
       zeroCst = arith::ConstantOp::create(
-          b, loc, vecTy, DenseElementsAttr::get(vecTy, b.getI32IntegerAttr(0)));
+          b, loc, vecTy, DenseElementsAttr::get(vecTy, zeroAttr));
     }
 
     struct Handle {
@@ -986,6 +1032,11 @@ class OpBuilderEmitter {
       const KMemrefType *type;
     };
     std::map<std::string, Handle> handles;
+    // Objects to link into this core's ELF, aggregated from the bareptr
+    // ukernels it calls. In the placed/lof path the core is hand-emitted (not
+    // built by AMDAIEInsertCores), so the emitter sets link_with directly;
+    // AMDAIELowerToAIE then copies it onto the aie.core.
+    std::set<std::string> coreLinkWith;
 
     std::function<void(const std::vector<KStmt *> &)> walk =
         [&](const std::vector<KStmt *> &body) {
@@ -1093,6 +1144,9 @@ class OpBuilderEmitter {
                     << call->getCallee();
                 continue;
               }
+              auto fdIt = externFnDecls_.find(call->getCallee());
+              bool bareptr =
+                  fdIt != externFnDecls_.end() && fdIt->second->isBareptr();
               SmallVector<Value> args;
               bool ok = true;
               for (auto &a : call->getArgs()) {
@@ -1101,7 +1155,16 @@ class OpBuilderEmitter {
                   ok = false;
                   break;
                 }
-                args.push_back(h->second.mem);
+                if (bareptr) {
+                  // bareptr ABI: pass (base_buffer, offset) per memref arg.
+                  coreLinkWith.insert(fdIt->second->getLinkWith());
+                  auto md = memref::ExtractStridedMetadataOp::create(
+                      b, loc, h->second.mem);
+                  args.push_back(md.getBaseBuffer());
+                  args.push_back(md.getOffset());
+                } else {
+                  args.push_back(h->second.mem);
+                }
               }
               if (!ok) continue;
               func::CallOp::create(b, loc, TypeRange{},
@@ -1115,13 +1178,21 @@ class OpBuilderEmitter {
               auto idMap = AffineMap::getMultiDimIdentityMap(nd, &ctx_);
               SmallVector<utils::IteratorType> iters(
                   nd, utils::IteratorType::parallel);
+              Type et = mlirElemType(it->second.type->elemType);
               linalg::GenericOp::create(
                   b, loc, TypeRange{}, ValueRange{}, ValueRange{it->second.mem},
                   ArrayRef<AffineMap>{idMap}, iters,
                   [&](OpBuilder &nb, Location nloc, ValueRange bbargs) {
-                    Value sc = arith::ConstantOp::create(
-                        nb, nloc, nb.getI32IntegerAttr(scale));
-                    Value m = arith::MulIOp::create(nb, nloc, bbargs[0], sc);
+                    Value m;
+                    if (isa<FloatType>(et)) {
+                      Value sc = arith::ConstantOp::create(
+                          nb, nloc, nb.getFloatAttr(et, (double)scale));
+                      m = arith::MulFOp::create(nb, nloc, bbargs[0], sc);
+                    } else {
+                      Value sc = arith::ConstantOp::create(
+                          nb, nloc, nb.getIntegerAttr(et, scale));
+                      m = arith::MulIOp::create(nb, nloc, bbargs[0], sc);
+                    }
                     linalg::YieldOp::create(nb, nloc, m);
                   });
             } else if (auto *rel = dyn_cast<KReleaseStmt>(s)) {
@@ -1166,6 +1237,10 @@ class OpBuilderEmitter {
     // output-stationary form holds accumulators directly, no forall), foralls,
     // and for-loops are all handled uniformly.
     walk(onCore->getBody());
+    if (!coreLinkWith.empty()) {
+      SmallVector<std::string> objs(coreLinkWith.begin(), coreLinkWith.end());
+      core.setLinkWith(b.getStringAttr(llvm::join(objs, ",")));
+    }
     AMDAIE::EndOp::create(b, loc);
   }
 
@@ -1234,7 +1309,8 @@ class OpBuilderEmitter {
       for (auto *e : a->type.dims) shape.push_back(eval_.evalInt(e));
       int64_t flat = 1;
       for (auto s : shape) flat *= s;
-      auto memTy = MemRefType::get(shape, b.getI32Type());
+      Type elemTy = mlirElemType(a->type.elemType);
+      auto memTy = MemRefType::get(shape, elemTy);
       auto descFlags = rw.count(a->name)
                            ? IREE::HAL::DescriptorFlags::Indirect
                            : (IREE::HAL::DescriptorFlags::ReadOnly |
@@ -1245,7 +1321,7 @@ class OpBuilderEmitter {
           IREE::HAL::DescriptorFlagsAttr::get(&ctx_, descFlags));
       Value aligned = memref::AssumeAlignmentOp::create(b, loc, subspan, 64);
       auto flatLofTy = AMDAIE::LogicalObjectFifoType::get(
-          MemRefType::get({flat}, b.getI32Type()));
+          MemRefType::get({flat}, elemTy));
       for (int c = 0; c < cols_; ++c) {
         SmallVector<Value> tv{shimTileVal(c)};
         Value lof = AMDAIE::LogicalObjectFifoFromMemrefOp::create(
@@ -1631,6 +1707,7 @@ class OpBuilderEmitter {
   std::string sourceDir_;
   ModuleOp module_;
   std::set<std::string> externFns_;  // declared extern fn names (call targets)
+  std::map<std::string, const KExternFnDecl *> externFnDecls_;  // for ABI lookup
 };
 
 }  // namespace

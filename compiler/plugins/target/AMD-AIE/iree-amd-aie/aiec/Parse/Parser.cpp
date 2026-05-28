@@ -125,8 +125,9 @@ KExternFnDecl *Parser::parseExternFn() {
     if (!consume(tok::comma)) break;
   }
   if (!expect(tok::r_paren, "')'")) return nullptr;
-  // Optional `impl "path.mlir"` clause pointing to the function body.
-  std::string implPath;
+  // Optional `impl "path.mlir"` (linalg template, pure-vectorized) OR
+  // `link_with "obj.o"` (precompiled bareptr ukernel, e.g. bf16/i8 matmul).
+  std::string implPath, linkWith;
   if (atIdentLike() && tokText() == "impl") {
     advance();
     if (!at(tok::string_literal)) {
@@ -135,10 +136,19 @@ KExternFnDecl *Parser::parseExternFn() {
     }
     implPath = tokText();
     advance();
+  } else if (atIdentLike() && tokText() == "link_with") {
+    advance();
+    if (!at(tok::string_literal)) {
+      diag_.report(tokLoc(), diag::err_expected)
+          << "object-file string after 'link_with'";
+      return nullptr;
+    }
+    linkWith = tokText();
+    advance();
   }
   consume(tok::semi);
   return ctx_.create<KExternFnDecl>(loc, std::move(name), std::move(args),
-                                    std::move(implPath));
+                                    std::move(implPath), std::move(linkWith));
 }
 
 // ─── kernel ─────────────────────────────────────────────────────────────
