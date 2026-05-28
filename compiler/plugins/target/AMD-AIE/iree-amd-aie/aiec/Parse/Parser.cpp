@@ -706,22 +706,28 @@ KStmt *Parser::parseStmt() {
       return ctx_.create<KCallStmt>(loc, std::move(name), std::move(args));
     }
     if (consume(tok::coloneq)) {
-      // NAME := NAME '*' expr
+      // `NAME := RHS *  expr`  (self-mul scale, RHS must be NAME), or
+      // `NAME := SRC`          (copy/cast SRC -> NAME, dtype convert if differ).
       if (!atIdentLike()) {
         diag_.report(tokLoc(), diag::err_expected) << "handle on RHS";
         return nullptr;
       }
-      std::string lhsHandle = tokText();
+      std::string rhsHandle = tokText();
       advance();
-      if (lhsHandle != name) {
-        diag_.report(loc, diag::err_unexpected_token)
-            << "expected self-mul pattern";
-        return nullptr;
+      if (at(tok::star)) {
+        if (rhsHandle != name) {
+          diag_.report(loc, diag::err_unexpected_token)
+              << "expected self-mul pattern";
+          return nullptr;
+        }
+        advance();  // consume '*'
+        KExpr *rhs = parseExpr();
+        if (!rhs) return nullptr;
+        return ctx_.create<KAssignMulStmt>(loc, std::move(name), rhs);
       }
-      if (!expect(tok::star, "'*'")) return nullptr;
-      KExpr *rhs = parseExpr();
-      if (!rhs) return nullptr;
-      return ctx_.create<KAssignMulStmt>(loc, std::move(name), rhs);
+      // Bare `NAME := SRC` copy/cast.
+      return ctx_.create<KAssignCopyStmt>(loc, std::move(name),
+                                          std::move(rhsHandle));
     }
     diag_.report(loc, diag::err_unexpected_token) << name;
     return nullptr;

@@ -21,6 +21,7 @@ class KStmt {
     Zero,
     Release,
     AssignMul,
+    AssignCopy,
     CallStmt,
     For,
     Issue,
@@ -146,6 +147,26 @@ class KAssignMulStmt : public KStmt {
  private:
   std::string handle_;
   KExpr *rhs_;
+};
+
+// `dst := src`: copy src into dst, converting element type if they differ
+// (f32->bf16 truncf / bf16->f32 extf). Used for the fused chain's f32
+// accumulator -> bf16 intermediate cast before the L1->L2 drain.
+class KAssignCopyStmt : public KStmt {
+ public:
+  KAssignCopyStmt(SourceLocation loc, std::string dst, std::string src)
+      : KStmt(Kind::AssignCopy, loc),
+        dst_(std::move(dst)),
+        src_(std::move(src)) {}
+  const std::string &getDst() const { return dst_; }
+  const std::string &getSrc() const { return src_; }
+  static bool classof(const KStmt *s) {
+    return s->getKind() == Kind::AssignCopy;
+  }
+
+ private:
+  std::string dst_;
+  std::string src_;
 };
 
 class KCallStmt : public KStmt {

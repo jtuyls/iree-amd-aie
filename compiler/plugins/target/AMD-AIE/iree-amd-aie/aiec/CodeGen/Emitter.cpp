@@ -682,6 +682,7 @@ class OpBuilderEmitter {
         else {
           alloc = memref::AllocOp::create(b, loc, memrefTy);
           l1Alloc[bi.decl->getName()] = alloc;
+          l1AllocByName_[bi.decl->getName()] = alloc;
           l1Allocs_.push_back(alloc);
         }
       } else {
@@ -967,16 +968,19 @@ class OpBuilderEmitter {
                    std::set<void *> &segIn) {
           for (auto *s : body) {
             if (auto *l = dyn_cast<KLetStmt>(s)) {
+              if (l->isSubview()) continue;
               bool produce = l->getRole() == AcquireRole::Produce;
               auto port = produce ? AMDAIE::LogicalObjectFifoPort::Produce
                                   : AMDAIE::LogicalObjectFifoPort::Consume;
+              // The first Produce buffer (incl. a routeless local accumulator)
+              // shapes the zero constant — it's what `zero()` writes.
+              if (produce && !produceBuf)
+                produceBuf = findBufferDecl(bufRef(l->getBufRef()));
               Value conn = resolveBufferConn(bufRef(l->getBufRef()), port);
               if (!conn) continue;
               if (produce) {
                 if (outSeen.insert(conn.getAsOpaquePointer()).second)
                   outList.push_back(conn);
-                if (!produceBuf)
-                  produceBuf = findBufferDecl(bufRef(l->getBufRef()));
               } else if (segIn.insert(conn.getAsOpaquePointer()).second) {
                 inList.push_back(conn);
               }
@@ -1089,7 +1093,17 @@ class OpBuilderEmitter {
               auto port = produce ? AMDAIE::LogicalObjectFifoPort::Produce
                                   : AMDAIE::LogicalObjectFifoPort::Consume;
               Value conn = resolveBufferConn(bufRef(l->getBufRef()), port);
-              if (!conn) continue;
+              if (!conn) {
+                // Routeless buffer = a LOCAL accumulator (no DMA fifo): use its
+                // L1 alloc directly. The matmul writes it and a `:=` cast reads
+                // it; acquire/release are no-ops. (Used for the bf16 fused
+                // chain's f32 accumulator, which is cast to bf16 before drain.)
+                auto ait = l1AllocByName_.find(bufRef(l->getBufRef()));
+                if (ait == l1AllocByName_.end()) continue;
+                handles[l->getName()] = {ait->second, Value{}, port,
+                                         &bd->getType()};
+                continue;
+              }
               Value acq = AMDAIE::LogicalObjectFifoAcquire::create(
                   b, loc, lofTypeFor(bd->getType(), bufferDepth(bd)), conn,
                   port);
@@ -1195,9 +1209,38 @@ class OpBuilderEmitter {
                     }
                     linalg::YieldOp::create(nb, nloc, m);
                   });
+            } else if (auto *cp = dyn_cast<KAssignCopyStmt>(s)) {
+              // `dst := src`: elementwise copy with dtype conversion
+              // (f32->bf16 truncf, bf16->f32 extf, else identity copy).
+              auto dit = handles.find(cp->getDst());
+              auto sit = handles.find(cp->getSrc());
+              if (dit == handles.end() || sit == handles.end()) continue;
+              int nd = (int)dit->second.type->dims.size();
+              auto idMap = AffineMap::getMultiDimIdentityMap(nd, &ctx_);
+              SmallVector<utils::IteratorType> iters(
+                  nd, utils::IteratorType::parallel);
+              Type dstEt = mlirElemType(dit->second.type->elemType);
+              Type srcEt = mlirElemType(sit->second.type->elemType);
+              linalg::GenericOp::create(
+                  b, loc, TypeRange{}, ValueRange{sit->second.mem},
+                  ValueRange{dit->second.mem}, ArrayRef<AffineMap>{idMap, idMap},
+                  iters, [&](OpBuilder &nb, Location nloc, ValueRange bb) {
+                    Value v = bb[0];
+                    if (srcEt != dstEt) {
+                      if (isa<FloatType>(srcEt) && isa<FloatType>(dstEt)) {
+                        auto sw = cast<FloatType>(srcEt).getWidth();
+                        auto dw = cast<FloatType>(dstEt).getWidth();
+                        v = sw > dw
+                                ? (Value)arith::TruncFOp::create(nb, nloc, dstEt, v)
+                                : (Value)arith::ExtFOp::create(nb, nloc, dstEt, v);
+                      }
+                    }
+                    linalg::YieldOp::create(nb, nloc, v);
+                  });
             } else if (auto *rel = dyn_cast<KReleaseStmt>(s)) {
               auto it = handles.find(rel->getHandle());
               if (it == handles.end()) continue;
+              if (!it->second.conn) continue;  // local accumulator: no fifo
               AMDAIE::LogicalObjectFifoRelease::create(b, loc, it->second.conn,
                                                        it->second.port);
             } else if (auto *f = dyn_cast<KForallStmt>(s)) {
@@ -1708,6 +1751,7 @@ class OpBuilderEmitter {
   ModuleOp module_;
   std::set<std::string> externFns_;  // declared extern fn names (call targets)
   std::map<std::string, const KExternFnDecl *> externFnDecls_;  // for ABI lookup
+  std::map<std::string, Value> l1AllocByName_;  // L1 allocs (routeless locals)
 };
 
 }  // namespace
