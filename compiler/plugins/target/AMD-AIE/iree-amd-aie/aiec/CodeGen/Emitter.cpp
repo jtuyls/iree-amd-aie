@@ -1006,7 +1006,12 @@ class OpBuilderEmitter {
 
     Tile ct = coreTile(c, r);
     auto tileOp = cast<AMDAIE::TileOp>(getTile(ct.col, ct.row).getDefiningOp());
-    auto core = AMDAIE::CoreOp::create(b, loc, tileOp, inList, outList);
+    auto core = onCore->getStackSize()
+                    ? AMDAIE::CoreOp::create(
+                          b, loc, tileOp, inList, outList,
+                          static_cast<uint32_t>(
+                              eval_.evalInt(onCore->getStackSize())))
+                    : AMDAIE::CoreOp::create(b, loc, tileOp, inList, outList);
     // Build the core body in its own region, then restore the workgroup-body
     // insertion point (so the next core/drain is a sibling, not nested).
     OpBuilder::InsertionGuard coreGuard(b);

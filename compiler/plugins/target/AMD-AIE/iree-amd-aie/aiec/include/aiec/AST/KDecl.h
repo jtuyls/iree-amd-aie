@@ -214,19 +214,21 @@ private:
   KExpr *whenCond_;
 };
 
-// on core[c, r] { ... }
+// on core[c, r] [stack_size=<expr>] { ... }
 class KOnCoreDecl : public KDecl {
 public:
   KOnCoreDecl(SourceLocation loc, std::vector<std::string> indexVars,
-              std::vector<KStmt *> body)
+              KExpr *stackSize, std::vector<KStmt *> body)
       : KDecl(Kind::OnCore, loc), indexVars_(std::move(indexVars)),
-        body_(std::move(body)) {}
+        stackSize_(stackSize), body_(std::move(body)) {}
   const std::vector<std::string> &getIndexVars() const { return indexVars_; }
+  KExpr *getStackSize() const { return stackSize_; }
   const std::vector<KStmt *> &getBody() const { return body_; }
   static bool classof(const KDecl *d) { return d->getKind() == Kind::OnCore; }
 
 private:
   std::vector<std::string> indexVars_;
+  KExpr *stackSize_;
   std::vector<KStmt *> body_;
 };
 

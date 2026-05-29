@@ -596,6 +596,13 @@ KOnCoreDecl *Parser::parseOnCore() {
     }
     if (!expect(tok::r_square, "']'")) return nullptr;
   }
+  KExpr *stackSize = nullptr;
+  if (atIdentLike() && tokText() == "stack_size") {
+    advance();
+    if (!expect(tok::equal, "'='")) return nullptr;
+    stackSize = parseExpr();
+    if (!stackSize) return nullptr;
+  }
   if (!expect(tok::l_brace, "'{'")) return nullptr;
   std::vector<KStmt *> body;
   while (!at(tok::r_brace) && !at(tok::eof)) {
@@ -604,7 +611,8 @@ KOnCoreDecl *Parser::parseOnCore() {
     body.push_back(s);
   }
   if (!expect(tok::r_brace, "'}'")) return nullptr;
-  return ctx_.create<KOnCoreDecl>(loc, std::move(ivs), std::move(body));
+  return ctx_.create<KOnCoreDecl>(loc, std::move(ivs), stackSize,
+                                  std::move(body));
 }
 
 KOnControllerDecl *Parser::parseOnController() {
