@@ -247,7 +247,9 @@ void swiglu_matvec_accum_bf16(int k, int n, const bfloat16 *__restrict gate,
     const float g = bf16_to_f32(gate[kk]);
     const float expNeg = exp_approx_f32(-g);
     const float sigmoid = 1.0f / (1.0f + expNeg);
-    const float xv = g * sigmoid * bf16_to_f32(up[kk]);
+    const float silu = bf16_bits_to_f32(f32_to_bf16_bits(g * sigmoid));
+    const float xv =
+        bf16_bits_to_f32(f32_to_bf16_bits(silu * bf16_to_f32(up[kk])));
     const bfloat16 *__restrict wp = w + kk * n;
     for (int j = 0; j < n; ++j) {
       acc[j] += xv * bf16_to_f32(wp[j]);
@@ -275,7 +277,8 @@ void swiglu_bf16(int len, const bfloat16 *__restrict gate, unsigned offsetGate,
     float g = bf16_to_f32(gate[i]);
     float expNeg = exp_approx_f32(-g);
     float sigmoid = 1.0f / (1.0f + expNeg);
-    store_f32_as_bf16(g * sigmoid * bf16_to_f32(up[i]), out + i);
+    float silu = bf16_bits_to_f32(f32_to_bf16_bits(g * sigmoid));
+    store_f32_as_bf16(silu * bf16_to_f32(up[i]), out + i);
   }
 }
 
