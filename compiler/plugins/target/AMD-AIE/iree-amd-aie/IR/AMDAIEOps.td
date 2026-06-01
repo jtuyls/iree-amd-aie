@@ -449,6 +449,30 @@ def AMDAIE_NpuAddressPatchOp: AMDAIE_Op<"npu.address_patch"> {
   let assemblyFormat = [{ attr-dict }];
 }
 
+def AMDAIE_NpuWrite32Op: AMDAIE_Op<"npu.write32"> {
+  let summary = "Operation to write a 32-bit value through the NPU controller";
+  let description = [{
+    This NPU controller operation writes one 32-bit value to a tile-relative
+    register or memory address. The `address` attribute is relative to the tile
+    selected by `col` and `row`; lowering encodes the physical address with the
+    target device model.
+
+    Example:
+
+    ```mlir
+    amdaie.npu.write32 {address = 126976 : ui32, col = 0 : ui32,
+      row = 2 : ui32, value = 1 : ui32}
+    ```
+  }];
+  let arguments = (
+    ins UI32Attr:$address,
+        UI32Attr:$value,
+        UI32Attr:$col,
+        UI32Attr:$row
+  );
+  let assemblyFormat = [{ attr-dict }];
+}
+
 def AMDAIE_NpuDmaCpyNdOp: AMDAIE_Op<"npu.dma_cpy_nd", [
       AttrSizedOperandSegments, DoublyStridedOpInterface]> {
   let summary = "The Npu uController's dma operator";

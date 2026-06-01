@@ -255,6 +255,73 @@ constexpr uint32_t kAie2ExecBufferKernelOpTxn = 3;
 // npu4 / AIE2P_STRIX_B0 (the only target the chained path is enabled for);
 // other AIE generations may use a different offset / BD address layout.
 constexpr uint64_t kDdrAieAddrOffset = 0x80000000ULL;
+// AIEC RTP lowering emits amdaie.npu.write32 values tagged with this sentinel;
+// the HAL replaces the low bits with the corresponding dispatch constant before
+// handing the transaction to firmware.
+constexpr uint32_t kWrite32ConstantSentinel = 0xA1EC0000u;
+constexpr uint32_t kWrite32ConstantMask = 0xFFFF0000u;
+
+// Size in bytes of one XAie transaction operation starting at byte offset `p`.
+// Returns 0 on malformed/truncated input.
+uint32_t iree_hal_amdxdna_txn_op_size(const uint8_t* b, size_t total,
+                                      size_t p) {
+  if (p >= total) return 0;
+  uint8_t op = b[p];
+  if (op == 0) {  // WRITE32.
+    if (p + 24 > total) return 0;
+    return *reinterpret_cast<const uint32_t*>(b + p + 20);
+  }
+  if (op == 1) {  // BLOCKWRITE.
+    if (p + 16 > total) return 0;
+    return *reinterpret_cast<const uint32_t*>(b + p + 12);
+  }
+  if (op == 3 || op == 4) {
+    if (p + 28 > total) return 0;
+    return *reinterpret_cast<const uint32_t*>(b + p + 24);
+  }
+  if (op >= 128) {  // Custom op.
+    if (p + 8 > total) return 0;
+    return *reinterpret_cast<const uint32_t*>(b + p + 4);
+  }
+  return 4;
+}
+
+iree_status_t iree_hal_amdxdna_patch_write32_constants(
+    uint32_t* txn, size_t txn_words, iree_const_byte_span_t constants) {
+  if (txn_words < 4) return iree_ok_status();
+  uint8_t* b = reinterpret_cast<uint8_t*>(txn);
+  size_t total = txn_words * sizeof(uint32_t);
+  uint32_t num_ops = txn[2];  // TXN header word 2 = NumOps.
+  size_t p = 16;              // Past the 16-byte XAie_TxnHeader.
+  for (uint32_t i = 0; i < num_ops; ++i) {
+    uint32_t sz = iree_hal_amdxdna_txn_op_size(b, total, p);
+    if (sz == 0 || p + sz > total) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "amdxdna write32 RTP patch saw malformed transaction op %u at byte "
+          "offset %zu",
+          i, p);
+    }
+    if (b[p] == 0) {  // WRITE32: patch sentinel values from HAL constants.
+      uint32_t* value = reinterpret_cast<uint32_t*>(b + p + 16);
+      if ((*value & kWrite32ConstantMask) == kWrite32ConstantSentinel) {
+        uint32_t constant_index = *value & ~kWrite32ConstantMask;
+        iree_host_size_t byte_offset =
+            static_cast<iree_host_size_t>(constant_index) * sizeof(uint32_t);
+        if (byte_offset + sizeof(uint32_t) > constants.data_length) {
+          return iree_make_status(
+              IREE_STATUS_INVALID_ARGUMENT,
+              "amdxdna write32 RTP constant index %u out of bounds for "
+              "%zu-byte constants block",
+              constant_index, constants.data_length);
+        }
+        memcpy(value, constants.data + byte_offset, sizeof(uint32_t));
+      }
+    }
+    p += sz;
+  }
+  return iree_ok_status();
+}
 
 // Apply the compiler-emitted host patch table to a copy of the control code.
 // `patches` is a flat list of (offset, arg_idx, arg_plus) triples (produced by
@@ -297,12 +364,15 @@ iree_status_t iree_hal_amdxdna_make_npu_cmd(
     iree_hal_amdxdna_direct_command_buffer* command_buffer,
     shim_xdna::cuidx_t cu_idx, std::vector<uint32_t>& txn,
     const std::vector<uint32_t>& patches, const uint64_t* args,
-    size_t arg_count, iree_hal_amdxdna_chain_cmd* out_cmd) {
+    size_t arg_count, iree_const_byte_span_t constants,
+    iree_hal_amdxdna_chain_cmd* out_cmd) {
   size_t bytes = txn.size() * sizeof(uint32_t);
   out_cmd->ctrl_code = command_buffer->device->shim_device->alloc_bo(
       bytes, XCL_BO_FLAGS_CACHEABLE);
   uint32_t* dst = static_cast<uint32_t*>(out_cmd->ctrl_code->map());
   memcpy(dst, txn.data(), bytes);
+  IREE_RETURN_IF_ERROR(
+      iree_hal_amdxdna_patch_write32_constants(dst, txn.size(), constants));
   if (!iree_hal_amdxdna_apply_patch_table(dst, txn.size(), patches, args,
                                           arg_count)) {
     return iree_make_status(
@@ -329,7 +399,8 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
     iree_hal_buffer_ref_list_t& bindings,
     iree_hal_amdxdna_direct_command_buffer* command_buffer,
     shim_xdna::hw_q* hwq, shim_xdna::cuidx_t cu_idx,
-    iree_hal_amdxdna_kernel_params& kernel_params) {
+    iree_hal_amdxdna_kernel_params& kernel_params,
+    iree_const_byte_span_t constants) {
   IREE_TRACE_ZONE_BEGIN(z0);
 
   // The chained path host-patches I/O addresses using the compiler-emitted
@@ -353,7 +424,12 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
   for (iree_host_size_t j = 0; j < bindings.count; ++j) {
     shim_xdna::bo* bo = iree_hal_amdxdna_buffer_handle(
         iree_hal_buffer_allocated_buffer(bindings.values[j].buffer));
-    binding_addrs[j] = bo->get_paddr();
+    // Match the normal ERT_START_CU path: a binding may reference a subspan of
+    // its allocated root BO, so host-patched DDR addresses must include both
+    // offsets in addition to the BO base address.
+    binding_addrs[j] = bo->get_paddr() +
+                       iree_hal_buffer_byte_offset(bindings.values[j].buffer) +
+                       bindings.values[j].offset;
   }
 
   // Append to the current group, opening a new one when the hw queue changes
@@ -371,7 +447,8 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
     iree_hal_amdxdna_chain_cmd cmd;
     IREE_RETURN_IF_ERROR(iree_hal_amdxdna_make_npu_cmd(
         command_buffer, cu_idx, kernel_params.asm_inst_runlist[run_idx],
-        kernel_params.patch_runlist[run_idx], args, arg_count, &cmd));
+        kernel_params.patch_runlist[run_idx], args, arg_count, constants,
+        &cmd));
     group.cmds.push_back(std::move(cmd));
     return iree_ok_status();
   };
@@ -574,7 +651,7 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_normal_run(
     iree_hal_buffer_ref_list_t& bindings,
     iree_hal_amdxdna_direct_command_buffer* command_buffer,
     shim_xdna::hw_q* hwq, shim_xdna::cuidx_t cu_idx, uint32_t n_kernel_runs,
-    std::vector<uint32_t>& asm_inst) {
+    std::vector<uint32_t>& asm_inst, iree_const_byte_span_t constants) {
   IREE_TRACE_ZONE_BEGIN(z0);
 
   // Check if the kernel should be executed.
@@ -589,6 +666,8 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_normal_run(
       ctrl_code_size, XCL_BO_FLAGS_CACHEABLE);
   uint32_t* instr_buffer = static_cast<uint32_t*>(bo_ctrl_code->map());
   memcpy(instr_buffer, asm_inst.data(), ctrl_code_size);
+  IREE_RETURN_IF_ERROR(iree_hal_amdxdna_patch_write32_constants(
+      instr_buffer, asm_inst.size(), constants));
   bo_ctrl_code->sync(shim_xdna::direction::host2device);
 
   shim_xdna::kernel ebuf(command_buffer->device->shim_device->get_pdev(),
@@ -662,7 +741,7 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_reconfigure(
     iree_hal_amdxdna_direct_command_buffer* command_buffer,
     shim_xdna::hw_q* hwq, shim_xdna::cuidx_t cu_idx,
     uint32_t n_reconfigure_runs, std::vector<uint32_t>& ctrlpkt_inst,
-    std::vector<uint32_t>& ctrlpkt_seq) {
+    std::vector<uint32_t>& ctrlpkt_seq, iree_const_byte_span_t constants) {
   IREE_TRACE_ZONE_BEGIN(z0);
   // Allocate a buffer object to hold the control packet instructions.
   size_t ctrlpkt_inst_size = ctrlpkt_inst.size() * sizeof(uint32_t);
@@ -671,6 +750,8 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_reconfigure(
   uint32_t* ctrlpkt_inst_buffer =
       static_cast<uint32_t*>(bo_ctrlpkt_inst->map());
   memcpy(ctrlpkt_inst_buffer, ctrlpkt_inst.data(), ctrlpkt_inst_size);
+  IREE_RETURN_IF_ERROR(iree_hal_amdxdna_patch_write32_constants(
+      ctrlpkt_inst_buffer, ctrlpkt_inst.size(), constants));
   bo_ctrlpkt_inst->sync(shim_xdna::direction::host2device);
   // Allocate a buffer object to hold the control packet sequence (content).
   size_t ctrlpkt_seq_size = ctrlpkt_seq.size() * sizeof(uint32_t);
@@ -790,7 +871,8 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
     // flushed as one ERT_CMD_CHAIN per hw queue at end().
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
-                bindings, command_buffer, hwq, cu_idx, kernel_params));
+                bindings, command_buffer, hwq, cu_idx, kernel_params,
+                constants));
     IREE_TRACE_ZONE_END(z0);
     return iree_ok_status();
   }
@@ -801,7 +883,7 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
         z0,
         iree_hal_amdxdna_direct_command_buffer_normal_run(
             bindings, command_buffer, hwq, cu_idx, kernel_params.n_kernel_runs,
-            kernel_params.asm_inst_runlist[0]));
+            kernel_params.asm_inst_runlist[0], constants));
   } else {
     for (size_t i = 0; i < num_reconfigurations; i++) {
       // Reconfigure the device.
@@ -809,13 +891,13 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
           z0, iree_hal_amdxdna_direct_command_buffer_reconfigure(
                   command_buffer, hwq, cu_idx, kernel_params.n_reconfigure_runs,
                   kernel_params.asm_inst_runlist[2 * i],
-                  kernel_params.reconf_data_runlist[i]));
+                  kernel_params.reconf_data_runlist[i], constants));
       // Dispatch the new kernel.
       IREE_RETURN_AND_END_ZONE_IF_ERROR(
           z0, iree_hal_amdxdna_direct_command_buffer_normal_run(
                   bindings, command_buffer, hwq, cu_idx,
                   kernel_params.n_kernel_runs,
-                  kernel_params.asm_inst_runlist[2 * i + 1]));
+                  kernel_params.asm_inst_runlist[2 * i + 1], constants));
     }
   }
 

@@ -40,6 +40,25 @@ LogicalResult appendAddressPatch(xilinx::AIEX::NpuAddressPatchOp op,
   return success();
 }
 
+LogicalResult appendWrite32(xilinx::AIEX::NpuWrite32Op op,
+                            TransactionBuilder &transactionBuilder) {
+  if (op.getBuffer()) {
+    return op.emitOpError()
+           << "symbolic buffer-relative write32 lowering is not supported";
+  }
+  std::optional<int32_t> maybeCol = op.getColumn();
+  std::optional<int32_t> maybeRow = op.getRow();
+  if (maybeCol.has_value() != maybeRow.has_value()) {
+    return op.emitOpError()
+           << "expected either both `column` and `row`, or neither";
+  }
+  if (maybeCol && maybeRow) {
+    return transactionBuilder.appendWrite32(*maybeCol, *maybeRow,
+                                            op.getAddress(), op.getValue());
+  }
+  return transactionBuilder.appendWrite32(op.getAddress(), op.getValue());
+}
+
 LogicalResult appendPushToQueue(NpuPushQueueOp op,
                                 TransactionBuilder &transactionBuilder) {
   if (failed(transactionBuilder.appendPushToQueueOp(
@@ -396,10 +415,10 @@ struct AMDAIEDmaToNpuPass : mlir::OperationPass<DeviceOp> {
     if (failed(applyPartialConversion(device, target, std::move(patterns))))
       signalPassFailure();
 
-    // Convert NpuWriteBdOp, NpuAddressPatchOp, NpuPushQueueOp, and NpuSyncOp to
-    // transactions using aie-rt.
+    // Convert NPU control ops to transactions using aie-rt.
     patterns.clear();
     target.addIllegalOp<NpuSyncOp>();
+    target.addIllegalOp<xilinx::AIEX::NpuWrite32Op>();
     target.addIllegalOp<NpuPushQueueOp>();
     target.addIllegalOp<xilinx::AIEX::NpuAddressPatchOp>();
     target.addIllegalOp<xilinx::AIEX::NpuWriteBdOp>();
@@ -412,6 +431,8 @@ struct AMDAIEDmaToNpuPass : mlir::OperationPass<DeviceOp> {
                                              transactionBuilder);
     patterns.insert<ConvertNpuOp<NpuPushQueueOp>>(
         &getContext(), appendPushToQueue, transactionBuilder);
+    patterns.insert<ConvertNpuOp<xilinx::AIEX::NpuWrite32Op>>(
+        &getContext(), appendWrite32, transactionBuilder);
     patterns.insert<ConvertNpuOp<xilinx::AIEX::NpuAddressPatchOp>>(
         &getContext(), appendAddressPatch, transactionBuilder);
     patterns.insert<ConvertNpuOp<xilinx::AIEX::NpuWriteBdOp>>(

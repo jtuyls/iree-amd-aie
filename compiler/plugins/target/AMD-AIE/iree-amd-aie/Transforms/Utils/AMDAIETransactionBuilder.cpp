@@ -152,6 +152,21 @@ LogicalResult TransactionBuilder::appendAddressPatch(uint32_t addr,
   return configureCustomTxnOp(deviceModel, opCode, data, size);
 }
 
+LogicalResult TransactionBuilder::appendWrite32(uint32_t address,
+                                                uint32_t value) {
+  TRY_XAIE_API_LOGICAL_RESULT(XAie_Write32, &deviceModel.devInst, address,
+                              value);
+  return success();
+}
+
+LogicalResult TransactionBuilder::appendWrite32(uint32_t col, uint32_t row,
+                                                uint32_t address,
+                                                uint32_t value) {
+  uint64_t regAddr =
+      XAie_GetTileAddr(&deviceModel.devInst, row, col) + address;
+  return appendWrite32(regAddr, value);
+}
+
 LogicalResult TransactionBuilder::appendLockOp(AMDAIE::LockOp lockOp) {
   auto tile = lockOp.getTile().getDefiningOp<AMDAIE::TileOp>();
   std::optional<int64_t> maybeCol = getConstantIntValue(tile.getCol());

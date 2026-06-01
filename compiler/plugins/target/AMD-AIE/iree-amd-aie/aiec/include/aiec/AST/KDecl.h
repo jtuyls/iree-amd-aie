@@ -49,10 +49,12 @@ struct KMemrefType {
   int memSpace = 0;                 // 0 = DDR, 1 = L2, 2 = L1
 };
 
-// extern fn NAME(arg: memref<...>, ...)
+// extern fn NAME(arg: memref<...>, scalar: i32, ...)
 struct KExternFnArg {
   std::string name;
   KMemrefType type;
+  std::string scalarType;           // empty for memref args
+  bool isScalar() const { return !scalarType.empty(); }
 };
 class KExternFnDecl : public KDecl {
 public:

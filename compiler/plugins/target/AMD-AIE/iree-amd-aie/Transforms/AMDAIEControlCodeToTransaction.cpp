@@ -28,6 +28,15 @@ LogicalResult convertOp(AMDAIE::NpuAddressPatchOp op,
   return success();
 }
 
+LogicalResult convertOp(AMDAIE::NpuWrite32Op op,
+                        TransactionBuilder &builder) {
+  if (failed(builder.appendWrite32(op.getCol(), op.getRow(), op.getAddress(),
+                                   op.getValue()))) {
+    return failure();
+  }
+  return success();
+}
+
 LogicalResult convertOp(AMDAIE::NpuTctSyncOp op, TransactionBuilder &builder) {
   if (failed(builder.appendTCTSync(
           op.getCol(), op.getRow(), static_cast<uint32_t>(op.getDirection()),
@@ -85,9 +94,9 @@ LogicalResult controlCodeToTransaction(IRRewriter &rewriter,
   res = controlCodeOp->walk([&](Operation *op) {
     LogicalResult switchResult =
         TypeSwitch<Operation *, LogicalResult>(op)
-            .Case<AMDAIE::NpuAddressPatchOp, AMDAIE::NpuTctSyncOp,
-                  AMDAIE::NpuPushToQueueOp, AMDAIE::NpuWriteBdOp,
-                  AMDAIE::DMAStartOp>([&](auto npuOp) {
+            .Case<AMDAIE::NpuAddressPatchOp, AMDAIE::NpuWrite32Op,
+                  AMDAIE::NpuTctSyncOp, AMDAIE::NpuPushToQueueOp,
+                  AMDAIE::NpuWriteBdOp, AMDAIE::DMAStartOp>([&](auto npuOp) {
               if (failed(convertOp(npuOp, builder))) return failure();
               toBeErased.push_back(npuOp);
               return success();

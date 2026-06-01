@@ -14,6 +14,7 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -133,8 +134,12 @@ bool stmtRefsName(const KStmt *s, const std::string &name) {
   if (auto *w = dyn_cast<KWaitStmt>(s))
     return exprRefsName(w->getIdxLo(), name) ||
            exprRefsName(w->getIdxHi(), name);
-  // Zero / Release / Call (args are handle names) / Barrier: no iv-bearing
-  // expr.
+  if (auto *call = dyn_cast<KCallStmt>(s)) {
+    for (auto *arg : call->getArgs())
+      if (exprRefsName(arg, name)) return true;
+    return false;
+  }
+  // Zero / Release / Barrier: no iv-bearing expr.
   return false;
 }
 
@@ -160,6 +165,11 @@ bool loopIsSpatial(const std::string &iv, const std::vector<KStmt *> &body) {
         return true;
     } else if (auto *f = dyn_cast<KForStmt>(s)) {
       if (loopIsSpatial(iv, f->getBody())) return true;
+    } else if (auto *call = dyn_cast<KCallStmt>(s)) {
+      // Controller calls such as write32 require constexpr tile coordinates,
+      // so iv-bearing calls must be emitted by unrolling the surrounding loop.
+      for (auto *arg : call->getArgs())
+        if (exprRefsName(arg, iv)) return true;
     }
   }
   return false;
@@ -351,8 +361,7 @@ class OpBuilderEmitter {
     int64_t mn = (params_.count("M") ? params_["M"] : 0) *
                  (params_.count("N") ? params_["N"] : 0);
     auto targs = tensorArgs(k);
-    std::string outDtype =
-        targs.empty() ? "i32" : targs.back()->type.elemType;
+    std::string outDtype = targs.empty() ? "i32" : targs.back()->type.elemType;
     auto fn = func::FuncOp::create(
         b, loc, "fused_dispatch_0_elementwise_" + itos(mn) + "_" + outDtype,
         b.getFunctionType({}, {}));
@@ -529,11 +538,15 @@ class OpBuilderEmitter {
       externFnDecls_[fn->getName()] = fn;
       if (fn->isBareptr()) {
         // Precompiled bareptr ukernel (bf16/i8 matmul, zero_fill, ...): emit a
-        // `func.func private` declaration with the bareptr ABI — each arg
-        // becomes (memref<elem, space>, index); link_with names the object.
+        // `func.func private` declaration with the bareptr ABI. Memref args
+        // become (memref<elem, space>, index); scalar args are passed by value.
         OpBuilder &b = builder_;
         SmallVector<Type> inTys;
         for (auto &a : fn->getArgs()) {
+          if (a.isScalar()) {
+            inTys.push_back(mlirElemType(a.scalarType));
+            continue;
+          }
           Attribute msAttr = a.type.memSpace
                                  ? b.getI32IntegerAttr(a.type.memSpace)
                                  : Attribute{};
@@ -566,6 +579,11 @@ class OpBuilderEmitter {
       std::map<std::string, std::string> subs;
       subs["NAME"] = fn->getName();
       for (size_t i = 0; i < fn->getArgs().size(); ++i) {
+        if (fn->getArgs()[i].isScalar()) {
+          subs["ARG" + itos(i) + "SHAPE"] = fn->getArgs()[i].scalarType;
+          subs["ARG" + itos(i) + "SPACE"] = "";
+          continue;
+        }
         std::string shape;
         for (auto *e : fn->getArgs()[i].type.dims)
           shape += itos(eval_.evalInt(e)) + "x";
@@ -625,6 +643,61 @@ class OpBuilderEmitter {
     if (et == "bf16") return b.getBF16Type();
     if (et == "f32") return b.getF32Type();
     return b.getI32Type();  // fallback (parser restricts to the set above)
+  }
+
+  Value getOrCreateRtpAlloc() {
+    OpBuilder &b = builder_;
+    Location loc = b.getUnknownLoc();
+    if (coreRtpAlloc_) return coreRtpAlloc_;
+    assert(currentCoreBlock_ && "rtp() scalar used outside an AIE core");
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(currentCoreBlock_);
+    auto memrefTy =
+        MemRefType::get({kRtpSlots}, b.getI32Type(),
+                        MemRefLayoutAttrInterface{}, b.getI32IntegerAttr(2));
+    auto alloc = memref::AllocOp::create(b, loc, memrefTy);
+    // The temporary-allocation bufferization pass copies this through to the
+    // AMDAIE buffer op. Controller write32 uses DM_BASE + this byte offset.
+    alloc->setAttr("amdaie.address", b.getI32IntegerAttr(kRtpBufferOffset));
+    coreRtpAlloc_ = alloc.getResult();
+    return coreRtpAlloc_;
+  }
+
+  Value emitRtpLoad(unsigned index) {
+    OpBuilder &b = builder_;
+    Location loc = b.getUnknownLoc();
+    Value alloc = getOrCreateRtpAlloc();
+    Value idx = arith::ConstantIndexOp::create(b, loc, index);
+    return memref::LoadOp::create(b, loc, alloc, idx);
+  }
+
+  Value emitScalarConstant(StringRef ty, const KExpr *expr) {
+    OpBuilder &b = builder_;
+    Location loc = b.getUnknownLoc();
+    if (auto *call = dyn_cast<KCallExpr>(expr)) {
+      if (!call->getReceiver() && call->getCallee() == "rtp" &&
+          call->getArgs().size() == 1) {
+        int64_t index = eval_.evalInt(call->getArgs()[0]);
+        if (index < 0 || index >= kRtpSlots) index = 0;
+        Value value = emitRtpLoad(static_cast<unsigned>(index));
+        if (ty == "i32" || ty == "int") return value;
+        if (ty == "index")
+          return arith::IndexCastOp::create(b, loc, b.getIndexType(), value);
+      }
+    }
+    int64_t value = eval_.evalInt(expr);
+    if (ty == "i8") return arith::ConstantIntOp::create(b, loc, value, 8);
+    if (ty == "i16") return arith::ConstantIntOp::create(b, loc, value, 16);
+    if (ty == "i32" || ty == "int")
+      return arith::ConstantIntOp::create(b, loc, value, 32);
+    if (ty == "f32")
+      return arith::ConstantFloatOp::create(
+          b, loc, b.getF32Type(), llvm::APFloat(static_cast<float>(value)));
+    if (ty == "bf16")
+      return arith::ConstantOp::create(
+          b, loc, b.getBF16Type(),
+          b.getFloatAttr(b.getBF16Type(), static_cast<double>(value)));
+    return arith::ConstantIntOp::create(b, loc, value, 32);
   }
 
   // The logicalobjectfifo type for a buffer: a FLAT 1-D memref (the DMA
@@ -858,6 +931,36 @@ class OpBuilderEmitter {
     return resolveTile(it->second, {(int64_t)c, (int64_t)r}, eval_);
   }
 
+  std::optional<Tile> evalTileRef(const KExpr *expr) {
+    auto catalogKindFromName =
+        [](StringRef name) -> std::optional<CatalogKind> {
+      if (name == "shim") return CatalogKind::Shim;
+      if (name == "memtile") return CatalogKind::Memtile;
+      if (name == "core") return CatalogKind::Core;
+      if (name == "controller") return CatalogKind::Controller;
+      return std::nullopt;
+    };
+
+    std::string name;
+    std::vector<int64_t> indices;
+    if (auto *idx = dyn_cast<KIndexExpr>(expr)) {
+      auto *base = dyn_cast<KIdentExpr>(idx->getBase());
+      if (!base) return std::nullopt;
+      name = base->getName();
+      for (KExpr *e : idx->getIndices()) indices.push_back(eval_.evalInt(e));
+    } else if (auto *id = dyn_cast<KIdentExpr>(expr)) {
+      name = id->getName();
+    } else {
+      return std::nullopt;
+    }
+
+    std::optional<CatalogKind> ck = catalogKindFromName(name);
+    if (!ck) return std::nullopt;
+    auto it = catalog_.find(*ck);
+    if (it == catalog_.end()) return std::nullopt;
+    return resolveTile(it->second, indices, eval_);
+  }
+
   // The persistent route connection feeding/draining a buffer reference in
   // a core body: Produce buffer = a route source, Consume buffer = a route
   // target. Matched by the route's index vars in the current (c,r) scope.
@@ -1006,17 +1109,19 @@ class OpBuilderEmitter {
 
     Tile ct = coreTile(c, r);
     auto tileOp = cast<AMDAIE::TileOp>(getTile(ct.col, ct.row).getDefiningOp());
-    auto core = onCore->getStackSize()
-                    ? AMDAIE::CoreOp::create(
-                          b, loc, tileOp, inList, outList,
-                          static_cast<uint32_t>(
-                              eval_.evalInt(onCore->getStackSize())))
-                    : AMDAIE::CoreOp::create(b, loc, tileOp, inList, outList);
+    auto core =
+        onCore->getStackSize()
+            ? AMDAIE::CoreOp::create(
+                  b, loc, tileOp, inList, outList,
+                  static_cast<uint32_t>(eval_.evalInt(onCore->getStackSize())))
+            : AMDAIE::CoreOp::create(b, loc, tileOp, inList, outList);
     // Build the core body in its own region, then restore the workgroup-body
     // insertion point (so the next core/drain is a sibling, not nested).
     OpBuilder::InsertionGuard coreGuard(b);
     Block *blk = b.createBlock(&core.getRegion());
     b.setInsertionPointToEnd(blk);
+    currentCoreBlock_ = blk;
+    coreRtpAlloc_ = Value();
 
     // One zeroing vector constant at core-block scope (dominates all forall
     // segments), shaped to the produced buffer.
@@ -1168,15 +1273,37 @@ class OpBuilderEmitter {
                   fdIt != externFnDecls_.end() && fdIt->second->isBareptr();
               SmallVector<Value> args;
               bool ok = true;
-              for (auto &a : call->getArgs()) {
-                auto h = handles.find(a);
+              const auto &callArgs = call->getArgs();
+              const KExternFnDecl *fd =
+                  fdIt != externFnDecls_.end() ? fdIt->second : nullptr;
+              if (fd && callArgs.size() != fd->getArgs().size()) {
+                ok = false;
+              }
+              if (bareptr && fd) coreLinkWith.insert(fd->getLinkWith());
+              for (size_t ai = 0; ok && ai < callArgs.size(); ++ai) {
+                KExpr *argExpr = callArgs[ai];
+                const KExternFnArg *formal = fd && ai < fd->getArgs().size()
+                                                 ? &fd->getArgs()[ai]
+                                                 : nullptr;
+                bool scalar = formal && formal->isScalar();
+                if (bareptr && scalar) {
+                  args.push_back(
+                      emitScalarConstant(formal->scalarType, argExpr));
+                  continue;
+                }
+
+                auto *id = dyn_cast<KIdentExpr>(argExpr);
+                if (!id) {
+                  ok = false;
+                  break;
+                }
+                auto h = handles.find(id->getName());
                 if (h == handles.end()) {
                   ok = false;
                   break;
                 }
                 if (bareptr) {
                   // bareptr ABI: pass (base_buffer, offset) per memref arg.
-                  coreLinkWith.insert(fdIt->second->getLinkWith());
                   auto md = memref::ExtractStridedMetadataOp::create(
                       b, loc, h->second.mem);
                   args.push_back(md.getBaseBuffer());
@@ -1228,16 +1355,18 @@ class OpBuilderEmitter {
               Type srcEt = mlirElemType(sit->second.type->elemType);
               linalg::GenericOp::create(
                   b, loc, TypeRange{}, ValueRange{sit->second.mem},
-                  ValueRange{dit->second.mem}, ArrayRef<AffineMap>{idMap, idMap},
-                  iters, [&](OpBuilder &nb, Location nloc, ValueRange bb) {
+                  ValueRange{dit->second.mem},
+                  ArrayRef<AffineMap>{idMap, idMap}, iters,
+                  [&](OpBuilder &nb, Location nloc, ValueRange bb) {
                     Value v = bb[0];
                     if (srcEt != dstEt) {
                       if (isa<FloatType>(srcEt) && isa<FloatType>(dstEt)) {
                         auto sw = cast<FloatType>(srcEt).getWidth();
                         auto dw = cast<FloatType>(dstEt).getWidth();
-                        v = sw > dw
-                                ? (Value)arith::TruncFOp::create(nb, nloc, dstEt, v)
-                                : (Value)arith::ExtFOp::create(nb, nloc, dstEt, v);
+                        v = sw > dw ? (Value)arith::TruncFOp::create(nb, nloc,
+                                                                     dstEt, v)
+                                    : (Value)arith::ExtFOp::create(nb, nloc,
+                                                                   dstEt, v);
                       }
                     }
                     linalg::YieldOp::create(nb, nloc, v);
@@ -1289,7 +1418,10 @@ class OpBuilderEmitter {
       SmallVector<std::string> objs(coreLinkWith.begin(), coreLinkWith.end());
       core.setLinkWith(b.getStringAttr(llvm::join(objs, ",")));
     }
+    if (coreRtpAlloc_) memref::DeallocOp::create(b, loc, coreRtpAlloc_);
     AMDAIE::EndOp::create(b, loc);
+    currentCoreBlock_ = nullptr;
+    coreRtpAlloc_ = Value();
   }
 
   // Tensor (non-scalar) kernel args, in source order.
@@ -1368,8 +1500,8 @@ class OpBuilderEmitter {
           /*dynamic_dims=*/ValueRange{}, b.getIndexAttr(64),
           IREE::HAL::DescriptorFlagsAttr::get(&ctx_, descFlags));
       Value aligned = memref::AssumeAlignmentOp::create(b, loc, subspan, 64);
-      auto flatLofTy = AMDAIE::LogicalObjectFifoType::get(
-          MemRefType::get({flat}, elemTy));
+      auto flatLofTy =
+          AMDAIE::LogicalObjectFifoType::get(MemRefType::get({flat}, elemTy));
       for (int c = 0; c < cols_; ++c) {
         SmallVector<Value> tv{shimTileVal(c)};
         Value lof = AMDAIE::LogicalObjectFifoFromMemrefOp::create(
@@ -1685,6 +1817,62 @@ class OpBuilderEmitter {
               }
               outstanding.push_back({tok, isSource, iss->getRouteName(),
                                      idx.empty() ? 0 : idx[0]});
+            } else if (auto *call = dyn_cast<KCallStmt>(s)) {
+              if (call->getCallee() != "write32" &&
+                  call->getCallee() != "write_rtp")
+                continue;
+              const auto &args = call->getArgs();
+              uint32_t col = 0;
+              uint32_t row = 0;
+              uint32_t address = 0;
+              uint32_t value = 0;
+              if (call->getCallee() == "write_rtp") {
+                uint32_t index = 0;
+                if (args.size() == 2) {
+                  std::optional<Tile> tile = evalTileRef(args[0]);
+                  if (!tile) {
+                    diag_.report(call->getLocation(), diag::err_expected)
+                        << "tile reference";
+                    continue;
+                  }
+                  col = static_cast<uint32_t>(tile->col);
+                  row = static_cast<uint32_t>(tile->row);
+                  index = static_cast<uint32_t>(eval_.evalInt(args[1]));
+                } else if (args.size() == 3) {
+                  col = static_cast<uint32_t>(eval_.evalInt(args[0]));
+                  row = static_cast<uint32_t>(eval_.evalInt(args[1]));
+                  index = static_cast<uint32_t>(eval_.evalInt(args[2]));
+                } else {
+                  diag_.report(call->getLocation(), diag::err_expected)
+                      << "write_rtp(tile, index) or "
+                         "write_rtp(col, row, index)";
+                  continue;
+                }
+                address = static_cast<uint32_t>(kRtpBufferOffset);
+                value = kRtpConstantSentinel + index;
+              } else if (args.size() == 3) {
+                std::optional<Tile> tile = evalTileRef(args[0]);
+                if (!tile) {
+                  diag_.report(call->getLocation(), diag::err_expected)
+                      << "tile reference";
+                  continue;
+                }
+                col = static_cast<uint32_t>(tile->col);
+                row = static_cast<uint32_t>(tile->row);
+                address = static_cast<uint32_t>(eval_.evalInt(args[1]));
+                value = static_cast<uint32_t>(eval_.evalInt(args[2]));
+              } else if (args.size() == 4) {
+                col = static_cast<uint32_t>(eval_.evalInt(args[0]));
+                row = static_cast<uint32_t>(eval_.evalInt(args[1]));
+                address = static_cast<uint32_t>(eval_.evalInt(args[2]));
+                value = static_cast<uint32_t>(eval_.evalInt(args[3]));
+              } else {
+                diag_.report(call->getLocation(), diag::err_expected)
+                    << "write32(tile, address, value) or "
+                       "write32(col, row, address, value)";
+                continue;
+              }
+              AMDAIE::NpuWrite32Op::create(b, loc, address, value, col, row);
             } else if (auto *w = dyn_cast<KWaitStmt>(s)) {
               bool haveLo = w->getIdxLo() != nullptr;
               bool haveHi = w->getIdxHi() != nullptr;
@@ -1750,12 +1938,18 @@ class OpBuilderEmitter {
   // Control-packet overlay connections, kept for the controlcode placeholders.
   std::vector<Value> ctrlShConns_, ctrlMtConns_, southConns_;
   Value ctrlCoConn_;
+  static constexpr int64_t kRtpSlots = 16;
+  static constexpr int64_t kRtpBufferOffset = 4096;
+  static constexpr uint32_t kRtpConstantSentinel = 0xA1EC0000u;
+  Block *currentCoreBlock_ = nullptr;
+  Value coreRtpAlloc_;
   // Buffer allocations to free at workgroup end (L1 shared, then L2 per inst).
   std::vector<Value> l1Allocs_, l2Allocs_;
   std::string sourceDir_;
   ModuleOp module_;
   std::set<std::string> externFns_;  // declared extern fn names (call targets)
-  std::map<std::string, const KExternFnDecl *> externFnDecls_;  // for ABI lookup
+  std::map<std::string, const KExternFnDecl *>
+      externFnDecls_;                           // for ABI lookup
   std::map<std::string, Value> l1AllocByName_;  // L1 allocs (routeless locals)
 };
 

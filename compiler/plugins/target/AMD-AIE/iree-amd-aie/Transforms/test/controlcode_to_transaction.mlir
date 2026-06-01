@@ -71,6 +71,33 @@ module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} 
 // CHECK:       0x00000104
 // CHECK:       0x00000001
 // CHECK:       0x00000028
+// CHECK:       0x00000200
+// CHECK:       0x00000000
+// CHECK:       0x0221F000
+// CHECK:       0x00000000
+// CHECK:       0x12345678
+// CHECK:       0x00000018
+// CHECK-LABEL: @write32
+// CHECK:       npu_instructions = dense_resource<npu_instructions> : tensor<10xui32>
+#executable_target_amdaie_xclbin_fb = #hal.executable.target<"amd-aie", "amdaie-xclbin-fb", {target_device = "npu1_4col", ukernels = "none"}>
+module attributes {hal.executable.target = #executable_target_amdaie_xclbin_fb} {
+  func.func @write32() {
+    amdaie.workgroup {
+      amdaie.controlcode {
+        amdaie.npu.write32 {address = 126976 : ui32, col = 1 : ui32, row = 2 : ui32, value = 305419896 : ui32}
+        amdaie.end
+      }
+    }
+    return
+  }
+}
+
+// -----
+
+// CHECK:       0x06030100
+// CHECK:       0x00000104
+// CHECK:       0x00000001
+// CHECK:       0x00000028
 // CHECK:       0x00140000
 // CHECK:       0x00000000
 // CHECK:       0x0001D214

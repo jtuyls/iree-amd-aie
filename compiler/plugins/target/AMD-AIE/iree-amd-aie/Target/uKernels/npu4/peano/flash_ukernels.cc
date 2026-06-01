@@ -13,37 +13,27 @@
 
 constexpr int D = 64;
 constexpr int SKV_T = 64;
-constexpr float SCALE = 0.18033688011112042f; // log2(e) / sqrt(64)
+constexpr float SCALE = 0.18033688011112042f;  // log2(e) / sqrt(64)
+constexpr float LN2 = 0.6931471805599453f;
 constexpr float NEG_INF = -3.0e38f;
+constexpr float TAIL_MARKER_BASE = 128.0f;
 
 static inline bfloat16 exp2_scalar_bf16(float x) {
   // Coarse branch-only exp2 approximation in log2 domain. This keeps Peano
   // away from libm/aie_api/native-exp2 while the shifted vector exp path is
   // isolated. Good enough for single-tile dataflow probes, not final softmax.
-  if (x < -8.0f)
-    return (bfloat16)0.00390625f;
-  if (x < -7.0f)
-    return (bfloat16)0.0078125f;
-  if (x < -6.0f)
-    return (bfloat16)0.015625f;
-  if (x < -5.0f)
-    return (bfloat16)0.03125f;
-  if (x < -4.0f)
-    return (bfloat16)0.0625f;
-  if (x < -3.0f)
-    return (bfloat16)0.125f;
-  if (x < -2.0f)
-    return (bfloat16)0.25f;
-  if (x < -1.0f)
-    return (bfloat16)0.5f;
-  if (x < -0.5f)
-    return (bfloat16)0.7071067811865476f;
-  if (x < -0.25f)
-    return (bfloat16)0.8408964152537145f;
-  if (x < -0.125f)
-    return (bfloat16)0.9170040432046712f;
-  if (x < -0.0625f)
-    return (bfloat16)0.9576032806985737f;
+  if (x < -8.0f) return (bfloat16)0.00390625f;
+  if (x < -7.0f) return (bfloat16)0.0078125f;
+  if (x < -6.0f) return (bfloat16)0.015625f;
+  if (x < -5.0f) return (bfloat16)0.03125f;
+  if (x < -4.0f) return (bfloat16)0.0625f;
+  if (x < -3.0f) return (bfloat16)0.125f;
+  if (x < -2.0f) return (bfloat16)0.25f;
+  if (x < -1.0f) return (bfloat16)0.5f;
+  if (x < -0.5f) return (bfloat16)0.7071067811865476f;
+  if (x < -0.25f) return (bfloat16)0.8408964152537145f;
+  if (x < -0.125f) return (bfloat16)0.9170040432046712f;
+  if (x < -0.0625f) return (bfloat16)0.9576032806985737f;
   return (bfloat16)1.0f;
 }
 
@@ -71,6 +61,48 @@ static inline float bf16_to_f32(bfloat16 x) {
   return bf16_bits_to_f32(*(uint16_t *)&x);
 }
 
+static inline float pow2_int_f32(int n) {
+  if (n < -126) return 0.0f;
+  if (n > 127) n = 127;
+  union {
+    uint32_t u;
+    float f;
+  } v;
+  v.u = (uint32_t)(n + 127) << 23;
+  return v.f;
+}
+
+static inline float exp_approx_f32(float x) {
+  constexpr float LOG2E = 1.4426950408889634f;
+  constexpr float LN2 = 0.6931471805599453f;
+
+  // Range reduce into approximately [-ln(2)/2, ln(2)/2] without libm. The
+  // polynomial is only used for SwiGLU bring-up; the vector exp2 path remains
+  // the performance target once the full fused path is numerically
+  // characterized.
+  float nf = x * LOG2E;
+  int n = (int)(nf + (nf >= 0.0f ? 0.5f : -0.5f));
+  float r = x - (float)n * LN2;
+  float r2 = r * r;
+  float r3 = r2 * r;
+  float r4 = r2 * r2;
+  float r5 = r4 * r;
+  float e = 1.0f + r + 0.5f * r2 + 0.16666666666666666f * r3 +
+            0.041666666666666664f * r4 + 0.008333333333333333f * r5;
+  return e * pow2_int_f32(n);
+}
+
+static inline float exp_nonpos_approx_f32(float x) {
+  if (x != x) return 0.0f;
+  if (x >= 0.0f) return 1.0f;
+  if (x < -20.0f) return 0.0f;
+  return exp_approx_f32(x);
+}
+
+static inline void store_f32_as_bf16(float x, bfloat16 *out) {
+  *(uint16_t *)out = f32_to_bf16_bits(x);
+}
+
 static inline void accumulate_pv_bf16(bfloat16 p, const bfloat16 *__restrict vp,
                                       float *__restrict o) {
   v32bfloat16 pvec = broadcast_to_v32bfloat16(p);
@@ -87,8 +119,7 @@ static inline void accumulate_pv_bf16(bfloat16 p, const bfloat16 *__restrict vp,
 }
 
 static inline void exp2_shifted_block_bf16(const bfloat16 *__restrict s,
-                                           bfloat16 m,
-                                           bfloat16 *__restrict p) {
+                                           bfloat16 m, bfloat16 *__restrict p) {
   v32bfloat16 sv = *(const v32bfloat16 *)(s);
   v32bfloat16 mv = broadcast_to_v32bfloat16(m);
   v32accfloat shifted = sub(ups(sv), ups(mv));
@@ -125,6 +156,148 @@ void copy_vec_bf16(const bfloat16 *__restrict in, unsigned offsetIn,
   out += offsetOut;
   for (int d = 0; d < D; ++d) {
     out[d] = in[d];
+  }
+}
+
+void add_rmsnorm_prepare_bf16(int len, const bfloat16 *__restrict x,
+                              unsigned offsetX,
+                              const bfloat16 *__restrict residual,
+                              unsigned offsetResidual, float *__restrict tmp,
+                              unsigned offsetTmp, float *__restrict inv,
+                              unsigned offsetInv) {
+  x += offsetX;
+  residual += offsetResidual;
+  tmp += offsetTmp;
+  inv += offsetInv;
+
+  float sumSq = 0.0f;
+  for (int i = 0; i < len; ++i) {
+    float v = bf16_to_f32(x[i]) + bf16_to_f32(residual[i]);
+    tmp[i] = v;
+    sumSq += v * v;
+  }
+  inv[0] = invsqrt(sumSq / (float)len + 1.0e-5f);
+}
+
+void add_rmsnorm_prepare_residual_bf16(
+    int len, const bfloat16 *__restrict x, unsigned offsetX,
+    const bfloat16 *__restrict residual, unsigned offsetResidual,
+    float *__restrict tmp, unsigned offsetTmp, float *__restrict inv,
+    unsigned offsetInv, bfloat16 *__restrict hidden, unsigned offsetHidden) {
+  x += offsetX;
+  residual += offsetResidual;
+  tmp += offsetTmp;
+  inv += offsetInv;
+  hidden += offsetHidden;
+
+  float sumSq = 0.0f;
+  for (int i = 0; i < len; ++i) {
+    float v = bf16_to_f32(x[i]) + bf16_to_f32(residual[i]);
+    tmp[i] = v;
+    store_f32_as_bf16(v, hidden + i);
+    sumSq += v * v;
+  }
+  inv[0] = invsqrt(sumSq / (float)len + 1.0e-5f);
+}
+
+void rmsnorm_scale_bf16(int len, const float *__restrict tmp,
+                        unsigned offsetTmp, const bfloat16 *__restrict weight,
+                        unsigned offsetWeight, const float *__restrict inv,
+                        unsigned offsetInv, bfloat16 *__restrict out,
+                        unsigned offsetOut) {
+  tmp += offsetTmp;
+  weight += offsetWeight;
+  inv += offsetInv;
+  out += offsetOut;
+
+  const float s = inv[0];
+  for (int i = 0; i < len; ++i) {
+    store_f32_as_bf16(tmp[i] * s * bf16_to_f32(weight[i]), out + i);
+  }
+}
+
+void matvec_accum_bf16(int k, int n, const bfloat16 *__restrict x,
+                       unsigned offsetX, const bfloat16 *__restrict w,
+                       unsigned offsetW, float *__restrict acc,
+                       unsigned offsetAcc) {
+  x += offsetX;
+  w += offsetW;
+  acc += offsetAcc;
+
+  for (int kk = 0; kk < k; ++kk) {
+    const float xv = bf16_to_f32(x[kk]);
+    const bfloat16 *__restrict wp = w + kk * n;
+    for (int j = 0; j < n; ++j) {
+      acc[j] += xv * bf16_to_f32(wp[j]);
+    }
+  }
+}
+
+void swiglu_matvec_accum_bf16(int k, int n, const bfloat16 *__restrict gate,
+                              unsigned offsetGate,
+                              const bfloat16 *__restrict up, unsigned offsetUp,
+                              const bfloat16 *__restrict w, unsigned offsetW,
+                              float *__restrict acc, unsigned offsetAcc) {
+  gate += offsetGate;
+  up += offsetUp;
+  w += offsetW;
+  acc += offsetAcc;
+
+  for (int kk = 0; kk < k; ++kk) {
+    const float g = bf16_to_f32(gate[kk]);
+    const float expNeg = exp_approx_f32(-g);
+    const float sigmoid = 1.0f / (1.0f + expNeg);
+    const float xv = g * sigmoid * bf16_to_f32(up[kk]);
+    const bfloat16 *__restrict wp = w + kk * n;
+    for (int j = 0; j < n; ++j) {
+      acc[j] += xv * bf16_to_f32(wp[j]);
+    }
+  }
+}
+
+void matvec_store_bf16(int n, const float *__restrict acc, unsigned offsetAcc,
+                       bfloat16 *__restrict out, unsigned offsetOut) {
+  acc += offsetAcc;
+  out += offsetOut;
+  for (int j = 0; j < n; ++j) {
+    store_f32_as_bf16(acc[j], out + j);
+  }
+}
+
+void swiglu_bf16(int len, const bfloat16 *__restrict gate, unsigned offsetGate,
+                 const bfloat16 *__restrict up, unsigned offsetUp,
+                 bfloat16 *__restrict out, unsigned offsetOut) {
+  gate += offsetGate;
+  up += offsetUp;
+  out += offsetOut;
+
+  for (int i = 0; i < len; ++i) {
+    float g = bf16_to_f32(gate[i]);
+    float expNeg = exp_approx_f32(-g);
+    float sigmoid = 1.0f / (1.0f + expNeg);
+    store_f32_as_bf16(g * sigmoid * bf16_to_f32(up[i]), out + i);
+  }
+}
+
+void rope_rotate_half_bf16(int len, const bfloat16 *__restrict x,
+                           unsigned offsetX, const bfloat16 *__restrict lut,
+                           unsigned offsetLut, bfloat16 *__restrict out,
+                           unsigned offsetOut) {
+  x += offsetX;
+  lut += offsetLut;
+  out += offsetOut;
+
+  const int half = len >> 1;
+  const bfloat16 *__restrict cosv = lut;
+  const bfloat16 *__restrict sinv = lut + len;
+  for (int i = 0; i < half; ++i) {
+    const int j = i + half;
+    const float x0 = bf16_to_f32(x[i]);
+    const float x1 = bf16_to_f32(x[j]);
+    store_f32_as_bf16(x0 * bf16_to_f32(cosv[i]) - x1 * bf16_to_f32(sinv[i]),
+                      out + i);
+    store_f32_as_bf16(x1 * bf16_to_f32(cosv[j]) + x0 * bf16_to_f32(sinv[j]),
+                      out + j);
   }
 }
 
@@ -172,12 +345,12 @@ void attn_qk_bf16(const bfloat16 *__restrict q, unsigned offsetQ,
   }
 }
 
-void flash_update_bf16(const bfloat16 *__restrict s, unsigned offsetS,
-                       const bfloat16 *__restrict v, unsigned offsetV,
-                       bfloat16 *__restrict pbuf, unsigned offsetP,
-                       float *__restrict m, unsigned offsetM,
-                       float *__restrict l, unsigned offsetL,
-                       float *__restrict o, unsigned offsetO) {
+static inline void flash_update_lanes_bf16(
+    int lanes, const bfloat16 *__restrict s, unsigned offsetS,
+    const bfloat16 *__restrict v, unsigned offsetV, bfloat16 *__restrict pbuf,
+    unsigned offsetP, float *__restrict m, unsigned offsetM,
+    float *__restrict l, unsigned offsetL, float *__restrict o,
+    unsigned offsetO) {
   s += offsetS;
   v += offsetV;
   pbuf += offsetP;
@@ -185,37 +358,90 @@ void flash_update_bf16(const bfloat16 *__restrict s, unsigned offsetS,
   l += offsetL;
   o += offsetO;
 
+  if (lanes < 0) lanes = 0;
+  if (lanes > SKV_T) lanes = SKV_T;
+
   float tmax = NEG_INF;
-  for (int j = 0; j < SKV_T; ++j) {
-    tmax = tmax > bf16_to_f32(s[j]) ? tmax : bf16_to_f32(s[j]);
+  for (int j = 0; j < lanes; ++j) {
+    float sj = bf16_to_f32(s[j]);
+    if (sj == sj) tmax = tmax > sj ? tmax : sj;
   }
 
   float m_old = m[0];
+  if (m_old != m_old) m_old = NEG_INF;
   float m_new = m_old > tmax ? m_old : tmax;
   float corr = 1.0f;
   if (m_old == NEG_INF)
     corr = 0.0f;
   else
-    corr = bf16_to_f32(exp2_scalar_bf16(m_old - m_new));
+    corr = exp_nonpos_approx_f32((m_old - m_new) * LN2);
 
   for (int d = 0; d < D; ++d) {
     o[d] *= corr;
   }
 
-  bfloat16 m_new_bf16 = (bfloat16)m_new;
-  exp2_shifted_block_bf16(s, m_new_bf16, pbuf);
-  exp2_shifted_block_bf16(s + 32, m_new_bf16, pbuf + 32);
-
   float lsum = l[0] * corr;
-  for (int j = 0; j < SKV_T; ++j) {
-    bfloat16 p = pbuf[j];
-    lsum += bf16_to_f32(p);
+  for (int j = 0; j < lanes; ++j) {
+    float p = exp_nonpos_approx_f32((bf16_to_f32(s[j]) - m_new) * LN2);
+    bfloat16 pbf;
+    uint16_t pBits = f32_to_bf16_bits(p);
+    *(uint16_t *)&pbf = pBits;
+    *(uint16_t *)(pbuf + j) = pBits;
+    lsum += bf16_to_f32(pbf);
     const bfloat16 *__restrict vp = v + j * D;
-    accumulate_pv_bf16(p, vp, o);
+    accumulate_pv_bf16(pbf, vp, o);
   }
 
   m[0] = m_new;
   l[0] = lsum;
+}
+
+void flash_update_bf16(const bfloat16 *__restrict s, unsigned offsetS,
+                       const bfloat16 *__restrict v, unsigned offsetV,
+                       bfloat16 *__restrict pbuf, unsigned offsetP,
+                       float *__restrict m, unsigned offsetM,
+                       float *__restrict l, unsigned offsetL,
+                       float *__restrict o, unsigned offsetO) {
+  flash_update_lanes_bf16(SKV_T, s, offsetS, v, offsetV, pbuf, offsetP, m,
+                          offsetM, l, offsetL, o, offsetO);
+}
+
+void flash_update_tail_bf16(int lanes, const bfloat16 *__restrict s,
+                            unsigned offsetS, const bfloat16 *__restrict v,
+                            unsigned offsetV, bfloat16 *__restrict pbuf,
+                            unsigned offsetP, float *__restrict m,
+                            unsigned offsetM, float *__restrict l,
+                            unsigned offsetL, float *__restrict o,
+                            unsigned offsetO) {
+  flash_update_lanes_bf16(lanes, s, offsetS, v, offsetV, pbuf, offsetP, m,
+                          offsetM, l, offsetL, o, offsetO);
+}
+
+void flash_update_seq_bf16(int seqLen, int tileStart,
+                           const bfloat16 *__restrict s, unsigned offsetS,
+                           const bfloat16 *__restrict v, unsigned offsetV,
+                           bfloat16 *__restrict pbuf, unsigned offsetP,
+                           float *__restrict m, unsigned offsetM,
+                           float *__restrict l, unsigned offsetL,
+                           float *__restrict o, unsigned offsetO) {
+  flash_update_lanes_bf16(seqLen - tileStart, s, offsetS, v, offsetV, pbuf,
+                          offsetP, m, offsetM, l, offsetL, o, offsetO);
+}
+
+void flash_update_tail_marker_bf16(const bfloat16 *__restrict s,
+                                   unsigned offsetS,
+                                   const bfloat16 *__restrict v,
+                                   unsigned offsetV, bfloat16 *__restrict pbuf,
+                                   unsigned offsetP, float *__restrict m,
+                                   unsigned offsetM, float *__restrict l,
+                                   unsigned offsetL, float *__restrict o,
+                                   unsigned offsetO) {
+  int lanes = SKV_T;
+  float marker = bf16_to_f32(v[offsetV + (SKV_T - 1) * D]);
+  int encoded = (int)(marker - TAIL_MARKER_BASE);
+  if (encoded >= 0 && encoded < SKV_T) lanes = encoded;
+  flash_update_lanes_bf16(lanes, s, offsetS, v, offsetV, pbuf, offsetP, m,
+                          offsetM, l, offsetL, o, offsetO);
 }
 
 void flash_update_mean_bf16(const bfloat16 *__restrict s, unsigned offsetS,
@@ -254,6 +480,20 @@ void flash_finalize_bf16(const float *__restrict o, unsigned offsetO,
   for (int d = 0; d < D; ++d) {
     rawOut[d] = f32_to_bf16_bits(o[d] * inv);
   }
+}
+
+void rtp_fill_bf16(int value, bfloat16 *__restrict out, unsigned offsetOut) {
+  out += offsetOut;
+  uint16_t *__restrict rawOut = (uint16_t *)out;
+  uint16_t v = f32_to_bf16_bits((float)value);
+  for (int i = 0; i < 64; ++i) rawOut[i] = v;
+}
+
+void fill7_bf16(bfloat16 *__restrict out, unsigned offsetOut) {
+  out += offsetOut;
+  uint16_t *__restrict rawOut = (uint16_t *)out;
+  uint16_t v = 0x40e0;
+  for (int i = 0; i < 64; ++i) rawOut[i] = v;
 }
 
 }  // extern "C"

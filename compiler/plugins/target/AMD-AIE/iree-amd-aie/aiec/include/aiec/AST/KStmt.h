@@ -172,17 +172,17 @@ class KAssignCopyStmt : public KStmt {
 class KCallStmt : public KStmt {
  public:
   KCallStmt(SourceLocation loc, std::string callee,
-            std::vector<std::string> args)
+            std::vector<KExpr *> args)
       : KStmt(Kind::CallStmt, loc),
         callee_(std::move(callee)),
         args_(std::move(args)) {}
   const std::string &getCallee() const { return callee_; }
-  const std::vector<std::string> &getArgs() const { return args_; }
+  const std::vector<KExpr *> &getArgs() const { return args_; }
   static bool classof(const KStmt *s) { return s->getKind() == Kind::CallStmt; }
 
  private:
   std::string callee_;
-  std::vector<std::string> args_;
+  std::vector<KExpr *> args_;
 };
 
 class KForStmt : public KStmt {

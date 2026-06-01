@@ -26,10 +26,13 @@ LogicalResult bufferizeTemporaryMemrefs(Operation *parentOp) {
         Key key{allocOp, coreOp, workgroupOp};
         if (bufferMap.count(key) == 0) {
           rewriter.setInsertionPointAfter(tileOp);
+          auto address = dyn_cast_if_present<IntegerAttr>(
+              allocOp->getAttr("amdaie.address"));
+          auto memBank = dyn_cast_if_present<IntegerAttr>(
+              allocOp->getAttr("amdaie.mem_bank"));
           auto bufferOp = rewriter.create<BufferOp>(
               allocOp.getLoc(), allocOp.getType(), tileOp,
-              /* sym_name */ nullptr, /* address */ nullptr,
-              /* mem_bank */ nullptr);
+              /* sym_name */ nullptr, address, memBank);
           bufferMap[key] = bufferOp;
         }
       }

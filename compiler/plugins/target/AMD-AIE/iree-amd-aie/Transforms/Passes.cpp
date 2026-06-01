@@ -1254,20 +1254,25 @@ void registerAMDAIEPasses() {
   // entry point for hand-authored placed object-fifo IR. Use for parameterized-
   // kernel experimentation so the validated `iree-amdaie-lower-placed-objectfifo`
   // path is never disturbed. Options:
-  //   subsume-loops={true|false} (default true): prepend the loop-subsumption
-  //     stage so a hand-authored scf.for over strided DMAs is folded into the
-  //     BD access pattern (one iterated BD) instead of unrolled. Required for
-  //     in-kernel DDR K-streaming and rolled per-tile phases (F16, F11). Safe
-  //     to leave on for unrolled kernels too since the combiner inside
-  //     DmaComposition now respects `npu.barrier` boundaries (F22). Turn OFF
-  //     to debug a subsumed kernel by reading the unrolled form.
-  // Usage: --iree-amdaie-lower-lof{subsume-loops=false}
+  //   subsume-loops={true|false} (default TRUE): prepend the loop-subsumption
+  //     stage (DmaComposition) so a hand-authored scf.for over strided DMAs is
+  //     folded into the BD access pattern (one iterated BD) instead of being
+  //     unrolled by `ControlCodeLoopUnroll`. This is a BD-pool optimization; the
+  //     subsume=false path (rolled + BD-id-cycled) is also correct and BD-
+  //     economical. Both paths are HW-validated for in-kernel DDR K-streaming +
+  //     rolled multi-pass phases (SmolLM FFN [64,576,1536,576], K-streamed,
+  //     multi-pass, on grids up to 6x2; i32 and bf16).
+  //   Note: the hand-authored controlcode interleaves per-column packet feeds;
+  //     `AMDAIEInsertDmaBdChain` keeps packet-flow chains non-interleaved so
+  //     their push order (and thus stream-switch arbiter order) is preserved.
+  // Usage: --iree-amdaie-lower-lof{subsume-loops=false}  (disable the optimization)
   struct LofOptions : public PassPipelineOptions<LofOptions> {
     Option<bool> subsumeLoops{
         *this, "subsume-loops",
-        ::llvm::cl::desc("Prepend the DMA loop-subsumption stage (default ON, "
-                         "barrier-aware combiner F22 makes it safe across "
-                         "multi-tile barrier-separated kernels)."),
+        ::llvm::cl::desc("Prepend the DMA loop-subsumption optimization "
+                         "(default ON). Both ON and OFF are correct; OFF keeps "
+                         "the hand-authored controlcode loops rolled + BD-id-"
+                         "cycled instead of folding them into iterated BDs."),
         ::llvm::cl::init(true)};
   };
   PassPipelineRegistration<LofOptions>(

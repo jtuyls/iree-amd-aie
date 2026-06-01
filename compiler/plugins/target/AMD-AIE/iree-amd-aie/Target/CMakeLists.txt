@@ -20,6 +20,7 @@ iree_c_embed_data(
     "uKernels/npu4/chess/trunci.cc"
     "uKernels/npu4/chess/zero_fill.cc"
     "uKernels/npu4/peano/matmul.cc"
+    "uKernels/npu4/peano/flash_ukernels.cc"
     "uKernels/npu4/peano/trunci.cc"
     "uKernels/npu4/peano/zero_fill.cc"
   C_FILE_OUTPUT

@@ -120,7 +120,17 @@ KExternFnDecl *Parser::parseExternFn() {
     a.name = tokText();
     advance();
     if (!expect(tok::colon, "':'")) return nullptr;
-    if (!parseMemrefType(a.type)) return nullptr;
+    if (at(tok::kw_memref)) {
+      if (!parseMemrefType(a.type)) return nullptr;
+    } else if (at(tok::kw_i32) || at(tok::kw_i8) || at(tok::kw_i16) ||
+               at(tok::kw_bf16) || at(tok::kw_f32)) {
+      a.scalarType = tokText();
+      advance();
+    } else {
+      diag_.report(tokLoc(), diag::err_expected)
+          << "'memref<...>' or scalar type";
+      return nullptr;
+    }
     args.push_back(std::move(a));
     if (!consume(tok::comma)) break;
   }
@@ -700,14 +710,14 @@ KStmt *Parser::parseStmt() {
     std::string name = tokText();
     advance();
     if (consume(tok::l_paren)) {
-      std::vector<std::string> args;
+      std::vector<KExpr *> args;
       while (!at(tok::r_paren)) {
-        if (!atIdentLike()) {
+        KExpr *arg = parseExpr();
+        if (!arg) {
           diag_.report(tokLoc(), diag::err_expected) << "argument";
           return nullptr;
         }
-        args.push_back(tokText());
-        advance();
+        args.push_back(arg);
         if (!consume(tok::comma)) break;
       }
       if (!expect(tok::r_paren, "')'")) return nullptr;
@@ -715,7 +725,8 @@ KStmt *Parser::parseStmt() {
     }
     if (consume(tok::coloneq)) {
       // `NAME := RHS *  expr`  (self-mul scale, RHS must be NAME), or
-      // `NAME := SRC`          (copy/cast SRC -> NAME, dtype convert if differ).
+      // `NAME := SRC`          (copy/cast SRC -> NAME, dtype convert if
+      // differ).
       if (!atIdentLike()) {
         diag_.report(tokLoc(), diag::err_expected) << "handle on RHS";
         return nullptr;
@@ -1127,6 +1138,20 @@ KExpr *Parser::parseListLiteral() {
 
 KExpr *Parser::parsePostfix(KExpr *base) {
   for (;;) {
+    if (at(tok::l_paren)) {
+      auto *id = dyn_cast<KIdentExpr>(base);
+      if (!id) {
+        diag_.report(tokLoc(), diag::err_expected) << "callable identifier";
+        return nullptr;
+      }
+      SourceLocation loc = tokLoc();
+      advance();
+      std::vector<KExpr *> args = parseCallArgs();
+      expect(tok::r_paren, "')'");
+      base =
+          ctx_.create<KCallExpr>(loc, nullptr, id->getName(), std::move(args));
+      continue;
+    }
     if (at(tok::l_square)) {
       SourceLocation loc = tokLoc();
       advance();
