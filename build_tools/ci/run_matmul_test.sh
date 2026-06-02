@@ -653,8 +653,8 @@ run_matmul_test_on_shapes ${bf16_i8_shapes_medium[@]} \
 
 
 # TODO(jornt): Disabled turbo tests temporarily due to instability issues in CI. Locally, I have been able to crash the NPU in this mode.
-# # note this will not actually show any devices because --amdxdna_n_core_rows --amdxdna_n_core_cols are not passed
-# # which i have omitted to make the conditional slightly more succinct
+# # amdxdna discovers rows/cols by default, so this conditional does not need
+# # the explicit --amdxdna_n_core_rows/--amdxdna_n_core_cols flags.
 # if [[ $($IREE_INSTALL_DIR/bin/iree-benchmark-module --dump_devices | grep amdxdna) ]]; then
 
 #   $IREE_INSTALL_DIR/bin/iree-benchmark-module \

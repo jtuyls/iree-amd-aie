@@ -1062,10 +1062,11 @@ class OpBuilderEmitter {
     }
     segs.push_back(cur);
 
-    // in = per-segment-distinct Consume conns; out = body-distinct Produce.
+    // in/out = body-distinct connections. A core may acquire/release the same
+    // input connection in multiple barrier-delimited phases, but the static
+    // core port list should name that connection only once.
     SmallVector<Value> inList, outList;
-    std::set<void *> outSeen;
-    const KBufferDecl *produceBuf = nullptr;
+    std::set<void *> inSeen, outSeen;
     std::function<void(const std::vector<const KStmt *> &, std::set<void *> &)>
         scan = [&](const std::vector<const KStmt *> &body,
                    std::set<void *> &segIn) {
@@ -1075,17 +1076,14 @@ class OpBuilderEmitter {
               bool produce = l->getRole() == AcquireRole::Produce;
               auto port = produce ? AMDAIE::LogicalObjectFifoPort::Produce
                                   : AMDAIE::LogicalObjectFifoPort::Consume;
-              // The first Produce buffer (incl. a routeless local accumulator)
-              // shapes the zero constant — it's what `zero()` writes.
-              if (produce && !produceBuf)
-                produceBuf = findBufferDecl(bufRef(l->getBufRef()));
               Value conn = resolveBufferConn(bufRef(l->getBufRef()), port);
               if (!conn) continue;
               if (produce) {
                 if (outSeen.insert(conn.getAsOpaquePointer()).second)
                   outList.push_back(conn);
               } else if (segIn.insert(conn.getAsOpaquePointer()).second) {
-                inList.push_back(conn);
+                if (inSeen.insert(conn.getAsOpaquePointer()).second)
+                  inList.push_back(conn);
               }
             } else if (auto *red = dyn_cast<KReduceStmt>(s)) {
               std::vector<const KStmt *> bb(red->getBody().begin(),
@@ -1122,22 +1120,6 @@ class OpBuilderEmitter {
     b.setInsertionPointToEnd(blk);
     currentCoreBlock_ = blk;
     coreRtpAlloc_ = Value();
-
-    // One zeroing vector constant at core-block scope (dominates all forall
-    // segments), shaped to the produced buffer.
-    Value zeroCst;
-    if (produceBuf) {
-      SmallVector<int64_t> shape;
-      for (auto *e : produceBuf->getType().dims)
-        shape.push_back(eval_.evalInt(e));
-      Type et = mlirElemType(produceBuf->getType().elemType);
-      auto vecTy = VectorType::get(shape, et);
-      Attribute zeroAttr = isa<FloatType>(et)
-                               ? (Attribute)b.getFloatAttr(et, 0.0)
-                               : (Attribute)b.getIntegerAttr(et, 0);
-      zeroCst = arith::ConstantOp::create(
-          b, loc, vecTy, DenseElementsAttr::get(vecTy, zeroAttr));
-    }
 
     struct Handle {
       Value mem;
@@ -1235,13 +1217,22 @@ class OpBuilderEmitter {
             } else if (auto *z = dyn_cast<KZeroStmt>(s)) {
               auto it = handles.find(z->getHandle());
               if (it == handles.end()) continue;
-              int nd = (int)it->second.type->dims.size();
+              auto memTy = cast<MemRefType>(it->second.mem.getType());
+              int nd = memTy.getRank();
               Value c0 = arith::ConstantIndexOp::create(b, loc, 0);
               SmallVector<Value> idx(nd, c0);
               SmallVector<bool> inb(nd, true);
-              if (zeroCst)
-                vector::TransferWriteOp::create(b, loc, zeroCst, it->second.mem,
-                                                idx, inb);
+              SmallVector<int64_t> shape(memTy.getShape().begin(),
+                                         memTy.getShape().end());
+              Type et = memTy.getElementType();
+              auto vecTy = VectorType::get(shape, et);
+              Attribute zeroAttr = isa<FloatType>(et)
+                                       ? (Attribute)b.getFloatAttr(et, 0.0)
+                                       : (Attribute)b.getIntegerAttr(et, 0);
+              Value zeroCst = arith::ConstantOp::create(
+                  b, loc, vecTy, DenseElementsAttr::get(vecTy, zeroAttr));
+              vector::TransferWriteOp::create(b, loc, zeroCst, it->second.mem,
+                                              idx, inb);
             } else if (auto *red = dyn_cast<KReduceStmt>(s)) {
               int64_t lo = eval_.evalInt(red->getLo());
               int64_t hi = eval_.evalInt(red->getHi());

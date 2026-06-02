@@ -159,6 +159,16 @@ void copy_vec_bf16(const bfloat16 *__restrict in, unsigned offsetIn,
   }
 }
 
+void copy_vec_offset_bf16(int len, int xOffset,
+                          const bfloat16 *__restrict in, unsigned offsetIn,
+                          bfloat16 *__restrict out, unsigned offsetOut) {
+  in += offsetIn;
+  out += offsetOut + xOffset;
+  for (int i = 0; i < len; ++i) {
+    out[i] = in[i];
+  }
+}
+
 void add_rmsnorm_prepare_bf16(int len, const bfloat16 *__restrict x,
                               unsigned offsetX,
                               const bfloat16 *__restrict residual,
@@ -173,6 +183,78 @@ void add_rmsnorm_prepare_bf16(int len, const bfloat16 *__restrict x,
   float sumSq = 0.0f;
   for (int i = 0; i < len; ++i) {
     float v = bf16_to_f32(x[i]) + bf16_to_f32(residual[i]);
+    tmp[i] = v;
+    sumSq += v * v;
+  }
+  inv[0] = invsqrt(sumSq / (float)len + 1.0e-5f);
+}
+
+void rmsnorm_copy_tmp_bf16(int len, const bfloat16 *__restrict x,
+                           unsigned offsetX, float *__restrict tmp,
+                           unsigned offsetTmp) {
+  x += offsetX;
+  tmp += offsetTmp;
+
+  for (int i = 0; i < len; ++i) {
+    tmp[i] = bf16_to_f32(x[i]);
+  }
+}
+
+void rmsnorm_sum_init_bf16(float *__restrict inv, unsigned offsetInv) {
+  inv += offsetInv;
+  inv[0] = 0.0f;
+}
+
+void rmsnorm_copy_tmp_offset_bf16(int len, int xOffset,
+                                  const bfloat16 *__restrict x,
+                                  unsigned offsetX,
+                                  float *__restrict tmp,
+                                  unsigned offsetTmp) {
+  x += offsetX;
+  tmp += offsetTmp + xOffset;
+
+  for (int i = 0; i < len; ++i) {
+    tmp[i] = bf16_to_f32(x[i]);
+  }
+}
+
+void rmsnorm_add_residual_accum_bf16(
+    int len, int xOffset, const bfloat16 *__restrict residual,
+    unsigned offsetResidual, float *__restrict tmp, unsigned offsetTmp,
+    float *__restrict inv, unsigned offsetInv) {
+  residual += offsetResidual;
+  tmp += offsetTmp + xOffset;
+  inv += offsetInv;
+
+  float sumSq = inv[0];
+  for (int i = 0; i < len; ++i) {
+    float v = tmp[i] + bf16_to_f32(residual[i]);
+    tmp[i] = v;
+    sumSq += v * v;
+  }
+  inv[0] = sumSq;
+}
+
+void rmsnorm_finalize_inv_bf16(int len, float *__restrict inv,
+                               unsigned offsetInv) {
+  inv += offsetInv;
+  inv[0] = invsqrt(inv[0] / (float)len + 1.0e-5f);
+}
+
+void rmsnorm_add_residual_prepare_bf16(int len,
+                                       const bfloat16 *__restrict residual,
+                                       unsigned offsetResidual,
+                                       float *__restrict tmp,
+                                       unsigned offsetTmp,
+                                       float *__restrict inv,
+                                       unsigned offsetInv) {
+  residual += offsetResidual;
+  tmp += offsetTmp;
+  inv += offsetInv;
+
+  float sumSq = 0.0f;
+  for (int i = 0; i < len; ++i) {
+    float v = tmp[i] + bf16_to_f32(residual[i]);
     tmp[i] = v;
     sumSq += v * v;
   }
@@ -198,6 +280,20 @@ void add_rmsnorm_prepare_residual_bf16(
     sumSq += v * v;
   }
   inv[0] = invsqrt(sumSq / (float)len + 1.0e-5f);
+}
+
+void add_residual_bf16(int len, const bfloat16 *__restrict x, unsigned offsetX,
+                       const bfloat16 *__restrict residual,
+                       unsigned offsetResidual, bfloat16 *__restrict hidden,
+                       unsigned offsetHidden) {
+  x += offsetX;
+  residual += offsetResidual;
+  hidden += offsetHidden;
+
+  for (int i = 0; i < len; ++i) {
+    store_f32_as_bf16(bf16_to_f32(x[i]) + bf16_to_f32(residual[i]),
+                      hidden + i);
+  }
 }
 
 void rmsnorm_scale_bf16(int len, const float *__restrict tmp,
@@ -226,6 +322,52 @@ void matvec_accum_bf16(int k, int n, const bfloat16 *__restrict x,
 
   for (int kk = 0; kk < k; ++kk) {
     const float xv = bf16_to_f32(x[kk]);
+    const bfloat16 *__restrict wp = w + kk * n;
+    for (int j = 0; j < n; ++j) {
+      acc[j] += xv * bf16_to_f32(wp[j]);
+    }
+  }
+}
+
+void rmsnorm_matvec_accum_bf16(
+    int k, int n, int xOffset, const float *__restrict tmp,
+    unsigned offsetTmp, const bfloat16 *__restrict rmsWeight,
+    unsigned offsetRmsWeight, const float *__restrict inv, unsigned offsetInv,
+    const bfloat16 *__restrict w, unsigned offsetW, float *__restrict acc,
+    unsigned offsetAcc) {
+  tmp += offsetTmp + xOffset;
+  rmsWeight += offsetRmsWeight + xOffset;
+  inv += offsetInv;
+  w += offsetW;
+  acc += offsetAcc;
+
+  const float s = inv[0];
+  for (int kk = 0; kk < k; ++kk) {
+    const float xv = bf16_bits_to_f32(
+        f32_to_bf16_bits(tmp[kk] * s * bf16_to_f32(rmsWeight[kk])));
+    const bfloat16 *__restrict wp = w + kk * n;
+    for (int j = 0; j < n; ++j) {
+      acc[j] += xv * bf16_to_f32(wp[j]);
+    }
+  }
+}
+
+void rmsnorm_matvec_accum_chunk_bf16(
+    int k, int n, int xOffset, const float *__restrict tmp,
+    unsigned offsetTmp, const bfloat16 *__restrict rmsWeight,
+    unsigned offsetRmsWeight, const float *__restrict inv, unsigned offsetInv,
+    const bfloat16 *__restrict w, unsigned offsetW, float *__restrict acc,
+    unsigned offsetAcc) {
+  tmp += offsetTmp + xOffset;
+  rmsWeight += offsetRmsWeight;
+  inv += offsetInv;
+  w += offsetW;
+  acc += offsetAcc;
+
+  const float s = inv[0];
+  for (int kk = 0; kk < k; ++kk) {
+    const float xv = bf16_bits_to_f32(
+        f32_to_bf16_bits(tmp[kk] * s * bf16_to_f32(rmsWeight[kk])));
     const bfloat16 *__restrict wp = w + kk * n;
     for (int j = 0; j < n; ++j) {
       acc[j] += xv * bf16_to_f32(wp[j]);
@@ -264,6 +406,49 @@ void matvec_store_bf16(int n, const float *__restrict acc, unsigned offsetAcc,
   for (int j = 0; j < n; ++j) {
     store_f32_as_bf16(acc[j], out + j);
   }
+}
+
+void matvec_store_add_bf16(int n, const float *__restrict acc,
+                           unsigned offsetAcc,
+                           const bfloat16 *__restrict residual,
+                           unsigned offsetResidual, bfloat16 *__restrict out,
+                           unsigned offsetOut) {
+  acc += offsetAcc;
+  residual += offsetResidual;
+  out += offsetOut;
+  for (int j = 0; j < n; ++j) {
+    const float proj = bf16_bits_to_f32(f32_to_bf16_bits(acc[j]));
+    store_f32_as_bf16(proj + bf16_to_f32(residual[j]), out + j);
+  }
+}
+
+void matvec_store_pack_add_bf16(int n, const float *__restrict acc,
+                                unsigned offsetAcc,
+                                const bfloat16 *__restrict residual,
+                                unsigned offsetResidual,
+                                bfloat16 *__restrict packed,
+                                unsigned offsetPacked) {
+  acc += offsetAcc;
+  residual += offsetResidual;
+  packed += offsetPacked;
+  for (int j = 0; j < n; ++j) {
+    const float proj = bf16_bits_to_f32(f32_to_bf16_bits(acc[j]));
+    store_f32_as_bf16(proj, packed + j);
+    store_f32_as_bf16(proj + bf16_to_f32(residual[j]), packed + n + j);
+  }
+}
+
+void matvec_store_add_if_row_bf16(int n, int activeRow, int packetRow,
+                                  const float *__restrict acc,
+                                  unsigned offsetAcc,
+                                  const bfloat16 *__restrict residual,
+                                  unsigned offsetResidual,
+                                  bfloat16 *__restrict out,
+                                  unsigned offsetOut) {
+  if (activeRow != packetRow)
+    return;
+  matvec_store_add_bf16(n, acc, offsetAcc, residual, offsetResidual, out,
+                        offsetOut);
 }
 
 void swiglu_bf16(int len, const bfloat16 *__restrict gate, unsigned offsetGate,
@@ -346,6 +531,15 @@ void attn_qk_bf16(const bfloat16 *__restrict q, unsigned offsetQ,
     }
     sRaw[j] = f32_to_bf16_bits(SCALE * acc);
   }
+}
+
+void attn_qk_seq_bf16(int seqLen, int tileStart,
+                      const bfloat16 *__restrict q, unsigned offsetQ,
+                      const bfloat16 *__restrict k, unsigned offsetK,
+                      bfloat16 *__restrict s, unsigned offsetS,
+                      float *__restrict prod, unsigned offsetProd) {
+  if (seqLen <= tileStart) return;
+  attn_qk_bf16(q, offsetQ, k, offsetK, s, offsetS, prod, offsetProd);
 }
 
 static inline void flash_update_lanes_bf16(
