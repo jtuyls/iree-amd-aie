@@ -21,6 +21,15 @@ IREE_FLAG(string, amdxdna_power_mode, "", "Set the power mode of the NPU.");
 IREE_FLAG(int32_t, amdxdna_cmd_chain, 0,
           "Batch each dispatch's commands into a single ERT_CMD_CHAIN "
           "(removes the per-command host round-trip). 0 = off (default).");
+IREE_FLAG(string, amdxdna_mcdm_diagnostic_stop_after, "",
+          "Windows MCDM bring-up gate. Empty/none runs normally; otherwise "
+          "stop after one of: load-api, find-adapter, create-device, "
+          "alloc-buffer, context-blob, create-context, open-cu, "
+          "create-command, sync-buffer, ready-submit, submit. Use trace to "
+          "run normally while printing packet diagnostics.");
+IREE_FLAG(string, amdxdna_mcdm_submit_mode, "",
+          "Windows MCDM submit mode. Empty/direct submits the exec BO directly; "
+          "aperture submits through the experimental command aperture path.");
 
 static const iree_string_view_t key_amdxdna_n_core_rows =
     iree_string_view_literal("amdxdna_n_core_rows");
@@ -32,6 +41,10 @@ static const iree_string_view_t key_amdxdna_power_mode =
     iree_string_view_literal("amdxdna_power_mode");
 static const iree_string_view_t key_amdxdna_cmd_chain =
     iree_string_view_literal("amdxdna_cmd_chain");
+static const iree_string_view_t key_amdxdna_mcdm_diagnostic_stop_after =
+    iree_string_view_literal("amdxdna_mcdm_diagnostic_stop_after");
+static const iree_string_view_t key_amdxdna_mcdm_submit_mode =
+    iree_string_view_literal("amdxdna_mcdm_submit_mode");
 
 static iree_status_t iree_hal_amdxdna_driver_factory_enumerate(
     void* self, iree_host_size_t* out_driver_info_count,
@@ -76,6 +89,24 @@ static iree_status_t iree_hal_amdxdna_driver_parse_flags(
         z0, iree_string_pair_builder_add(
                 builder,
                 iree_make_string_pair(key_amdxdna_power_mode, power_mode)));
+  }
+  iree_string_view_t diagnostic_stop_after =
+      IREE_SV(FLAG_amdxdna_mcdm_diagnostic_stop_after);
+  if (!iree_string_view_is_empty(diagnostic_stop_after)) {
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_string_pair_builder_add(
+                builder,
+                iree_make_string_pair(
+                    key_amdxdna_mcdm_diagnostic_stop_after,
+                    diagnostic_stop_after)));
+  }
+  iree_string_view_t submit_mode = IREE_SV(FLAG_amdxdna_mcdm_submit_mode);
+  if (!iree_string_view_is_empty(submit_mode)) {
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_string_pair_builder_add(
+                builder,
+                iree_make_string_pair(key_amdxdna_mcdm_submit_mode,
+                                      submit_mode)));
   }
 
   IREE_TRACE_ZONE_END(z0);

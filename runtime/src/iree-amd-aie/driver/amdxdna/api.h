@@ -27,6 +27,13 @@ struct iree_hal_amdxdna_device_params {
   // removing the per-command host round-trip. Default 0 = the proven
   // per-command ERT_START_CU path.
   int32_t cmd_chain;
+  // Windows MCDM diagnostic gate. Empty/none runs normally. Non-empty values
+  // stop after the named native stage so hardware bring-up can advance one
+  // KMT-facing operation at a time.
+  iree_string_view_t mcdm_diagnostic_stop_after;
+  // Windows MCDM submit mode. Empty/direct submits the exec BO directly.
+  // aperture uses the special context command aperture and is experimental.
+  iree_string_view_t mcdm_submit_mode;
 };
 
 IREE_API_EXPORT void iree_hal_amdxdna_device_options_initialize(

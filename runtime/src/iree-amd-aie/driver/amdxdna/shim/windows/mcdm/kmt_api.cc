@@ -16,10 +16,12 @@ namespace {
 
 constexpr NTSTATUS kStatusPending = static_cast<NTSTATUS>(0x00000103);
 constexpr uint64_t kPageSize = 4096;
-constexpr uint64_t kCommandApertureBase = 0x04000000;
 constexpr uint64_t kCommandApertureAllocationSize = 0x1000;
+constexpr D3DGPU_VIRTUAL_ADDRESS kCommandApertureGpuVaBase = 0x04000000;
 constexpr uint64_t kCommandApertureGpuVaSize = 0x04000000;
 constexpr uint32_t kCommandAperturePrivateType = 0x332b;
+constexpr uint32_t kCommandApertureGpuAllocationDelta = 0x40;
+constexpr uint32_t kCommandApertureCleanupAllocationDelta = 0xc0;
 constexpr uint32_t kSubmitPrivateQwords = 13;  // 104 bytes on current driver.
 
 template <typename Fn>
@@ -369,6 +371,28 @@ bool SyncBuffer(const KmtApi& api, const Device& device, const Buffer& buffer,
   return CheckStatus("D3DKMTInvalidateCache", status, out_error);
 }
 
+bool WaitForBufferResidency(const KmtApi& api, const Device& device,
+                            const Context& context, const Buffer& buffer,
+                            const char* label, std::string* out_error) {
+  if (buffer.paging_fence_value == 0) return true;
+
+  D3DKMT_HANDLE wait_objects[1] = {device.paging_sync_object};
+  UINT64 wait_values[1] = {buffer.paging_fence_value};
+  D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMGPU wait = {};
+  wait.hContext = context.context;
+  wait.ObjectCount = 1;
+  wait.ObjectHandleArray = wait_objects;
+  wait.MonitoredFenceValueArray = wait_values;
+  NTSTATUS status = api.wait_from_gpu(&wait);
+  std::string call_name = "D3DKMTWaitForSynchronizationObjectFromGpu";
+  if (label && label[0]) {
+    call_name += "(";
+    call_name += label;
+    call_name += ")";
+  }
+  return CheckStatus(call_name.c_str(), status, out_error);
+}
+
 void DestroyBuffer(const KmtApi& api, const Device& device, Buffer* buffer) {
   if (!buffer || !buffer->allocation) return;
   if (buffer->cpu_ptr) {
@@ -469,24 +493,24 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
     return false;
   }
 
-  AllocPrivate alloc_private = {};
-  alloc_private.requested_size = kCommandApertureAllocationSize;
-  alloc_private.aligned_size = kCommandApertureAllocationSize;
-  alloc_private.private_type = kCommandAperturePrivateType;
-  alloc_private.policy = 0;
+  AllocPrivate command_private = {};
+  command_private.requested_size = kCommandApertureAllocationSize;
+  command_private.aligned_size = kCommandApertureAllocationSize;
+  command_private.private_type = kCommandAperturePrivateType;
+  command_private.policy = 0;
 
-  D3DDDI_ALLOCATIONINFO2 alloc_info = {};
-  alloc_info.pPrivateDriverData = &alloc_private;
-  alloc_info.PrivateDriverDataSize = sizeof(alloc_private);
+  D3DDDI_ALLOCATIONINFO2 command_info = {};
+  command_info.pPrivateDriverData = &command_private;
+  command_info.PrivateDriverDataSize = sizeof(command_private);
 
-  D3DKMT_CREATEALLOCATION create = {};
-  create.hDevice = device.device;
-  create.Flags.CreateResource = 1;
-  create.Flags.CreateShared = 1;
-  create.NumAllocations = 1;
-  create.pAllocationInfo2 = &alloc_info;
+  D3DKMT_CREATEALLOCATION create_command = {};
+  create_command.hDevice = device.device;
+  create_command.Flags.CreateResource = 1;
+  create_command.Flags.CreateShared = 1;
+  create_command.NumAllocations = 1;
+  create_command.pAllocationInfo2 = &command_info;
 
-  NTSTATUS status = api.create_allocation2(&create);
+  NTSTATUS status = api.create_allocation2(&create_command);
   if (!CheckStatus("D3DKMTCreateAllocation2(command aperture)", status,
                    out_error)) {
     return false;
@@ -495,8 +519,8 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
   CommandAperture aperture = {};
   aperture.allocation_size = kCommandApertureAllocationSize;
   aperture.gpu_va_size = kCommandApertureGpuVaSize;
-  aperture.allocation = alloc_info.hAllocation;
-  aperture.resource = create.hResource;
+  aperture.allocation = command_info.hAllocation;
+  aperture.resource = create_command.hResource;
 
   D3DKMT_LOCK2 lock = {};
   lock.hDevice = device.device;
@@ -512,10 +536,18 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
                 static_cast<size_t>(aperture.allocation_size));
   }
 
+  // XRT's NPU command aperture is exposed as a small cluster of related
+  // handles. The returned allocation is CPU-locked, +0x40 is GPU mapped and
+  // named in submit private data, and +0xc0 is used for cleanup.
+  aperture.gpu_allocation =
+      aperture.allocation + kCommandApertureGpuAllocationDelta;
+
   D3DDDI_MAPGPUVIRTUALADDRESS map = {};
   map.hPagingQueue = device.paging_queue;
-  map.hAllocation = aperture.allocation;
-  map.BaseAddress = kCommandApertureBase;
+  map.hAllocation = aperture.gpu_allocation;
+  // Let the MCDM driver choose the aperture VA. XRT leaves BaseAddress unset
+  // here and the driver returns the context-owned 0x04000000 window.
+  map.BaseAddress = 0;
   map.SizeInPages = kCommandApertureGpuVaSize / kPageSize;
   map.Protection.Write = 1;
   status = api.map_gpu_virtual_address(&map);
@@ -525,8 +557,19 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
     return false;
   }
   aperture.gpu_va = map.VirtualAddress;
+  if (aperture.gpu_va != kCommandApertureGpuVaBase) {
+    if (out_error) {
+      std::ostringstream os;
+      os << "D3DKMTMapGpuVirtualAddress(command aperture) returned VA 0x"
+         << std::hex << aperture.gpu_va << ", expected 0x"
+         << kCommandApertureGpuVaBase;
+      *out_error = os.str();
+    }
+    DestroyCommandAperture(api, device, &aperture);
+    return false;
+  }
 
-  D3DKMT_HANDLE resident_allocs[1] = {aperture.allocation};
+  D3DKMT_HANDLE resident_allocs[1] = {aperture.gpu_allocation};
   D3DDDI_MAKERESIDENT resident = {};
   resident.hPagingQueue = device.paging_queue;
   resident.NumAllocations = 1;
@@ -539,6 +582,8 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
     DestroyCommandAperture(api, device, &aperture);
     return false;
   }
+  aperture.cleanup_allocation =
+      aperture.allocation + kCommandApertureCleanupAllocationDelta;
 
   D3DKMT_HANDLE wait_objects[1] = {device.paging_sync_object};
   UINT64 wait_values[1] = {resident.PagingFenceValue};
@@ -569,7 +614,7 @@ bool SubmitAndWaitCommandAperture(const KmtApi& api, const Device& device,
 
   uint64_t submit_private[kSubmitPrivateQwords] = {};
   submit_private[0] = 2;
-  submit_private[1] = aperture.allocation;
+  submit_private[1] = aperture.gpu_allocation;
   submit_private[2] = aperture.gpu_va;
 
   uint64_t fence_id = context->next_fence_id++;
@@ -584,6 +629,17 @@ bool SubmitAndWaitCommandAperture(const KmtApi& api, const Device& device,
   if (!CheckStatus("D3DKMTSubmitCommandToHwQueue", status, out_error)) {
     return false;
   }
+
+  D3DKMT_INVALIDATECACHE invalidate = {};
+  invalidate.hDevice = device.device;
+  invalidate.hAllocation = aperture.gpu_allocation;
+  invalidate.Offset = 0;
+  invalidate.Length = aperture.gpu_va_size;
+  status = api.invalidate_cache(&invalidate);
+  // XRT invalidates the GPU-side sibling handle after submit. The KMT-only
+  // fallback maps the returned allocation handle directly, where this cache
+  // operation may be rejected even though submit/wait succeeds.
+  (void)status;
 
   HANDLE wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   D3DKMT_HANDLE wait_objects[1] = {context->progress_fence};
@@ -620,19 +676,9 @@ bool SubmitAndWaitBuffer(const KmtApi& api, const Device& device,
     return false;
   }
 
-  if (buffer.paging_fence_value != 0) {
-    D3DKMT_HANDLE wait_objects[1] = {device.paging_sync_object};
-    UINT64 wait_values[1] = {buffer.paging_fence_value};
-    D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMGPU wait = {};
-    wait.hContext = context->context;
-    wait.ObjectCount = 1;
-    wait.ObjectHandleArray = wait_objects;
-    wait.MonitoredFenceValueArray = wait_values;
-    NTSTATUS wait_status = api.wait_from_gpu(&wait);
-    if (!CheckStatus("D3DKMTWaitForSynchronizationObjectFromGpu(buffer)",
-                     wait_status, out_error)) {
-      return false;
-    }
+  if (!WaitForBufferResidency(api, device, *context, buffer, "buffer",
+                              out_error)) {
+    return false;
   }
 
   uint64_t submit_private[kSubmitPrivateQwords] = {};
@@ -679,7 +725,12 @@ bool SubmitAndWaitBuffer(const KmtApi& api, const Device& device,
 
 void DestroyCommandAperture(const KmtApi& api, const Device& device,
                             CommandAperture* aperture) {
-  if (!aperture || (!aperture->allocation && !aperture->resource)) return;
+  if (!aperture ||
+      (!aperture->allocation && !aperture->resource &&
+       !aperture->gpu_allocation && !aperture->gpu_resource &&
+       !aperture->cleanup_allocation)) {
+    return;
+  }
   if (aperture->gpu_va) {
     D3DKMT_FREEGPUVIRTUALADDRESS free_va = {};
     free_va.hAdapter = device.adapter;
@@ -691,22 +742,48 @@ void DestroyCommandAperture(const KmtApi& api, const Device& device,
   if (aperture->cpu_ptr && aperture->allocation) {
     D3DKMT_UNLOCK2 unlock = {};
     unlock.hDevice = device.device;
-    unlock.hAllocation = aperture->allocation;
+    unlock.hAllocation = aperture->cleanup_allocation
+                             ? aperture->cleanup_allocation
+                             : aperture->allocation;
     api.unlock2(&unlock);
     aperture->cpu_ptr = nullptr;
   }
 
-  D3DKMT_DESTROYALLOCATION2 destroy = {};
-  destroy.hDevice = device.device;
-  destroy.Flags.AssumeNotInUse = 1;
-  if (aperture->resource) {
-    destroy.hResource = aperture->resource;
-  } else if (aperture->allocation) {
-    D3DKMT_HANDLE allocs[1] = {aperture->allocation};
-    destroy.AllocationCount = 1;
-    destroy.phAllocationList = allocs;
+  bool owns_separate_gpu_allocation = aperture->gpu_resource != 0;
+  if (owns_separate_gpu_allocation) {
+    D3DKMT_DESTROYALLOCATION2 destroy_gpu = {};
+    destroy_gpu.hDevice = device.device;
+    destroy_gpu.Flags.AssumeNotInUse = 1;
+    if (aperture->gpu_resource) {
+      destroy_gpu.hResource = aperture->gpu_resource;
+    } else if (aperture->gpu_allocation) {
+      D3DKMT_HANDLE allocs[1] = {aperture->gpu_allocation};
+      destroy_gpu.AllocationCount = 1;
+      destroy_gpu.phAllocationList = allocs;
+    }
+    api.destroy_allocation2(&destroy_gpu);
+    aperture->gpu_allocation = 0;
+    aperture->gpu_resource = 0;
   }
-  api.destroy_allocation2(&destroy);
+
+  if (aperture->cleanup_allocation || aperture->allocation ||
+      aperture->resource) {
+    D3DKMT_DESTROYALLOCATION2 destroy_command = {};
+    destroy_command.hDevice = device.device;
+    destroy_command.Flags.AssumeNotInUse = 1;
+    if (aperture->cleanup_allocation) {
+      D3DKMT_HANDLE allocs[1] = {aperture->cleanup_allocation};
+      destroy_command.AllocationCount = 1;
+      destroy_command.phAllocationList = allocs;
+    } else if (aperture->resource) {
+      destroy_command.hResource = aperture->resource;
+    } else if (aperture->allocation) {
+      D3DKMT_HANDLE allocs[1] = {aperture->allocation};
+      destroy_command.AllocationCount = 1;
+      destroy_command.phAllocationList = allocs;
+    }
+    api.destroy_allocation2(&destroy_command);
+  }
   *aperture = {};
 }
 

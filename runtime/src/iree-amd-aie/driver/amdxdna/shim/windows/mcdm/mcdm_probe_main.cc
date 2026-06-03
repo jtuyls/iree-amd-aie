@@ -26,6 +26,7 @@ enum class Stage {
   execbuf_bo,
   all_bos,
   context,
+  aperture,
   submit,
 };
 
@@ -52,6 +53,8 @@ bool ParseStage(const std::string& text, Stage* out_stage) {
     *out_stage = Stage::all_bos;
   } else if (text == "context") {
     *out_stage = Stage::context;
+  } else if (text == "aperture") {
+    *out_stage = Stage::aperture;
   } else if (text == "submit") {
     *out_stage = Stage::submit;
   } else {
@@ -112,9 +115,11 @@ bool RunBufferProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
 }
 
 bool RunContextProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
-                     const std::string& xclbin_path, bool submit) {
+                     const std::string& xclbin_path, bool create_aperture,
+                     bool submit, bool allow_unsafe_submit) {
   if (xclbin_path.empty()) {
-    std::cerr << "--xclbin=PATH is required for context and submit stages\n";
+    std::cerr << "--xclbin=PATH is required for context, aperture, and submit "
+                 "stages\n";
     return false;
   }
 
@@ -155,7 +160,14 @@ bool RunContextProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
             << " progress_fence_gpu=0x" << std::hex
             << context.progress_fence_gpu << std::dec << "\n";
 
-  if (submit) {
+  if (submit && !allow_unsafe_submit) {
+    mcdm::DestroyContext(api, &context);
+    std::cout << "submit.skipped=1 reason=unsafe-submit-requires-"
+                 "--allow-unsafe-submit\n";
+    return true;
+  }
+
+  if (create_aperture || submit) {
     mcdm::CommandAperture aperture;
     if (!mcdm::CreateCommandAperture(api, device, context, &aperture, &error)) {
       std::cerr << "CreateCommandAperture failed: " << error << "\n";
@@ -163,10 +175,20 @@ bool RunContextProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
       return false;
     }
     std::cout << "command_aperture.allocation=" << aperture.allocation
+              << " gpu_allocation=" << aperture.gpu_allocation
+              << " cleanup_allocation=" << aperture.cleanup_allocation
               << " resource=" << aperture.resource
+              << " gpu_resource=" << aperture.gpu_resource
               << " gpu_va=0x" << std::hex << aperture.gpu_va
               << " gpu_va_size=0x" << aperture.gpu_va_size
               << " cpu_ptr=" << aperture.cpu_ptr << std::dec << "\n";
+
+    if (!submit) {
+      mcdm::DestroyCommandAperture(api, device, &aperture);
+      mcdm::DestroyContext(api, &context);
+      std::cout << "aperture.destroy=ok\n";
+      return true;
+    }
 
     bool ok =
         mcdm::SubmitAndWaitCommandAperture(api, device, &context, aperture,
@@ -192,6 +214,7 @@ int wmain(int argc, wchar_t** argv) {
   Stage stage = Stage::all_bos;
   uint64_t size = 4096;
   std::string xclbin_path;
+  bool allow_unsafe_submit = false;
   for (int i = 1; i < argc; ++i) {
     std::string arg = NarrowArg(argv[i]);
     if (arg.rfind("--stage=", 0) == 0) {
@@ -206,10 +229,13 @@ int wmain(int argc, wchar_t** argv) {
       }
     } else if (arg.rfind("--xclbin=", 0) == 0) {
       xclbin_path = arg.substr(strlen("--xclbin="));
+    } else if (arg == "--allow-unsafe-submit") {
+      allow_unsafe_submit = true;
     } else {
       std::cerr << "usage: mcdm_probe.exe "
                    "[--stage=discover|device|host-bo|cacheable-bo|execbuf-bo|"
-                   "all-bos|context|submit] [--size=N] [--xclbin=PATH]\n";
+                   "all-bos|context|aperture|submit] [--size=N] "
+                   "[--xclbin=PATH] [--allow-unsafe-submit]\n";
       return 2;
     }
   }
@@ -253,9 +279,12 @@ int wmain(int argc, wchar_t** argv) {
     return 0;
   }
 
-  if (stage == Stage::context || stage == Stage::submit) {
+  if (stage == Stage::context || stage == Stage::aperture ||
+      stage == Stage::submit) {
     bool ok = RunContextProbe(api, device, xclbin_path,
-                              stage == Stage::submit);
+                              stage == Stage::aperture ||
+                                  stage == Stage::submit,
+                              stage == Stage::submit, allow_unsafe_submit);
     mcdm::DestroyDevice(api, &device);
     return ok ? 0 : 1;
   }

@@ -915,11 +915,12 @@ LogicalResult generateCoreElfFiles(AIE::DeviceOp deviceOp,
       }
 
       std::string targetLower = StringRef(targetArch).lower();
+      std::string targetTriple = targetLower + "-none-unknown-elf";
       std::vector<std::string> flags;
       flags.emplace_back(objFile);
       for (StringRef ukernelObjectName : ukernelObjectNames)
         flags.emplace_back(ukernelObjectNameToPath[ukernelObjectName].string());
-      flags.emplace_back("--target=" + targetLower + "-none-unknown-elf");
+      flags.emplace_back("--target=" + targetTriple);
       flags.emplace_back("-Wl,--gc-sections");
 
       // Decision to use 'warn' for orphan sections: currently if the preceding
@@ -929,6 +930,36 @@ LogicalResult generateCoreElfFiles(AIE::DeviceOp deviceOp,
       // result in larger binaries. The flag '--exclude-secion' should work
       // but doesn't appear to supported with peano.
       flags.emplace_back("-Wl,--orphan-handling=warn");
+#ifdef _WIN32
+      // The Windows Peano package ships AIE2P libc/libm as c.lib/m.lib while
+      // the clang driver injects GNU-style -lc/-lm. Make per-compilation
+      // aliases in the temporary directory instead of mutating the toolchain
+      // install. Also ignore host-default .deplibs entries such as libcmt that
+      // can be embedded in the packaged crt objects.
+      Path peanoTargetLibDir = peanoDir / "lib" / targetTriple;
+      for (auto [srcName, aliasName] :
+           {std::pair{"c.lib", "libc.a"}, std::pair{"m.lib", "libm.a"}}) {
+        Path installedAlias = peanoTargetLibDir / aliasName;
+        Path srcPath = peanoTargetLibDir / srcName;
+        if (std::filesystem::exists(installedAlias) ||
+            !std::filesystem::exists(srcPath)) {
+          continue;
+        }
+        Path aliasPath = tempDir / aliasName;
+        std::error_code ec;
+        std::filesystem::copy_file(
+            srcPath, aliasPath, std::filesystem::copy_options::overwrite_existing,
+            ec);
+        if (ec) {
+          llvm::errs() << "Failed to create Peano library alias "
+                       << aliasPath.string() << " from " << srcPath.string()
+                       << " because: " << ec.message() << "\n";
+          return failure();
+        }
+      }
+      flags.emplace_back("-Wl,-L," + tempDir.string());
+      flags.emplace_back("-Wl,--no-dependent-libraries");
+#endif
       flags.emplace_back("-Wl,-T," + ldscriptPath.string());
       flags.emplace_back("-o");
       flags.emplace_back(elfFile.string());

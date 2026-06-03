@@ -95,8 +95,13 @@ struct Context {
 struct CommandAperture {
   uint64_t allocation_size = 0;
   uint64_t gpu_va_size = 0;
+  // Small CPU-locked command BO mapped over the 64 MiB command window at the
+  // VA expected by the context blob.
   D3DKMT_HANDLE allocation = 0;
+  D3DKMT_HANDLE gpu_allocation = 0;
+  D3DKMT_HANDLE cleanup_allocation = 0;
   D3DKMT_HANDLE resource = 0;
+  D3DKMT_HANDLE gpu_resource = 0;
   D3DGPU_VIRTUAL_ADDRESS gpu_va = 0;
   void* cpu_ptr = nullptr;
 };
@@ -114,6 +119,10 @@ bool CreateBuffer(const KmtApi& api, const Device& device, BufferKind kind,
 
 bool SyncBuffer(const KmtApi& api, const Device& device, const Buffer& buffer,
                 uint64_t offset, uint64_t length, std::string* out_error);
+
+bool WaitForBufferResidency(const KmtApi& api, const Device& device,
+                            const Context& context, const Buffer& buffer,
+                            const char* label, std::string* out_error);
 
 void DestroyBuffer(const KmtApi& api, const Device& device, Buffer* buffer);
 

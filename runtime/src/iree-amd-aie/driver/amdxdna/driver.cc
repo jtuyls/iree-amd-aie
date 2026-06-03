@@ -31,6 +31,31 @@ static bool iree_hal_amdxdna_power_mode_is_valid(iree_string_view_t value) {
          iree_string_view_equal(value, IREE_SV("turbo"));
 }
 
+static bool iree_hal_amdxdna_mcdm_diagnostic_stage_is_valid(
+    iree_string_view_t value) {
+  return iree_string_view_is_empty(value) ||
+         iree_string_view_equal(value, IREE_SV("none")) ||
+         iree_string_view_equal(value, IREE_SV("load-api")) ||
+         iree_string_view_equal(value, IREE_SV("find-adapter")) ||
+         iree_string_view_equal(value, IREE_SV("create-device")) ||
+         iree_string_view_equal(value, IREE_SV("alloc-buffer")) ||
+         iree_string_view_equal(value, IREE_SV("context-blob")) ||
+         iree_string_view_equal(value, IREE_SV("create-context")) ||
+         iree_string_view_equal(value, IREE_SV("open-cu")) ||
+         iree_string_view_equal(value, IREE_SV("create-command")) ||
+         iree_string_view_equal(value, IREE_SV("sync-buffer")) ||
+         iree_string_view_equal(value, IREE_SV("ready-submit")) ||
+         iree_string_view_equal(value, IREE_SV("submit")) ||
+         iree_string_view_equal(value, IREE_SV("trace"));
+}
+
+static bool iree_hal_amdxdna_mcdm_submit_mode_is_valid(
+    iree_string_view_t value) {
+  return iree_string_view_is_empty(value) ||
+         iree_string_view_equal(value, IREE_SV("direct")) ||
+         iree_string_view_equal(value, IREE_SV("aperture"));
+}
+
 static iree_status_t iree_hal_amdxdna_parse_non_negative_int32_option(
     iree_string_view_t key, iree_string_view_t value, int32_t* out_value) {
   if (!iree_string_view_atoi_int32(value, out_value)) {
@@ -92,6 +117,28 @@ iree_status_t iree_hal_amdxdna_device_options_parse(
             (int)value.size, value.data);
       }
       params->power_mode = value;
+    } else if (iree_string_view_equal(
+                   key, IREE_SV("amdxdna_mcdm_diagnostic_stop_after"))) {
+      if (!iree_hal_amdxdna_mcdm_diagnostic_stage_is_valid(value)) {
+        return iree_make_status(
+            IREE_STATUS_FAILED_PRECONDITION,
+            "Option 'amdxdna_mcdm_diagnostic_stop_after' expected one of: "
+            "none | load-api | find-adapter | create-device | alloc-buffer | "
+            "context-blob | create-context | open-cu | create-command | "
+            "sync-buffer | ready-submit | submit | trace. Got: '%.*s'",
+            (int)value.size, value.data);
+      }
+      params->mcdm_diagnostic_stop_after = value;
+    } else if (iree_string_view_equal(key,
+                                      IREE_SV("amdxdna_mcdm_submit_mode"))) {
+      if (!iree_hal_amdxdna_mcdm_submit_mode_is_valid(value)) {
+        return iree_make_status(
+            IREE_STATUS_FAILED_PRECONDITION,
+            "Option 'amdxdna_mcdm_submit_mode' expected one of: direct | "
+            "aperture. Got: '%.*s'",
+            (int)value.size, value.data);
+      }
+      params->mcdm_submit_mode = value;
     } else {
       return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                               "Unrecognized option: %.*s", (int)key.size,
@@ -120,7 +167,13 @@ IREE_API_EXPORT iree_status_t iree_hal_amdxdna_driver_create(
           !iree_host_size_checked_add(
               total_size, device_params->device_path.size, &total_size) ||
           !iree_host_size_checked_add(
-              total_size, device_params->power_mode.size, &total_size))) {
+              total_size, device_params->power_mode.size, &total_size) ||
+          !iree_host_size_checked_add(
+              total_size, device_params->mcdm_diagnostic_stop_after.size,
+              &total_size) ||
+          !iree_host_size_checked_add(
+              total_size, device_params->mcdm_submit_mode.size,
+              &total_size))) {
     IREE_TRACE_ZONE_END(z0);
     return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
                             "amdxdna driver option strings are too large");
@@ -143,6 +196,13 @@ IREE_API_EXPORT iree_status_t iree_hal_amdxdna_driver_create(
   string_storage += iree_string_view_append_to_buffer(
       device_params->power_mode, &driver->options.device_params.power_mode,
       string_storage);
+  string_storage += iree_string_view_append_to_buffer(
+      device_params->mcdm_diagnostic_stop_after,
+      &driver->options.device_params.mcdm_diagnostic_stop_after,
+      string_storage);
+  string_storage += iree_string_view_append_to_buffer(
+      device_params->mcdm_submit_mode,
+      &driver->options.device_params.mcdm_submit_mode, string_storage);
   *out_driver = reinterpret_cast<iree_hal_driver_t*>(driver);
 
   IREE_TRACE_ZONE_END(z0);
@@ -212,6 +272,20 @@ static iree_status_t iree_hal_amdxdna_driver_dump_device_info(
       power_mode.data));
   IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
       builder, "  cmd_chain: %s\n", params->cmd_chain ? "true" : "false"));
+  const iree_string_view_t diagnostic_stop_after =
+      params->mcdm_diagnostic_stop_after.size
+          ? params->mcdm_diagnostic_stop_after
+          : IREE_SV("<disabled>");
+  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
+      builder, "  mcdm_diagnostic_stop_after: %.*s\n",
+      static_cast<int>(diagnostic_stop_after.size),
+      diagnostic_stop_after.data));
+  const iree_string_view_t submit_mode = params->mcdm_submit_mode.size
+                                             ? params->mcdm_submit_mode
+                                             : IREE_SV("direct");
+  IREE_RETURN_IF_ERROR(iree_string_builder_append_format(
+      builder, "  mcdm_submit_mode: %.*s\n",
+      static_cast<int>(submit_mode.size), submit_mode.data));
   return iree_ok_status();
 }
 

@@ -7,6 +7,8 @@
 #include "iree-amd-aie/driver/amdxdna/native.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -22,6 +24,29 @@ namespace mcdm = iree::hal::amdxdna::mcdm;
 namespace {
 
 constexpr uint64_t kMaxExecBoSize = 4096;
+constexpr char kAllowUnsafeApertureSubmitEnv[] =
+    "IREE_AMDXDNA_MCDM_ALLOW_UNSAFE_APERTURE_SUBMIT";
+
+enum class DiagnosticStage : uint8_t {
+  none = 0,
+  load_api,
+  find_adapter,
+  create_device,
+  alloc_buffer,
+  context_blob,
+  create_context,
+  open_cu,
+  create_command,
+  sync_buffer,
+  ready_submit,
+  submit,
+  trace,
+};
+
+enum class SubmitMode : uint8_t {
+  direct,
+  aperture,
+};
 
 struct BoundBuffer {
   iree_hal_amdxdna_native_buffer_t* buffer = nullptr;
@@ -33,10 +58,111 @@ std::string string_view_to_string(iree_string_view_t value) {
   return std::string(value.data, value.size);
 }
 
+bool env_flag_enabled(const char* name) {
+  const char* value = std::getenv(name);
+  if (!value) return false;
+  return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+         std::strcmp(value, "TRUE") == 0 || std::strcmp(value, "yes") == 0 ||
+         std::strcmp(value, "YES") == 0;
+}
+
 iree_status_t status_from_mcdm_error(const char* label,
                                      const std::string& error) {
   return iree_make_status(IREE_STATUS_INTERNAL, "%s: %s", label,
                           error.c_str());
+}
+
+const char* diagnostic_stage_name(DiagnosticStage stage) {
+  switch (stage) {
+    case DiagnosticStage::none:
+      return "none";
+    case DiagnosticStage::load_api:
+      return "load-api";
+    case DiagnosticStage::find_adapter:
+      return "find-adapter";
+    case DiagnosticStage::create_device:
+      return "create-device";
+    case DiagnosticStage::alloc_buffer:
+      return "alloc-buffer";
+    case DiagnosticStage::context_blob:
+      return "context-blob";
+    case DiagnosticStage::create_context:
+      return "create-context";
+    case DiagnosticStage::open_cu:
+      return "open-cu";
+    case DiagnosticStage::create_command:
+      return "create-command";
+    case DiagnosticStage::sync_buffer:
+      return "sync-buffer";
+    case DiagnosticStage::ready_submit:
+      return "ready-submit";
+    case DiagnosticStage::submit:
+      return "submit";
+    case DiagnosticStage::trace:
+      return "trace";
+  }
+  return "unknown";
+}
+
+bool parse_diagnostic_stage(iree_string_view_t value,
+                            DiagnosticStage* out_stage) {
+  *out_stage = DiagnosticStage::none;
+  if (iree_string_view_is_empty(value) ||
+      iree_string_view_equal(value, IREE_SV("none"))) {
+    return true;
+  }
+  if (iree_string_view_equal(value, IREE_SV("load-api"))) {
+    *out_stage = DiagnosticStage::load_api;
+  } else if (iree_string_view_equal(value, IREE_SV("find-adapter"))) {
+    *out_stage = DiagnosticStage::find_adapter;
+  } else if (iree_string_view_equal(value, IREE_SV("create-device"))) {
+    *out_stage = DiagnosticStage::create_device;
+  } else if (iree_string_view_equal(value, IREE_SV("alloc-buffer"))) {
+    *out_stage = DiagnosticStage::alloc_buffer;
+  } else if (iree_string_view_equal(value, IREE_SV("context-blob"))) {
+    *out_stage = DiagnosticStage::context_blob;
+  } else if (iree_string_view_equal(value, IREE_SV("create-context"))) {
+    *out_stage = DiagnosticStage::create_context;
+  } else if (iree_string_view_equal(value, IREE_SV("open-cu"))) {
+    *out_stage = DiagnosticStage::open_cu;
+  } else if (iree_string_view_equal(value, IREE_SV("create-command"))) {
+    *out_stage = DiagnosticStage::create_command;
+  } else if (iree_string_view_equal(value, IREE_SV("sync-buffer"))) {
+    *out_stage = DiagnosticStage::sync_buffer;
+  } else if (iree_string_view_equal(value, IREE_SV("ready-submit"))) {
+    *out_stage = DiagnosticStage::ready_submit;
+  } else if (iree_string_view_equal(value, IREE_SV("submit"))) {
+    *out_stage = DiagnosticStage::submit;
+  } else if (iree_string_view_equal(value, IREE_SV("trace"))) {
+    *out_stage = DiagnosticStage::trace;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+bool parse_submit_mode(iree_string_view_t value, SubmitMode* out_mode) {
+  *out_mode = SubmitMode::direct;
+  if (iree_string_view_is_empty(value) ||
+      iree_string_view_equal(value, IREE_SV("direct"))) {
+    return true;
+  }
+  if (iree_string_view_equal(value, IREE_SV("aperture"))) {
+    *out_mode = SubmitMode::aperture;
+    return true;
+  }
+  return false;
+}
+
+iree_status_t require_submit_mode_opt_in(SubmitMode submit_mode) {
+  if (submit_mode != SubmitMode::aperture) return iree_ok_status();
+  if (env_flag_enabled(kAllowUnsafeApertureSubmitEnv)) return iree_ok_status();
+  return iree_make_status(
+      IREE_STATUS_FAILED_PRECONDITION,
+      "amdxdna_mcdm_submit_mode=aperture is disabled by default because the "
+      "Windows MCDM exec-BO staging contract is not fully mapped yet; set "
+      "%s=1 to opt in to this unsafe probe mode",
+      kAllowUnsafeApertureSubmitEnv);
 }
 
 iree_status_t validate_device_size_fits_u64(iree_device_size_t size) {
@@ -110,9 +236,15 @@ struct iree_hal_amdxdna_native_device_t {
   iree_allocator_t host_allocator;
   mcdm::KmtApi api;
   mcdm::Device device;
+  DiagnosticStage diagnostic_stop_after = DiagnosticStage::none;
+  SubmitMode submit_mode = SubmitMode::direct;
 
-  explicit iree_hal_amdxdna_native_device_t(iree_allocator_t host_allocator)
-      : host_allocator(host_allocator) {}
+  iree_hal_amdxdna_native_device_t(iree_allocator_t host_allocator,
+                                   DiagnosticStage diagnostic_stop_after,
+                                   SubmitMode submit_mode)
+      : host_allocator(host_allocator),
+        diagnostic_stop_after(diagnostic_stop_after),
+        submit_mode(submit_mode) {}
 };
 
 struct iree_hal_amdxdna_native_buffer_t {
@@ -132,13 +264,20 @@ struct iree_hal_amdxdna_native_queue_t {
 struct iree_hal_amdxdna_native_context_t {
   iree_hal_amdxdna_native_device_t* device = nullptr;
   mcdm::Context context;
+  mcdm::CommandAperture command_aperture;
+  bool has_command_aperture = false;
   mcdm::ContextBlobInfo info;
   iree_hal_amdxdna_native_queue_t queue;
 
   iree_hal_amdxdna_native_context_t(
       iree_hal_amdxdna_native_device_t* device, mcdm::Context context,
+      mcdm::CommandAperture command_aperture, bool has_command_aperture,
       mcdm::ContextBlobInfo info)
-      : device(device), context(context), info(std::move(info)) {
+      : device(device),
+        context(context),
+        command_aperture(command_aperture),
+        has_command_aperture(has_command_aperture),
+        info(std::move(info)) {
     queue.context = this;
   }
 };
@@ -167,6 +306,24 @@ struct iree_hal_amdxdna_native_command_t {
 
 namespace {
 
+bool diagnostic_enabled(iree_hal_amdxdna_native_device_t* device) {
+  return device &&
+         device->diagnostic_stop_after != DiagnosticStage::none;
+}
+
+iree_status_t diagnostic_after(iree_hal_amdxdna_native_device_t* device,
+                               DiagnosticStage stage) {
+  if (!diagnostic_enabled(device)) return iree_ok_status();
+  std::fprintf(stderr, "[amdxdna:mcdm] reached stage: %s\n",
+               diagnostic_stage_name(stage));
+  std::fflush(stderr);
+  if (device->diagnostic_stop_after != stage) return iree_ok_status();
+  return iree_make_status(
+      IREE_STATUS_CANCELLED,
+      "amdxdna Windows MCDM diagnostic stop after stage '%s'",
+      diagnostic_stage_name(stage));
+}
+
 ert_start_kernel_cmd* command_start_packet(
     iree_hal_amdxdna_native_command_t* command) {
   return command->start_packet;
@@ -174,6 +331,78 @@ ert_start_kernel_cmd* command_start_packet(
 
 ert_packet* command_packet(iree_hal_amdxdna_native_command_t* command) {
   return reinterpret_cast<ert_packet*>(command_start_packet(command));
+}
+
+bool diagnostic_trace_packets(iree_hal_amdxdna_native_device_t* device) {
+  return diagnostic_enabled(device);
+}
+
+void trace_command_packet(const char* phase,
+                          iree_hal_amdxdna_native_command_t* command) {
+  if (!diagnostic_trace_packets(command->device)) return;
+
+  const mcdm::Buffer& exec = command->exec_buffer->buffer;
+  const mcdm::BufferKindInfo exec_kind = mcdm::GetBufferKindInfo(exec.kind);
+  ert_packet* packet = command_packet(command);
+  ert_start_kernel_cmd* start_packet = command_start_packet(command);
+  const size_t packet_size = std::min<size_t>(
+      get_ert_packet_size_bytes(packet), command->command_size);
+  const size_t word_count =
+      std::min<size_t>((packet_size + sizeof(uint32_t) - 1) / sizeof(uint32_t),
+                       16);
+
+  std::fprintf(stderr,
+               "[amdxdna:mcdm] packet %s: exec kind=%s alloc=0x%08x "
+               "gpu_va=0x%llx size=%llu packet_bytes=%zu valid=%u\n",
+               phase, exec_kind.name, static_cast<unsigned>(exec.allocation),
+               static_cast<unsigned long long>(exec.gpu_va),
+               static_cast<unsigned long long>(exec.size), packet_size,
+               ert_valid_opcode(packet) ? 1u : 0u);
+  std::fprintf(stderr,
+               "[amdxdna:mcdm] packet %s: header=0x%08x state=%u opcode=%u "
+               "type=%u count=%u extra_cu_masks=%u cu_mask=0x%08x "
+               "reg_idx=%u arg_count=%u bound_count=%zu\n",
+               phase, packet->header, packet->state, packet->opcode,
+               packet->type, packet->count, start_packet->extra_cu_masks,
+               start_packet->cu_mask, command->reg_idx, command->arg_count,
+               command->bound_buffers.size());
+
+  if (packet->opcode == ERT_START_NPU) {
+    const ert_npu_data* npu_data = get_ert_npu_data(start_packet);
+    if (npu_data) {
+      std::fprintf(stderr,
+                   "[amdxdna:mcdm] packet %s: npu instruction_va=0x%llx "
+                   "instruction_size=%u prop_count=%u\n",
+                   phase,
+                   static_cast<unsigned long long>(
+                       npu_data->instruction_buffer),
+                   npu_data->instruction_buffer_size,
+                   npu_data->instruction_prop_count);
+    }
+  }
+
+  const uint32_t* words = reinterpret_cast<const uint32_t*>(packet);
+  std::fprintf(stderr, "[amdxdna:mcdm] packet %s: words", phase);
+  for (size_t i = 0; i < word_count; ++i) {
+    std::fprintf(stderr, " %08x", words[i]);
+  }
+  std::fprintf(stderr, "\n");
+
+  for (size_t i = 0; i < command->bound_buffers.size(); ++i) {
+    const BoundBuffer& bound = command->bound_buffers[i];
+    if (!bound.buffer) continue;
+    const mcdm::Buffer& buffer = bound.buffer->buffer;
+    const mcdm::BufferKindInfo kind = mcdm::GetBufferKindInfo(buffer.kind);
+    std::fprintf(stderr,
+                 "[amdxdna:mcdm] packet %s: bound[%zu] kind=%s alloc=0x%08x "
+                 "gpu_va=0x%llx offset=%llu size=%llu bo_size=%llu\n",
+                 phase, i, kind.name, static_cast<unsigned>(buffer.allocation),
+                 static_cast<unsigned long long>(buffer.gpu_va),
+                 static_cast<unsigned long long>(bound.offset),
+                 static_cast<unsigned long long>(bound.size),
+                 static_cast<unsigned long long>(buffer.size));
+  }
+  std::fflush(stderr);
 }
 
 iree_status_t check_pkt_count_capacity(
@@ -241,6 +470,27 @@ iree_status_t iree_hal_amdxdna_native_resolve_device_options(
         "got %d",
         options->n_core_cols);
   }
+  DiagnosticStage diagnostic_stop_after = DiagnosticStage::none;
+  if (!parse_diagnostic_stage(options->mcdm_diagnostic_stop_after,
+                              &diagnostic_stop_after)) {
+    return iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "Option 'amdxdna_mcdm_diagnostic_stop_after' has invalid value "
+        "'%.*s'",
+        static_cast<int>(options->mcdm_diagnostic_stop_after.size),
+        options->mcdm_diagnostic_stop_after.data);
+  }
+  (void)diagnostic_stop_after;
+  SubmitMode submit_mode = SubmitMode::direct;
+  if (!parse_submit_mode(options->mcdm_submit_mode, &submit_mode)) {
+    return iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "Option 'amdxdna_mcdm_submit_mode' has invalid value '%.*s'",
+        static_cast<int>(options->mcdm_submit_mode.size),
+        options->mcdm_submit_mode.data);
+  }
+  IREE_RETURN_IF_ERROR(require_submit_mode_opt_in(submit_mode));
+  (void)submit_mode;
   return parse_power_mode(options->power_mode, out_power_mode,
                           out_should_set_power_mode);
 }
@@ -249,24 +499,87 @@ iree_status_t iree_hal_amdxdna_native_device_create(
     const iree_hal_amdxdna_device_params* options,
     iree_allocator_t host_allocator,
     iree_hal_amdxdna_native_device_t** out_device) {
-  (void)options;
+  IREE_ASSERT_ARGUMENT(options);
   IREE_ASSERT_ARGUMENT(out_device);
   *out_device = nullptr;
+
+  DiagnosticStage diagnostic_stop_after = DiagnosticStage::none;
+  if (!parse_diagnostic_stage(options->mcdm_diagnostic_stop_after,
+                              &diagnostic_stop_after)) {
+    return iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "Option 'amdxdna_mcdm_diagnostic_stop_after' has invalid value "
+        "'%.*s'",
+        static_cast<int>(options->mcdm_diagnostic_stop_after.size),
+        options->mcdm_diagnostic_stop_after.data);
+  }
+  SubmitMode submit_mode = SubmitMode::direct;
+  if (!parse_submit_mode(options->mcdm_submit_mode, &submit_mode)) {
+    return iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "Option 'amdxdna_mcdm_submit_mode' has invalid value '%.*s'",
+        static_cast<int>(options->mcdm_submit_mode.size),
+        options->mcdm_submit_mode.data);
+  }
+  IREE_RETURN_IF_ERROR(require_submit_mode_opt_in(submit_mode));
 
   iree_hal_amdxdna_native_device_t* device = nullptr;
   IREE_RETURN_IF_ERROR(iree_allocator_malloc(
       host_allocator, sizeof(*device), reinterpret_cast<void**>(&device)));
-  device = new (device) iree_hal_amdxdna_native_device_t(host_allocator);
+  device = new (device) iree_hal_amdxdna_native_device_t(
+      host_allocator, diagnostic_stop_after, submit_mode);
 
   std::string error;
   mcdm::Adapter adapter;
-  if (!device->api.Load(&error) ||
-      !mcdm::FindNpuAdapter(device->api, &adapter, &error) ||
-      !mcdm::CreateDevice(device->api, adapter.handle, &device->device,
+  if (!device->api.Load(&error)) {
+    iree_status_t status = status_from_mcdm_error(
+        "amdxdna Windows MCDM KMT API load failed", error);
+    device->~iree_hal_amdxdna_native_device_t();
+    iree_allocator_free(host_allocator, device);
+    return status;
+  }
+  iree_status_t status = diagnostic_after(device, DiagnosticStage::load_api);
+  if (!iree_status_is_ok(status)) {
+    device->~iree_hal_amdxdna_native_device_t();
+    iree_allocator_free(host_allocator, device);
+    return status;
+  }
+
+  if (!mcdm::FindNpuAdapter(device->api, &adapter, &error)) {
+    status = status_from_mcdm_error(
+        "amdxdna Windows MCDM adapter discovery failed", error);
+    device->~iree_hal_amdxdna_native_device_t();
+    iree_allocator_free(host_allocator, device);
+    return status;
+  }
+  status = diagnostic_after(device, DiagnosticStage::find_adapter);
+  if (!iree_status_is_ok(status)) {
+    if (adapter.handle) {
+      D3DKMT_CLOSEADAPTER close = {};
+      close.hAdapter = adapter.handle;
+      device->api.close_adapter(&close);
+    }
+    device->~iree_hal_amdxdna_native_device_t();
+    iree_allocator_free(host_allocator, device);
+    return status;
+  }
+
+  if (!mcdm::CreateDevice(device->api, adapter.handle, &device->device,
                           &error)) {
-    iree_status_t status =
-        status_from_mcdm_error("amdxdna Windows MCDM device creation failed",
-                               error);
+    status = status_from_mcdm_error(
+        "amdxdna Windows MCDM device creation failed", error);
+    if (adapter.handle) {
+      D3DKMT_CLOSEADAPTER close = {};
+      close.hAdapter = adapter.handle;
+      device->api.close_adapter(&close);
+    }
+    device->~iree_hal_amdxdna_native_device_t();
+    iree_allocator_free(host_allocator, device);
+    return status;
+  }
+  status = diagnostic_after(device, DiagnosticStage::create_device);
+  if (!iree_status_is_ok(status)) {
+    mcdm::DestroyDevice(device->api, &device->device);
     device->~iree_hal_amdxdna_native_device_t();
     iree_allocator_free(host_allocator, device);
     return status;
@@ -313,6 +626,12 @@ iree_status_t iree_hal_amdxdna_native_device_alloc_buffer(
     return status_from_mcdm_error("amdxdna Windows MCDM BO allocation failed",
                                   error);
   }
+  iree_status_t status =
+      diagnostic_after(device, DiagnosticStage::alloc_buffer);
+  if (!iree_status_is_ok(status)) {
+    mcdm::DestroyBuffer(device->api, device->device, &buffer);
+    return status;
+  }
   out_buffer->reset(new iree_hal_amdxdna_native_buffer_t(device, buffer));
   return iree_ok_status();
 }
@@ -342,6 +661,7 @@ iree_status_t iree_hal_amdxdna_native_device_create_context(
     return status_from_mcdm_error(
         "amdxdna Windows MCDM context blob generation failed", error);
   }
+  IREE_RETURN_IF_ERROR(diagnostic_after(device, DiagnosticStage::context_blob));
 
   mcdm::Context context;
   if (!mcdm::CreateContext(device->api, device->device, private_data, &context,
@@ -349,14 +669,37 @@ iree_status_t iree_hal_amdxdna_native_device_create_context(
     return status_from_mcdm_error(
         "amdxdna Windows MCDM context creation failed", error);
   }
+  iree_status_t status =
+      diagnostic_after(device, DiagnosticStage::create_context);
+  if (!iree_status_is_ok(status)) {
+    mcdm::DestroyContext(device->api, &context);
+    return status;
+  }
 
-  *out_context = new iree_hal_amdxdna_native_context_t(device, context, info);
+  mcdm::CommandAperture command_aperture = {};
+  bool has_command_aperture = false;
+  if (device->submit_mode == SubmitMode::aperture) {
+    if (!mcdm::CreateCommandAperture(device->api, device->device, context,
+                                     &command_aperture, &error)) {
+      mcdm::DestroyContext(device->api, &context);
+      return status_from_mcdm_error(
+          "amdxdna Windows MCDM command aperture creation failed", error);
+    }
+    has_command_aperture = true;
+  }
+
+  *out_context = new iree_hal_amdxdna_native_context_t(
+      device, context, command_aperture, has_command_aperture, info);
   return iree_ok_status();
 }
 
 void iree_hal_amdxdna_native_context_destroy(
     iree_hal_amdxdna_native_context_t* context) {
   if (!context) return;
+  if (context->has_command_aperture) {
+    mcdm::DestroyCommandAperture(context->device->api, context->device->device,
+                                 &context->command_aperture);
+  }
   mcdm::DestroyContext(context->device->api, &context->context);
   delete context;
 }
@@ -419,7 +762,7 @@ iree_status_t iree_hal_amdxdna_native_buffer_sync(
     return status_from_mcdm_error("amdxdna Windows MCDM BO sync failed",
                                   error);
   }
-  return iree_ok_status();
+  return diagnostic_after(buffer->device, DiagnosticStage::sync_buffer);
 }
 
 iree_status_t iree_hal_amdxdna_native_buffer_sync_all(
@@ -448,7 +791,7 @@ iree_status_t iree_hal_amdxdna_native_context_open_cu(
   // Single-PDI prototype contexts expose one DPU/CU. Multi-PDI xclbins will
   // need metadata-driven CU lookup.
   out_cu_index->index = 0;
-  return iree_ok_status();
+  return diagnostic_after(context->device, DiagnosticStage::open_cu);
 }
 
 iree_hal_amdxdna_native_queue_t* iree_hal_amdxdna_native_context_queue(
@@ -478,6 +821,12 @@ iree_status_t iree_hal_amdxdna_native_command_create(
     return status_from_mcdm_error(
         "amdxdna Windows MCDM execbuf allocation failed", error);
   }
+  iree_status_t status =
+      diagnostic_after(device, DiagnosticStage::create_command);
+  if (!iree_status_is_ok(status)) {
+    mcdm::DestroyBuffer(device->api, device->device, &buffer);
+    return status;
+  }
   exec_buffer.reset(new iree_hal_amdxdna_native_buffer_t(device, buffer));
 
   auto* command = new iree_hal_amdxdna_native_command_t(
@@ -486,7 +835,7 @@ iree_status_t iree_hal_amdxdna_native_command_create(
   command->start_packet->state = ERT_CMD_STATE_NEW;
   command->start_packet->opcode = to_ert_opcode(opcode);
   command->start_packet->type = ERT_CU;
-  iree_status_t status = inc_pkt_count(command, sizeof(uint32_t));
+  status = inc_pkt_count(command, sizeof(uint32_t));
   if (!iree_status_is_ok(status)) {
     delete command;
     return status;
@@ -627,7 +976,14 @@ iree_status_t iree_hal_amdxdna_native_command_prepare_chain(
   chain_data->submit_index = 0;
   chain_data->error_index = 0;
   for (iree_host_size_t i = 0; i < command_count; ++i) {
+    IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
+        commands[i]->exec_buffer.get(),
+        iree_hal_amdxdna_native_sync_direction_t::host_to_device));
     chain_data->data[i] = commands[i]->exec_buffer->buffer.allocation;
+    trace_command_packet("chain-slot", commands[i]);
+    command->bound_buffers.push_back(BoundBuffer{
+        commands[i]->exec_buffer.get(), 0,
+        iree_hal_amdxdna_native_buffer_size(commands[i]->exec_buffer.get())});
     for (const BoundBuffer& bound : commands[i]->bound_buffers) {
       command->bound_buffers.push_back(bound);
     }
@@ -651,17 +1007,54 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
       iree_hal_amdxdna_native_sync_direction_t::host_to_device));
 
   std::string error;
-  if (!mcdm::SubmitAndWaitBuffer(command->device->api, command->device->device,
-                                 &queue->context->context,
-                                 command->exec_buffer->buffer, &error)) {
-    return status_from_mcdm_error(
-        "amdxdna Windows MCDM command submit failed", error);
+  for (size_t i = 0; i < command->bound_buffers.size(); ++i) {
+    const BoundBuffer& bound = command->bound_buffers[i];
+    if (!bound.buffer) continue;
+    std::string label = "bound[" + std::to_string(i) + "]";
+    if (!mcdm::WaitForBufferResidency(
+            command->device->api, command->device->device,
+            queue->context->context, bound.buffer->buffer, label.c_str(),
+            &error)) {
+      return status_from_mcdm_error(
+          "amdxdna Windows MCDM bound BO residency wait failed", error);
+    }
+  }
+
+  trace_command_packet("before-submit", command);
+  IREE_RETURN_IF_ERROR(
+      diagnostic_after(command->device, DiagnosticStage::ready_submit));
+
+  if (command->device->submit_mode == SubmitMode::aperture) {
+    if (!queue->context->has_command_aperture) {
+      return iree_make_status(
+          IREE_STATUS_FAILED_PRECONDITION,
+          "amdxdna Windows MCDM aperture submit requested without command "
+          "aperture");
+    }
+    if (!mcdm::SubmitAndWaitCommandAperture(
+            command->device->api, command->device->device,
+            &queue->context->context, queue->context->command_aperture,
+            &error)) {
+      return status_from_mcdm_error(
+          "amdxdna Windows MCDM command aperture submit failed", error);
+    }
+  } else {
+    if (!mcdm::SubmitAndWaitBuffer(command->device->api,
+                                   command->device->device,
+                                   &queue->context->context,
+                                   command->exec_buffer->buffer, &error)) {
+      return status_from_mcdm_error(
+          "amdxdna Windows MCDM command submit failed", error);
+    }
   }
   queue->exec_command_count++;
+  IREE_RETURN_IF_ERROR(diagnostic_after(command->device,
+                                        DiagnosticStage::submit));
 
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
       command->exec_buffer.get(),
       iree_hal_amdxdna_native_sync_direction_t::device_to_host));
+  trace_command_packet("after-readback", command);
 
   if (packet->state == ERT_CMD_STATE_COMPLETED) return iree_ok_status();
 
