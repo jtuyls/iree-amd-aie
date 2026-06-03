@@ -20,6 +20,9 @@
 
 struct iree_hal_amdxdna_kernel_params {
   std::vector<uint8_t> pdi;
+  // Optional AXLF/xclbin wrapper for the PDI(s), used by Windows MCDM context
+  // creation. Linux KMQ ignores this and keeps using `pdi`.
+  std::vector<uint8_t> xclbin;
   std::vector<std::vector<uint32_t>> asm_inst_runlist;
   std::vector<std::vector<uint32_t>> reconf_data_runlist;
   // Host patch table parallel to `asm_inst_runlist`: each inner vector is a

@@ -45,10 +45,12 @@ extern const iree_hal_device_vtable_t iree_hal_amdxdna_device_vtable;
 
 struct iree_hal_amdxdna_context_cache_key_t {
   std::vector<uint8_t> pdi;
+  std::vector<uint8_t> xclbin;
   std::string kernel_name;
 
   bool operator==(const iree_hal_amdxdna_context_cache_key_t& rhs) const {
-    return pdi == rhs.pdi && kernel_name == rhs.kernel_name;
+    return pdi == rhs.pdi && xclbin == rhs.xclbin &&
+           kernel_name == rhs.kernel_name;
   }
 };
 
@@ -61,16 +63,18 @@ struct iree_hal_amdxdna_context_cache_key_hash_t {
     };
     for (uint8_t byte : key.pdi) mix(byte);
     mix(0xff);
+    for (uint8_t byte : key.xclbin) mix(byte);
+    mix(0xfe);
     for (char c : key.kernel_name) mix(static_cast<uint8_t>(c));
     return hash;
   }
 };
 
 struct iree_hal_amdxdna_device_context_cache_t {
-  // Keyed by the bootstrap PDI and the CU/export name used to register the
-  // native context. Linux KMQ contexts currently register one CU name, so
-  // sharing across identical PDIs is valid only when that bootstrap name also
-  // matches.
+  // Keyed by the bootstrap PDI, optional AXLF/xclbin wrapper, and the CU/export
+  // name used to register the native context. Linux KMQ contexts currently
+  // register one CU name, so sharing across identical context bytes is valid
+  // only when that bootstrap name also matches.
   std::unordered_map<iree_hal_amdxdna_context_cache_key_t,
                      std::shared_ptr<iree_hal_amdxdna_native_context_t>,
                      iree_hal_amdxdna_context_cache_key_hash_t>
@@ -1064,30 +1068,41 @@ static void iree_hal_amdxdna_device_destroy(iree_hal_device_t* base_device) {
 
 iree_status_t iree_hal_amdxdna_device_get_or_create_context(
     iree_hal_amdxdna_device* device, iree_const_byte_span_t pdi,
-    iree_string_view_t kernel_name,
+    iree_const_byte_span_t xclbin, iree_string_view_t kernel_name,
     std::shared_ptr<iree_hal_amdxdna_native_context_t>* out_context) {
   *out_context = nullptr;
-  if (pdi.data_length == 0) {
+  if (pdi.data_length == 0 && xclbin.data_length == 0) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
-                            "control-packet context cache requires a PDI");
+                            "control-packet context cache requires context "
+                            "PDI or xclbin data");
   }
-  if (!pdi.data) {
+  if (pdi.data_length != 0 && !pdi.data) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
                             "control-packet context cache PDI is NULL");
+  }
+  if (xclbin.data_length != 0 && !xclbin.data) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "control-packet context cache xclbin is NULL");
   }
   if (iree_string_view_is_empty(kernel_name)) {
     return iree_make_status(
         IREE_STATUS_INVALID_ARGUMENT,
         "control-packet context cache requires a non-empty CU name");
   }
-  // Callers must only pass a non-empty PDI (empty-PDI entry points reuse their
-  // executable's already-resolved context instead of querying the cache).
+  // Callers must pass non-empty context data (empty-PDI/xclbin entry points
+  // reuse their executable's already-resolved context instead of querying the
+  // cache).
   // Lock is held across create_hw_context so two threads racing on the same
   // (or different) bootstrap keys serialize on the cache; concurrent misses on
   // different PDIs are rare enough that finer-grained locking isn't worth the
   // complexity.
   iree_hal_amdxdna_context_cache_key_t key;
-  key.pdi.assign(pdi.data, pdi.data + pdi.data_length);
+  if (pdi.data_length != 0) {
+    key.pdi.assign(pdi.data, pdi.data + pdi.data_length);
+  }
+  if (xclbin.data_length != 0) {
+    key.xclbin.assign(xclbin.data, xclbin.data + xclbin.data_length);
+  }
   key.kernel_name.assign(kernel_name.data, kernel_name.size);
   std::lock_guard<std::mutex> lock(device->pdi_context_cache->mutex);
   auto it = device->pdi_context_cache->contexts.find(key);
@@ -1099,6 +1114,7 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_device_create_context(
       device->native_device,
       iree_make_const_byte_span(key.pdi.data(), key.pdi.size()),
+      iree_make_const_byte_span(key.xclbin.data(), key.xclbin.size()),
       iree_make_string_view(key.kernel_name.data(), key.kernel_name.size()),
       &raw_context));
   std::shared_ptr<iree_hal_amdxdna_native_context_t> ctx(

@@ -14,12 +14,13 @@
 #include "iree/base/api.h"
 
 // Returns a shared native context for the (non-empty) control-packet bootstrap
-// `pdi` and CU/export name, creating and caching it on first use. Linux KMQ
-// contexts currently register one CU name, so the cache key includes both PDI
-// bytes and the name used to create the context.
+// `pdi`/optional `xclbin` context wrapper and CU/export name, creating and
+// caching it on first use. Linux KMQ contexts currently register one CU name,
+// so the cache key includes both context bytes and the name used to create the
+// context.
 iree_status_t iree_hal_amdxdna_device_get_or_create_context(
     iree_hal_amdxdna_device* device, iree_const_byte_span_t pdi,
-    iree_string_view_t kernel_name,
+    iree_const_byte_span_t xclbin, iree_string_view_t kernel_name,
     std::shared_ptr<iree_hal_amdxdna_native_context_t>* out_context);
 
 #endif  // IREE_AMD_AIE_DRIVER_AMDXDNA_DEVICE_INTERNAL_H_

@@ -5,6 +5,12 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+if(WIN32)
+  add_subdirectory(shim/windows/mcdm)
+  message(STATUS "amdxdna HAL backend is not yet registered on Windows; building MCDM probe only")
+  return()
+endif()
+
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(STATUS "amdxdna HAL backend is only implemented for Linux KMQ; skipping")
   return()

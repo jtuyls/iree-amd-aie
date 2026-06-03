@@ -984,6 +984,8 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
   size_t num_reconfigurations = kernel_params.reconf_data_runlist.size();
   iree_const_byte_span_t pdi_span = iree_make_const_byte_span(
       kernel_params.pdi.data(), kernel_params.pdi.size());
+  iree_const_byte_span_t xclbin_span = iree_make_const_byte_span(
+      kernel_params.xclbin.data(), kernel_params.xclbin.size());
   iree_string_view_t kernel_name = iree_make_string_view(
       kernel_params.kernel_name.data(), kernel_params.kernel_name.size());
   std::shared_ptr<iree_hal_amdxdna_native_context_t> context;
@@ -992,16 +994,17 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
     iree_hal_amdxdna_native_context_t* raw_context = nullptr;
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_native_device_create_context(
-                command_buffer->device->native_device, pdi_span, kernel_name,
-                &raw_context));
+                command_buffer->device->native_device, pdi_span, xclbin_span,
+                kernel_name, &raw_context));
     context.reset(raw_context, iree_hal_amdxdna_native_context_destroy);
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_native_context_open_cu(context.get(), kernel_name,
                                                     &cu_idx));
-  } else if (!kernel_params.pdi.empty()) {
+  } else if (!kernel_params.pdi.empty() || !kernel_params.xclbin.empty()) {
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_device_get_or_create_context(
-                command_buffer->device, pdi_span, kernel_name, &context));
+                command_buffer->device, pdi_span, xclbin_span, kernel_name,
+                &context));
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_native_context_open_cu(context.get(), kernel_name,
                                                     &cu_idx));
@@ -1022,8 +1025,8 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
     IREE_TRACE_ZONE_END(z0);
     return iree_make_status(
         IREE_STATUS_FAILED_PRECONDITION,
-        "amdxdna: control-packet dispatch with no PDI ran before its "
-        "PDI-carrying entry point loaded the array");
+        "amdxdna: control-packet dispatch with no context image ran before "
+        "its PDI/xclbin-carrying entry point loaded the array");
   }
   iree_hal_amdxdna_native_queue_t* queue =
       iree_hal_amdxdna_native_context_queue(context.get());

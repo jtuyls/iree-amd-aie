@@ -1,0 +1,29 @@
+# Copyright 2026 The IREE Authors
+#
+# Licensed under the Apache License v2.0 with LLVM Exceptions.
+# See https://llvm.org/LICENSE.txt for license information.
+# SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+if(NOT WIN32)
+  return()
+endif()
+
+iree_cc_library(
+  NAME
+    kmt_api
+  SRCS
+    context_blob.cc
+    context_blob.h
+    kmt_api.cc
+    kmt_api.h
+  PUBLIC
+)
+
+iree_cc_binary(
+  NAME
+    mcdm_probe
+  SRCS
+    mcdm_probe_main.cc
+  DEPS
+    ::kmt_api
+)
