@@ -121,6 +121,7 @@ int main(int argc, char **argv) {
           /*outputCtrlPktInstPath=*/ctrlpktInstPath.str().str(),
           /*outputCtrlPktSeqPath=*/ctrlpktSeqPath.str().str(),
           /*artifactPath=*/artifactPath.str().str(),
+          /*contextXclbinPath=*/std::nullopt,
           /*printIRBeforeAll=*/false,
           /*printIRAfterAll=*/false,
           /*printIRModuleScope=*/false,

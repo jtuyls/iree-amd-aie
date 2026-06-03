@@ -335,6 +335,7 @@ bool CreateBuffer(const KmtApi& api, const Device& device, BufferKind kind,
     DestroyBuffer(api, device, &buffer);
     return false;
   }
+  buffer.paging_fence_value = resident.PagingFenceValue;
 
   D3DKMT_LOCK2 lock = {};
   lock.hDevice = device.device;
@@ -605,6 +606,75 @@ bool SubmitAndWaitCommandAperture(const KmtApi& api, const Device& device,
   if (wait_event) CloseHandle(wait_event);
   return CheckStatus("D3DKMTWaitForSynchronizationObjectFromCpu", status,
                      out_error);
+}
+
+bool SubmitAndWaitBuffer(const KmtApi& api, const Device& device,
+                         Context* context, const Buffer& buffer,
+                         std::string* out_error) {
+  if (!context || !context->hw_queue) {
+    if (out_error) *out_error = "SubmitAndWaitBuffer called without an HW queue";
+    return false;
+  }
+  if (!buffer.allocation || !buffer.gpu_va || buffer.size == 0) {
+    if (out_error) *out_error = "SubmitAndWaitBuffer called with invalid buffer";
+    return false;
+  }
+
+  if (buffer.paging_fence_value != 0) {
+    D3DKMT_HANDLE wait_objects[1] = {device.paging_sync_object};
+    UINT64 wait_values[1] = {buffer.paging_fence_value};
+    D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMGPU wait = {};
+    wait.hContext = context->context;
+    wait.ObjectCount = 1;
+    wait.ObjectHandleArray = wait_objects;
+    wait.MonitoredFenceValueArray = wait_values;
+    NTSTATUS wait_status = api.wait_from_gpu(&wait);
+    if (!CheckStatus("D3DKMTWaitForSynchronizationObjectFromGpu(buffer)",
+                     wait_status, out_error)) {
+      return false;
+    }
+  }
+
+  uint64_t submit_private[kSubmitPrivateQwords] = {};
+  submit_private[0] = 2;
+  submit_private[1] = buffer.allocation;
+  submit_private[2] = buffer.gpu_va;
+
+  uint64_t fence_id = context->next_fence_id++;
+  D3DKMT_SUBMITCOMMANDTOHWQUEUE submit = {};
+  submit.hHwQueue = context->hw_queue;
+  submit.HwQueueProgressFenceId = fence_id;
+  submit.CommandBuffer = buffer.gpu_va;
+  submit.CommandLength = static_cast<UINT>(buffer.size);
+  submit.PrivateDriverDataSize = sizeof(submit_private);
+  submit.pPrivateDriverData = submit_private;
+  NTSTATUS status = api.submit_command_to_hw_queue(&submit);
+  if (!CheckStatus("D3DKMTSubmitCommandToHwQueue(buffer)", status,
+                   out_error)) {
+    return false;
+  }
+
+  HANDLE wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  D3DKMT_HANDLE wait_objects[1] = {context->progress_fence};
+  UINT64 wait_values[1] = {fence_id + 1};
+  D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait = {};
+  wait.hDevice = device.device;
+  wait.ObjectCount = 1;
+  wait.ObjectHandleArray = wait_objects;
+  wait.FenceValueArray = wait_values;
+  wait.hAsyncEvent = wait_event;
+  status = api.wait_from_cpu(&wait);
+  if (status == kStatusPending && wait_event) {
+    DWORD wait_result = WaitForSingleObject(wait_event, 5000);
+    if (wait_result != WAIT_OBJECT_0) {
+      status = static_cast<NTSTATUS>(WAIT_TIMEOUT);
+    } else {
+      status = 0;
+    }
+  }
+  if (wait_event) CloseHandle(wait_event);
+  return CheckStatus("D3DKMTWaitForSynchronizationObjectFromCpu(buffer)",
+                     status, out_error);
 }
 
 void DestroyCommandAperture(const KmtApi& api, const Device& device,

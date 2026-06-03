@@ -38,7 +38,9 @@ target_compile_options(iree-aie-bootgen PRIVATE
 
 set(OPENSSL_USE_STATIC_LIBS TRUE CACHE BOOL "" FORCE)
 set(_openssl_libs "")
-if(WIN32)
+option(IREE_AMD_AIE_USE_BUNDLED_OPENSSL
+       "Build the bundled OpenSSL dependency for bootgen." OFF)
+if(WIN32 AND NOT IREE_AMD_AIE_USE_BUNDLED_OPENSSL)
   if(NOT ${CMAKE_SIZEOF_VOID_P} EQUAL 8)
     message(
       FATAL_ERROR

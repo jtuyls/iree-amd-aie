@@ -44,6 +44,21 @@ iree_cc_library(
     iree-amd-aie::aie_runtime::iree_aie_runtime_static
 )
 
+set(_amd_aie_target_deps
+  ::AMDAIERT
+  ::AMDAIEUkernels
+  iree-amd-aie::aie_runtime::iree_aie_runtime_static
+  iree::target::amd-aie::Transforms
+)
+
+if(IREE_AMD_AIE_BOOTGEN_EXECUTABLE)
+  file(TO_CMAKE_PATH "${IREE_AMD_AIE_BOOTGEN_EXECUTABLE}" _amd_aie_bootgen_executable)
+elseif(IREE_AMD_AIE_ENABLE_BOOTGEN)
+  list(APPEND _amd_aie_target_deps iree-aie-bootgen)
+else()
+  message(FATAL_ERROR "The AMD-AIE compiler target requires either bundled bootgen or IREE_AMD_AIE_BOOTGEN_EXECUTABLE")
+endif()
+
 iree_cc_library(
   NAME
     AIETargets
@@ -53,14 +68,18 @@ iree_cc_library(
     "AMDAIETargetLdScript.cpp"
     "XCLBinGen.cpp"
   DEPS
-    ::AMDAIERT
-    ::AMDAIEUkernels
-    iree-amd-aie::aie_runtime::iree_aie_runtime_static
-    iree::target::amd-aie::Transforms
-    iree-aie-bootgen
+    ${_amd_aie_target_deps}
   INCLUDES
     ${CMAKE_CURRENT_BINARY_DIR}
 )
+
+if(IREE_AMD_AIE_BOOTGEN_EXECUTABLE)
+  target_compile_definitions(
+    iree_target_amd-aie_Target_AIETargets
+    PRIVATE
+      "IREE_AMD_AIE_BOOTGEN_EXECUTABLE=\"${_amd_aie_bootgen_executable}\""
+  )
+endif()
 
 if(IREE_AMD_AIE_ENABLE_XRT_DRIVER)
   add_dependencies(iree_target_amd-aie_Target_AIETargets iree-aie-xclbinutil)

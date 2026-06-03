@@ -80,6 +80,7 @@ struct Buffer {
   D3DKMT_HANDLE allocation = 0;
   D3DGPU_VIRTUAL_ADDRESS gpu_va = 0;
   void* cpu_ptr = nullptr;
+  UINT64 paging_fence_value = 0;
 };
 
 struct Context {
@@ -131,6 +132,10 @@ bool SubmitAndWaitCommandAperture(const KmtApi& api, const Device& device,
                                   Context* context,
                                   const CommandAperture& aperture,
                                   std::string* out_error);
+
+bool SubmitAndWaitBuffer(const KmtApi& api, const Device& device,
+                         Context* context, const Buffer& buffer,
+                         std::string* out_error);
 
 void DestroyCommandAperture(const KmtApi& api, const Device& device,
                             CommandAperture* aperture);

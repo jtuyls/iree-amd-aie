@@ -5,14 +5,8 @@
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-if(WIN32)
-  add_subdirectory(shim/windows/mcdm)
-  message(STATUS "amdxdna HAL backend is not yet registered on Windows; building MCDM probe only")
-  return()
-endif()
-
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  message(STATUS "amdxdna HAL backend is only implemented for Linux KMQ; skipping")
+if(NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR WIN32))
+  message(STATUS "amdxdna HAL backend is only implemented for Linux KMQ and Windows MCDM; skipping")
   return()
 endif()
 
@@ -30,12 +24,21 @@ iree_register_external_hal_driver(
 set(IREE_HAL_AMDXDNA_NATIVE_SRCS
   native.h
 )
-set(IREE_HAL_AMDXDNA_NATIVE_DEPS
-  iree-amd-aie::driver::amdxdna::shim::linux::kmq::shim-xdna
-)
-list(APPEND IREE_HAL_AMDXDNA_NATIVE_SRCS
-  native_linux_kmq.cc
-)
+if(WIN32)
+  set(IREE_HAL_AMDXDNA_NATIVE_DEPS
+    iree-amd-aie::driver::amdxdna::shim::windows::mcdm::kmt_api
+  )
+  list(APPEND IREE_HAL_AMDXDNA_NATIVE_SRCS
+    native_windows_mcdm.cc
+  )
+else()
+  set(IREE_HAL_AMDXDNA_NATIVE_DEPS
+    iree-amd-aie::driver::amdxdna::shim::linux::kmq::shim-xdna
+  )
+  list(APPEND IREE_HAL_AMDXDNA_NATIVE_SRCS
+    native_linux_kmq.cc
+  )
+endif()
 
 iree_cc_library(
   NAME
@@ -80,5 +83,7 @@ iree_cc_library(
     iree::base::internal::flatcc::parsing
     iree-amd-aie::schemas::pdi_executable_def_c_fbs
     ${IREE_HAL_AMDXDNA_NATIVE_DEPS}
+  COPTS
+    $<$<CXX_COMPILER_ID:MSVC>:/std:c++20>
   PUBLIC
 )

@@ -303,8 +303,10 @@ void serializePDIToFb(FlatbufferBuilder &builder,
                       flatbuffers_string_vec_ref_t entryPointsRef,
                       SmallVector<int32_t> &asmInstrIndices,
                       SmallVector<int32_t> &pdiIndices,
+                      SmallVector<int32_t> &xclbinIndices,
                       SmallVector<int32_t> &reconfDataIndices,
                       SmallVector<flatbuffers_ref_t> pdiRefs,
+                      SmallVector<flatbuffers_ref_t> xclbinRefs,
                       SmallVector<flatbuffers_ref_t> asmInstrRefs,
                       SmallVector<flatbuffers_ref_t> reconfDataRefs,
                       SmallVector<flatbuffers_ref_t> patchRefs) {
@@ -320,6 +322,10 @@ void serializePDIToFb(FlatbufferBuilder &builder,
       builder.createInt32Vec(pdiIndices);
   iree_amd_aie_hal_amdxdna_ExecutableDef_pdi_indices_add(builder,
                                                          pdiIndicesRef);
+  flatbuffers_int32_vec_ref_t xclbinIndicesRef =
+      builder.createInt32Vec(xclbinIndices);
+  iree_amd_aie_hal_amdxdna_ExecutableDef_xclbin_indices_add(
+      builder, xclbinIndicesRef);
   flatbuffers_int32_vec_ref_t reconfDataIndicesRef =
       builder.createInt32Vec(reconfDataIndices);
   iree_amd_aie_hal_amdxdna_ExecutableDef_reconf_data_runlist_indices_add(
@@ -327,6 +333,10 @@ void serializePDIToFb(FlatbufferBuilder &builder,
   // Add the PDI strings to the flatbuffer.
   flatbuffers_vec_ref_t pdisRef = builder.createOffsetVecDestructive(pdiRefs);
   iree_amd_aie_hal_amdxdna_ExecutableDef_pdis_add(builder, pdisRef);
+  // Add the optional AXLF/xclbin context wrappers to the flatbuffer.
+  flatbuffers_vec_ref_t xclbinsRef =
+      builder.createOffsetVecDestructive(xclbinRefs);
+  iree_amd_aie_hal_amdxdna_ExecutableDef_xclbins_add(builder, xclbinsRef);
   // Add the npu instructions to the flatbuffer.
   flatbuffers_vec_ref_t asmInstrsRef =
       builder.createOffsetVecDestructive(asmInstrRefs);
@@ -537,6 +547,7 @@ LogicalResult AIETargetBackend::serializeExecutable(
   // Utilities for converting data into FlatBuffer formats.
   Flatbuffer1dStringArrayConverter entryPointNameConvertor(ordinalCount);
   Flatbuffer1dStringArrayConverter artifactConvertor(ordinalCount);
+  Flatbuffer1dStringArrayConverter contextXclbinConvertor(ordinalCount);
   Flatbuffer3dUInt32ArrayConverter asmInstrConverter(ordinalCount);
   // Host patch table, parallel to `asmInstrConverter` (amdxdna cmd-chain
   // path).
@@ -574,6 +585,14 @@ LogicalResult AIETargetBackend::serializeExecutable(
       default:
         llvm::errs() << "Unsupported device HAL\n";
         return failure();
+    }
+    SmallString<128> contextXclbinPath(entryPointWorkDir);
+    std::optional<std::string> maybeContextXclbinPath;
+    if (options.deviceHal == AMDAIEOptions::DeviceHAL::AMDXDNA &&
+        options.emitAMDXDNAContextXclbin) {
+      llvm::sys::path::append(contextXclbinPath,
+                              entryPointNames[i] + ".context.xclbin");
+      maybeContextXclbinPath = contextXclbinPath.str().str();
     }
     // Path to store the NPU instructions.
     SmallString<128> npuInstPath(entryPointWorkDir);
@@ -632,6 +651,7 @@ LogicalResult AIETargetBackend::serializeExecutable(
             /*outputCtrlPktInstPath=*/ctrlpktInstPath.str().str(),
             /*outputCtrlPktSeqPath=*/ctrlpktSeqPath.str().str(),
             /*artifactPath=*/artifactPath.str().str(),
+            /*contextXclbinPath=*/maybeContextXclbinPath,
             /*printIRBeforeAll=*/options.aie2xclbinPrintIrBeforeAll,
             /*printIRAfterAll=*/options.aie2xclbinPrintIrAfterAll,
             /*printIRModuleScope=*/options.aie2xclbinPrintIrModuleScope,
@@ -704,6 +724,18 @@ LogicalResult AIETargetBackend::serializeExecutable(
     }
     // Add the artifact to the converter.
     artifactConvertor.addEntry(ordinal, artifactString);
+    std::string contextXclbinString;
+    if (!artifactString.empty() && maybeContextXclbinPath) {
+      std::unique_ptr<llvm::MemoryBuffer> contextXclbinInput =
+          openInputFile(*maybeContextXclbinPath, &errorMessage);
+      if (!contextXclbinInput) {
+        moduleOp.emitOpError()
+            << "Failed to open context xclbin file: " << errorMessage;
+        return failure();
+      }
+      contextXclbinString = contextXclbinInput->getBuffer();
+    }
+    contextXclbinConvertor.addEntry(ordinal, contextXclbinString);
   }
 
   // Serialize the executable to flatbuffer format
@@ -737,9 +769,13 @@ LogicalResult AIETargetBackend::serializeExecutable(
       serializePDIToFb(builder,
                        entryPointNameConvertor.getFlatbufferVecRef(builder),
                        asmInstrConverter.indices, artifactConvertor.indices,
+                       contextXclbinConvertor.indices,
                        reconfDataConverter.indices,
                        artifactConvertor.getFlatbufferRefs(
                            builder, iree_amd_aie_hal_amdxdna_PdiDef_create),
+                       contextXclbinConvertor.getFlatbufferRefs(
+                           builder,
+                           iree_amd_aie_hal_amdxdna_XclbinDef_create),
                        get3dUInt32ArrayRefs(asmInstrConverter),
                        get3dUInt32ArrayRefs(reconfDataConverter),
                        get3dUInt32ArrayRefs(patchConverter));

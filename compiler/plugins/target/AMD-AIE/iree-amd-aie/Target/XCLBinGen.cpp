@@ -6,14 +6,19 @@
 
 #include "XCLBinGen.h"
 
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <random>
 #include <sstream>
+#include <system_error>
+#include <vector>
 
 #include "AMDAIETargets.h"
 #include "aie/Passes.h"
@@ -56,7 +61,9 @@
 
 #define DEBUG_TYPE "amdaie-xclbingen"
 
+#ifndef IREE_AMD_AIE_BOOTGEN_EXECUTABLE
 extern int iree_aie_bootgen_main(int argc, const char *argv[]);
+#endif  // IREE_AMD_AIE_BOOTGEN_EXECUTABLE
 
 // https://stackoverflow.com/a/60198074
 using namespace std::placeholders;
@@ -1025,6 +1032,475 @@ json::Object makeKernelJSON(const std::string &name, const std::string &id,
       {"instances", json::Array{json::Object{{"name", instance}}}}};
 }
 
+namespace {
+
+constexpr uint32_t kAxlfSectionMemTopology = 6;
+constexpr uint32_t kAxlfSectionConnectivity = 7;
+constexpr uint32_t kAxlfSectionIpLayout = 8;
+constexpr uint32_t kAxlfSectionBuildMetadata = 14;
+constexpr uint32_t kAxlfSectionAiePartition = 32;
+
+constexpr uint8_t kMemDram = 2;
+constexpr uint32_t kIpPsKernel = 7;
+constexpr uint8_t kCdoPrimary = 1;
+constexpr uint16_t kPsSubtypeDpu = 1;
+constexpr uint16_t kPsFunctionalDpu = 0;
+
+struct AxlfSectionHeader {
+  uint32_t kind = 0;
+  char name[16] = {};
+  uint64_t offset = 0;
+  uint64_t size = 0;
+};
+static_assert(sizeof(AxlfSectionHeader) == 40);
+
+struct AxlfHeader {
+  uint64_t length = 0;
+  uint64_t timeStamp = 0;
+  uint64_t featureRomTimeStamp = 0;
+  uint16_t versionPatch = 0;
+  uint8_t versionMajor = 2;
+  uint8_t versionMinor = 19;
+  uint16_t mode = 0;
+  uint16_t actionMask = 0;
+  uint8_t interfaceUuid[16] = {};
+  char platformVbnv[64] = {};
+  uint8_t uuid[16] = {};
+  char debugBin[16] = {};
+  uint32_t numSections = 0;
+};
+static_assert(sizeof(AxlfHeader) == 152);
+
+struct AxlfFileHeader {
+  char magic[8] = {};
+  int32_t signatureLength = -1;
+  uint8_t reserved[28] = {};
+  uint8_t keyBlock[256] = {};
+  uint64_t uniqueId = 0;
+  AxlfHeader header;
+};
+static_assert(sizeof(AxlfFileHeader) == 456);
+
+struct ArrayOffset {
+  uint32_t size = 0;
+  uint32_t offset = 0;
+};
+static_assert(sizeof(ArrayOffset) == 8);
+
+struct MemData {
+  uint8_t type = 0;
+  uint8_t used = 0;
+  uint8_t padding[6] = {};
+  uint64_t size = 0;
+  uint64_t baseAddress = 0;
+  uint8_t tag[16] = {};
+};
+static_assert(sizeof(MemData) == 40);
+
+struct Connection {
+  int32_t argIndex = 0;
+  int32_t ipLayoutIndex = 0;
+  int32_t memDataIndex = 0;
+};
+static_assert(sizeof(Connection) == 12);
+
+struct IpData {
+  uint32_t type = 0;
+  uint32_t properties = 0;
+  uint64_t baseAddress = 0;
+  uint8_t name[64] = {};
+};
+static_assert(sizeof(IpData) == 80);
+
+struct CdoGroup {
+  uint32_t nameOffset = 0;
+  uint8_t cdoType = 0;
+  uint8_t padding[3] = {};
+  uint64_t pdiId = 0;
+  ArrayOffset dpuKernelIds;
+  ArrayOffset preCdoGroups;
+  uint8_t reserved[64] = {};
+};
+static_assert(sizeof(CdoGroup) == 96);
+
+struct AiePdi {
+  uint8_t uuid[16] = {};
+  ArrayOffset pdiImage;
+  ArrayOffset cdoGroups;
+  uint8_t reserved[64] = {};
+};
+static_assert(sizeof(AiePdi) == 96);
+
+struct AiePartitionInfo {
+  uint16_t columnWidth = 0;
+  uint8_t padding[6] = {};
+  ArrayOffset startColumns;
+  uint8_t reserved[72] = {};
+};
+static_assert(sizeof(AiePartitionInfo) == 88);
+
+struct AiePartition {
+  uint8_t schemaVersion = 0;
+  uint8_t padding0[3] = {};
+  uint32_t nameOffset = 0;
+  uint32_t operationsPerCycle = 0;
+  uint8_t padding[4] = {};
+  uint64_t inferenceFingerprint = 0;
+  uint64_t prePostFingerprint = 0;
+  AiePartitionInfo info;
+  ArrayOffset aiePdi;
+  uint32_t kernelCommitId = 0;
+  uint8_t reserved[52] = {};
+};
+static_assert(sizeof(AiePartition) == 184);
+
+struct XclbinSectionPayload {
+  uint32_t kind = 0;
+  StringRef name;
+  std::vector<uint8_t> payload;
+};
+
+void appendAlignment(std::vector<uint8_t> &data, size_t alignment = 8) {
+  size_t padding = (alignment - data.size() % alignment) % alignment;
+  data.insert(data.end(), padding, uint8_t{0});
+}
+
+template <typename T>
+void appendPod(std::vector<uint8_t> &data, const T &value) {
+  const auto *bytes = reinterpret_cast<const uint8_t *>(&value);
+  data.insert(data.end(), bytes, bytes + sizeof(T));
+}
+
+void appendBytes(std::vector<uint8_t> &data, ArrayRef<uint8_t> bytes) {
+  data.insert(data.end(), bytes.begin(), bytes.end());
+}
+
+LogicalResult copyCString(MutableArrayRef<uint8_t> dest, StringRef value,
+                          const char *fieldName) {
+  if (value.size() >= dest.size()) {
+    llvm::errs() << fieldName << " is too long for xclbin field: " << value
+                 << "\n";
+    return failure();
+  }
+  std::fill(dest.begin(), dest.end(), uint8_t{0});
+  std::memcpy(dest.data(), value.data(), value.size());
+  return success();
+}
+
+LogicalResult copyCString(char *dest, size_t destSize, StringRef value,
+                          const char *fieldName) {
+  return copyCString(MutableArrayRef<uint8_t>(
+                         reinterpret_cast<uint8_t *>(dest), destSize),
+                     value, fieldName);
+}
+
+FailureOr<uint32_t> appendHeapData(std::vector<uint8_t> &section,
+                                   ArrayRef<uint8_t> bytes,
+                                   bool align = true) {
+  if (section.size() > std::numeric_limits<uint32_t>::max() ||
+      bytes.size() >
+          std::numeric_limits<uint32_t>::max() - section.size() - 7) {
+    llvm::errs() << "xclbin section exceeds 32-bit AIE_PARTITION offsets\n";
+    return failure();
+  }
+  uint32_t offset = static_cast<uint32_t>(section.size());
+  appendBytes(section, bytes);
+  if (align) appendAlignment(section);
+  return offset;
+}
+
+FailureOr<uint32_t> appendHeapCString(std::vector<uint8_t> &section,
+                                      StringRef value) {
+  std::vector<uint8_t> bytes(value.begin(), value.end());
+  bytes.push_back(0);
+  return appendHeapData(section, bytes);
+}
+
+template <typename T>
+FailureOr<uint32_t> appendHeapPod(std::vector<uint8_t> &section,
+                                  const T &value, bool align = true) {
+  ArrayRef<uint8_t> bytes(reinterpret_cast<const uint8_t *>(&value),
+                          sizeof(T));
+  return appendHeapData(section, bytes, align);
+}
+
+std::array<uint8_t, 16> makeUuidBytes() {
+  std::array<uint8_t, 16> uuid = {};
+  std::random_device rd;
+  std::mt19937_64 rng(rd());
+  for (size_t i = 0; i < uuid.size(); i += sizeof(uint64_t)) {
+    uint64_t word = rng();
+    std::memcpy(uuid.data() + i, &word, sizeof(word));
+  }
+  uuid[6] = (uuid[6] & 0x0f) | 0x40;
+  uuid[8] = (uuid[8] & 0x3f) | 0x80;
+  return uuid;
+}
+
+FailureOr<uint64_t> parseUInt64(StringRef value, const char *fieldName) {
+  uint64_t result = 0;
+  if (value.getAsInteger(/*Radix=*/0, result)) {
+    llvm::errs() << "failed to parse " << fieldName << " as integer: "
+                 << value << "\n";
+    return failure();
+  }
+  return result;
+}
+
+std::vector<uint8_t> buildMemTopologySection() {
+  std::vector<uint8_t> section;
+  int32_t count = 2;
+  appendPod(section, count);
+
+  MemData host = {};
+  host.type = kMemDram;
+  host.used = 1;
+  host.size = 0x10000;
+  host.baseAddress = 0x4000000;
+  (void)copyCString(MutableArrayRef<uint8_t>(host.tag, sizeof(host.tag)),
+                    "HOST", "mem tag");
+  appendPod(section, host);
+
+  MemData sram = {};
+  sram.type = kMemDram;
+  sram.used = 1;
+  sram.size = 0xc000;
+  sram.baseAddress = 0x4000000;
+  (void)copyCString(MutableArrayRef<uint8_t>(sram.tag, sizeof(sram.tag)),
+                    "SRAM", "mem tag");
+  appendPod(section, sram);
+  return section;
+}
+
+FailureOr<std::vector<uint8_t>> buildIpLayoutSection(StringRef kernelName,
+                                                     StringRef instanceName,
+                                                     uint64_t kernelId) {
+  std::string ipName = (kernelName + ":" + instanceName).str();
+  IpData ip = {};
+  ip.type = kIpPsKernel;
+  ip.properties = kPsSubtypeDpu | (kPsFunctionalDpu << 4) |
+                  ((kernelId & 0xfff) << 16);
+  ip.baseAddress = std::numeric_limits<uint64_t>::max();
+  if (failed(copyCString(MutableArrayRef<uint8_t>(ip.name, sizeof(ip.name)),
+                         ipName, "IP_LAYOUT name"))) {
+    return failure();
+  }
+
+  std::vector<uint8_t> section;
+  int32_t count = 1;
+  appendPod(section, count);
+  appendPod(section, ip);
+  return section;
+}
+
+std::vector<uint8_t> buildConnectivitySection() {
+  std::vector<Connection> connections = {
+      {/*argIndex=*/1, /*ipLayoutIndex=*/0, /*memDataIndex=*/1},
+      {/*argIndex=*/3, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
+      {/*argIndex=*/4, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
+      {/*argIndex=*/5, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
+      {/*argIndex=*/6, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
+      {/*argIndex=*/7, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
+      {/*argIndex=*/8, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
+  };
+
+  std::vector<uint8_t> section;
+  int32_t count = static_cast<int32_t>(connections.size());
+  appendPod(section, count);
+  for (const Connection &connection : connections) {
+    appendPod(section, connection);
+  }
+  return section;
+}
+
+FailureOr<std::vector<uint8_t>> buildAiePartitionSection(ArrayRef<uint8_t> pdi,
+                                                         uint64_t kernelId) {
+  AiePartition partition = {};
+  partition.operationsPerCycle = 2048;
+  partition.inferenceFingerprint = 23423;
+  partition.prePostFingerprint = 12345;
+  partition.info.columnWidth = 4;
+  partition.info.startColumns.size = 1;
+  partition.aiePdi.size = 1;
+
+  std::vector<uint8_t> section(sizeof(AiePartition), uint8_t{0});
+
+  FailureOr<uint32_t> partitionName = appendHeapCString(section, "QoS");
+  if (failed(partitionName)) return failure();
+  partition.nameOffset = *partitionName;
+
+  FailureOr<uint32_t> kernelCommitId = appendHeapCString(section, "");
+  if (failed(kernelCommitId)) return failure();
+  partition.kernelCommitId = *kernelCommitId;
+
+  uint16_t startColumn = 1;
+  FailureOr<uint32_t> startColumnsOffset =
+      appendHeapPod(section, startColumn, /*align=*/true);
+  if (failed(startColumnsOffset)) return failure();
+  partition.info.startColumns.offset = *startColumnsOffset;
+
+  AiePdi aiePdi = {};
+  std::array<uint8_t, 16> pdiUuid = makeUuidBytes();
+  std::memcpy(aiePdi.uuid, pdiUuid.data(), pdiUuid.size());
+  aiePdi.pdiImage.size = static_cast<uint32_t>(pdi.size());
+  FailureOr<uint32_t> pdiImageOffset =
+      appendHeapData(section, pdi, /*align=*/true);
+  if (failed(pdiImageOffset)) return failure();
+  aiePdi.pdiImage.offset = *pdiImageOffset;
+
+  CdoGroup cdo = {};
+  FailureOr<uint32_t> cdoName = appendHeapCString(section, "DPU");
+  if (failed(cdoName)) return failure();
+  cdo.nameOffset = *cdoName;
+  cdo.cdoType = kCdoPrimary;
+  cdo.pdiId = 0x01;
+  cdo.dpuKernelIds.size = 1;
+  FailureOr<uint32_t> kernelIdsOffset =
+      appendHeapPod(section, kernelId, /*align=*/true);
+  if (failed(kernelIdsOffset)) return failure();
+  cdo.dpuKernelIds.offset = *kernelIdsOffset;
+  cdo.preCdoGroups.size = 1;
+  uint64_t preCdoGroup = 0xC1;
+  FailureOr<uint32_t> preCdoGroupsOffset =
+      appendHeapPod(section, preCdoGroup, /*align=*/true);
+  if (failed(preCdoGroupsOffset)) return failure();
+  cdo.preCdoGroups.offset = *preCdoGroupsOffset;
+
+  aiePdi.cdoGroups.size = 1;
+  FailureOr<uint32_t> cdoOffset = appendHeapPod(section, cdo, /*align=*/true);
+  if (failed(cdoOffset)) return failure();
+  aiePdi.cdoGroups.offset = *cdoOffset;
+
+  FailureOr<uint32_t> pdiOffset =
+      appendHeapPod(section, aiePdi, /*align=*/true);
+  if (failed(pdiOffset)) return failure();
+  partition.aiePdi.offset = *pdiOffset;
+
+  std::memcpy(section.data(), &partition, sizeof(partition));
+  return section;
+}
+
+std::vector<uint8_t> buildBuildMetadataSection(StringRef kernelName) {
+  json::Object metadata{{"kernels",
+                         json::Array{json::Object{{"name", kernelName}}}}};
+  std::string metadataStr =
+      llvm::formatv("{0:2}", json::Value(std::move(metadata))).str();
+  return std::vector<uint8_t>(metadataStr.begin(), metadataStr.end());
+}
+
+LogicalResult writeAxlf(StringRef outputPath,
+                        ArrayRef<XclbinSectionPayload> sections) {
+  if (sections.empty() || sections.size() > std::numeric_limits<uint32_t>::max()) {
+    llvm::errs() << "invalid xclbin section count\n";
+    return failure();
+  }
+
+  AxlfFileHeader fileHeader = {};
+  std::memcpy(fileHeader.magic, "xclbin2", 8);
+  fileHeader.signatureLength = -1;
+  std::memset(fileHeader.reserved, 0xff, sizeof(fileHeader.reserved));
+  std::memset(fileHeader.keyBlock, 0xff, sizeof(fileHeader.keyBlock));
+  uint64_t now = static_cast<uint64_t>(
+      std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+  fileHeader.uniqueId = now;
+  fileHeader.header.timeStamp = now;
+  fileHeader.header.numSections = static_cast<uint32_t>(sections.size());
+  std::array<uint8_t, 16> axlfUuid = makeUuidBytes();
+  std::memcpy(fileHeader.header.uuid, axlfUuid.data(), axlfUuid.size());
+
+  std::vector<AxlfSectionHeader> sectionHeaders(sections.size());
+  uint64_t currentOffset =
+      sizeof(AxlfFileHeader) + sizeof(AxlfSectionHeader) * sections.size();
+  for (size_t i = 0; i < sections.size(); ++i) {
+    currentOffset += (8 - currentOffset % 8) % 8;
+    sectionHeaders[i].kind = sections[i].kind;
+    if (failed(copyCString(sectionHeaders[i].name,
+                           sizeof(sectionHeaders[i].name), sections[i].name,
+                           "AXLF section name"))) {
+      return failure();
+    }
+    sectionHeaders[i].offset = currentOffset;
+    sectionHeaders[i].size = sections[i].payload.size();
+    currentOffset += sections[i].payload.size();
+  }
+  fileHeader.header.length = currentOffset;
+
+  std::vector<uint8_t> xclbin;
+  xclbin.reserve(static_cast<size_t>(currentOffset));
+  appendPod(xclbin, fileHeader);
+  for (const AxlfSectionHeader &sectionHeader : sectionHeaders) {
+    appendPod(xclbin, sectionHeader);
+  }
+  for (size_t i = 0; i < sections.size(); ++i) {
+    appendAlignment(xclbin);
+    if (xclbin.size() != sectionHeaders[i].offset) {
+      llvm::errs() << "internal xclbin offset mismatch\n";
+      return failure();
+    }
+    appendBytes(xclbin, sections[i].payload);
+  }
+
+  std::ofstream output(outputPath.str(), std::ios::binary);
+  if (!output.is_open()) {
+    llvm::errs() << "failed to open context xclbin for writing: "
+                 << outputPath << "\n";
+    return failure();
+  }
+  output.write(reinterpret_cast<const char *>(xclbin.data()), xclbin.size());
+  if (!output.good()) {
+    llvm::errs() << "failed to write context xclbin: " << outputPath << "\n";
+    return failure();
+  }
+  return success();
+}
+
+LogicalResult generateAMDXDNAContextXCLBin(
+    const std::string &output, const Path &pdiPath,
+    const std::string &xclBinKernelID, const std::string &xclBinKernelName,
+    const std::string &xclBinInstanceName) {
+  ErrorOr<std::unique_ptr<MemoryBuffer>> pdiBuffer =
+      MemoryBuffer::getFile(pdiPath.string(), /*IsText=*/false,
+                            /*RequiresNullTerminator=*/false);
+  if (!pdiBuffer) {
+    llvm::errs() << "failed to open PDI for context xclbin: "
+                 << pdiBuffer.getError().message() << "\n";
+    return failure();
+  }
+  if ((*pdiBuffer)->getBufferSize() > std::numeric_limits<uint32_t>::max()) {
+    llvm::errs() << "PDI is too large for AIE_PARTITION metadata\n";
+    return failure();
+  }
+
+  FailureOr<uint64_t> kernelId =
+      parseUInt64(xclBinKernelID, "xclbin kernel id");
+  if (failed(kernelId)) return failure();
+
+  ArrayRef<uint8_t> pdiBytes(
+      reinterpret_cast<const uint8_t *>((*pdiBuffer)->getBufferStart()),
+      (*pdiBuffer)->getBufferSize());
+  FailureOr<std::vector<uint8_t>> ipLayout =
+      buildIpLayoutSection(xclBinKernelName, xclBinInstanceName, *kernelId);
+  if (failed(ipLayout)) return failure();
+  FailureOr<std::vector<uint8_t>> aiePartition =
+      buildAiePartitionSection(pdiBytes, *kernelId);
+  if (failed(aiePartition)) return failure();
+
+  std::vector<XclbinSectionPayload> sections;
+  sections.push_back({kAxlfSectionBuildMetadata, "BUILD_METADATA",
+                      buildBuildMetadataSection(xclBinKernelName)});
+  sections.push_back(
+      {kAxlfSectionMemTopology, "MEM_TOPOLOGY", buildMemTopologySection()});
+  sections.push_back(
+      {kAxlfSectionIpLayout, "IP_LAYOUT", std::move(*ipLayout)});
+  sections.push_back({kAxlfSectionConnectivity, "CONNECTIVITY",
+                      buildConnectivitySection()});
+  sections.push_back({kAxlfSectionAiePartition, "AIE_PARTITION",
+                      std::move(*aiePartition)});
+  return writeAxlf(output, sections);
+}
+
+}  // namespace
+
 LogicalResult generatePDI(const std::string &Output, const Path &tempDir,
                           bool enableCtrlPkt) {
   std::string errorMessage;
@@ -1072,6 +1548,16 @@ LogicalResult generatePDI(const std::string &Output, const Path &tempDir,
 
   // Execute the bootgen command.
   {
+#ifdef IREE_AMD_AIE_BOOTGEN_EXECUTABLE
+    std::vector<std::string> flags = {"-arch", "versal", "-image",
+                                      designBifFile.string(), "-o", Output,
+                                      "-w"};
+    if (failed(runTool(IREE_AMD_AIE_BOOTGEN_EXECUTABLE, flags,
+                       /*verbose=*/false))) {
+      llvm::errs() << "failed to execute bootgen";
+      return failure();
+    }
+#else
     // first element is empty string because iree_aie_bootgen_main
     // is the main of bootgen.exe (and argv[0] is typically the name of the exe)
     std::vector<std::string> flags = {
@@ -1087,6 +1573,7 @@ LogicalResult generatePDI(const std::string &Output, const Path &tempDir,
       llvm::errs() << "failed to execute bootgen";
       return failure();
     }
+#endif  // IREE_AMD_AIE_BOOTGEN_EXECUTABLE
   }
 
   return success();
@@ -1537,12 +2024,13 @@ LogicalResult aie2xclbin(
     const std::optional<std::string> &outputNpuInstPath,
     const std::optional<std::string> &outputCtrlPktInstPath,
     const std::optional<std::string> &outputCtrlPktSeqPath,
-    const std::string &artifactPath, bool printIRBeforeAll,
-    bool printIRAfterAll, bool printIRModuleScope, bool timing,
-    const std::string &tempDir, bool useChess, bool useChessForUKernel,
-    bool verbose, const std::optional<std::string> &vitisDir,
-    const std::string &targetArch, const std::string &npuVersion,
-    const std::string &peanoDir,
+    const std::string &artifactPath,
+    const std::optional<std::string> &contextXclbinPath,
+    bool printIRBeforeAll, bool printIRAfterAll, bool printIRModuleScope,
+    bool timing, const std::string &tempDir, bool useChess,
+    bool useChessForUKernel, bool verbose,
+    const std::optional<std::string> &vitisDir, const std::string &targetArch,
+    const std::string &npuVersion, const std::string &peanoDir,
     const mlir::iree_compiler::AMDAIE::AMDAIEOptions::DeviceHAL deviceHal,
     const std::string &xclBinKernelID, const std::string &xclBinKernelName,
     const std::string &xclBinInstanceName, const std::string &amdAIEInstallDir,
@@ -1604,6 +2092,13 @@ LogicalResult aie2xclbin(
             pdiPath, artifactPath,
             std::filesystem::copy_options::overwrite_existing, ec)) {
       llvm::errs() << "Failed to copy file because: " << ec.message() << "\n";
+      return failure();
+    }
+    if (contextXclbinPath &&
+        failed(generateAMDXDNAContextXCLBin(
+            *contextXclbinPath, pdiPath, xclBinKernelID, xclBinKernelName,
+            xclBinInstanceName))) {
+      llvm::errs() << "Failed to generate AMDXDNA context XCLBin\n";
       return failure();
     }
     return success();

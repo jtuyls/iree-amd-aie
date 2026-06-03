@@ -20,7 +20,15 @@ endif()
 if(IREE_AMD_AIE_ENABLE_XRT_DRIVER)
   include(iree_aie_xrt)
 endif()
-include(iree_aie_bootgen)
+option(IREE_AMD_AIE_ENABLE_BOOTGEN "Build the bundled bootgen library." ON)
+set(IREE_AMD_AIE_BOOTGEN_EXECUTABLE
+    ""
+    CACHE FILEPATH
+          "Path to an external bootgen executable. When set, the compiler uses this instead of linking bundled bootgen."
+)
+if(IREE_AMD_AIE_ENABLE_BOOTGEN AND NOT IREE_AMD_AIE_BOOTGEN_EXECUTABLE)
+  include(iree_aie_bootgen)
+endif()
 
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/compiler/plugins/target/AMD-AIE target/AMD-AIE)
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/compiler/plugins/preprocessing/XDNA-OPLIB preprocessing/XDNA-OPLIB)
