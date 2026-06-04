@@ -32,6 +32,8 @@ constexpr char kApertureLockHandleDeltaEnv[] =
     "IREE_AMDXDNA_MCDM_APERTURE_LOCK_HANDLE_DELTA";
 constexpr char kApertureGpuHandleDeltaEnv[] =
     "IREE_AMDXDNA_MCDM_APERTURE_GPU_HANDLE_DELTA";
+constexpr char kApertureCleanupHandleDeltaEnv[] =
+    "IREE_AMDXDNA_MCDM_APERTURE_CLEANUP_HANDLE_DELTA";
 constexpr char kTraceQhdlEnv[] = "IREE_AMDXDNA_MCDM_TRACE_QHDL";
 
 template <typename Fn>
@@ -557,10 +559,12 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
   const uint32_t lock_handle_delta =
       ReadHandleDeltaEnv(kApertureLockHandleDeltaEnv, 0);
   const uint32_t gpu_handle_delta =
-      ReadHandleDeltaEnv(kApertureGpuHandleDeltaEnv, 0x40);
+      ReadHandleDeltaEnv(kApertureGpuHandleDeltaEnv, 0);
+  const uint32_t cleanup_handle_delta =
+      ReadHandleDeltaEnv(kApertureCleanupHandleDeltaEnv, 0);
   const D3DKMT_HANDLE lock_allocation =
       aperture.allocation + lock_handle_delta;
-  aperture.cleanup_allocation = lock_allocation;
+  aperture.cleanup_allocation = aperture.allocation + cleanup_handle_delta;
 
   D3DKMT_LOCK2 lock = {};
   lock.hDevice = device.device;
@@ -579,16 +583,16 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
     return false;
   }
   aperture.cpu_ptr = lock.pData;
-  if (aperture.cpu_ptr) {
-    std::memset(aperture.cpu_ptr, 0,
-                static_cast<size_t>(aperture.allocation_size));
-  }
 
   aperture.gpu_allocation = aperture.allocation + gpu_handle_delta;
 
   D3DDDI_MAPGPUVIRTUALADDRESS map = {};
   map.hPagingQueue = device.paging_queue;
   map.hAllocation = aperture.gpu_allocation;
+  // Direct KMT allocation handles need an explicit VA request to land on the
+  // context-described aperture VA. XRT traces use sibling handles for some
+  // wrapper paths and leave this unset, but those aliases are rejected in this
+  // direct shim path on the 32.0.203.314 driver.
   map.BaseAddress = kCommandApertureGpuVaBase;
   map.SizeInPages = kCommandApertureGpuVaSize / kPageSize;
   map.Protection.Write = 1;
@@ -603,7 +607,8 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
          << lock_allocation << " resource=0x" << aperture.resource
          << " base=0x" << kCommandApertureGpuVaBase << " pages=0x"
          << map.SizeInPages << " lock_delta=0x" << lock_handle_delta
-         << " gpu_delta=0x" << gpu_handle_delta;
+         << " gpu_delta=0x" << gpu_handle_delta << " cleanup_delta=0x"
+         << cleanup_handle_delta;
       *out_error = os.str();
     }
     DestroyCommandAperture(api, device, &aperture);
@@ -1044,12 +1049,12 @@ void DestroyCommandAperture(const KmtApi& api, const Device& device,
     D3DKMT_DESTROYALLOCATION2 destroy_command = {};
     destroy_command.hDevice = device.device;
     destroy_command.Flags.AssumeNotInUse = 1;
-    if (aperture->resource) {
-      destroy_command.hResource = aperture->resource;
-    } else if (aperture->cleanup_allocation) {
+    if (aperture->cleanup_allocation) {
       D3DKMT_HANDLE allocs[1] = {aperture->cleanup_allocation};
       destroy_command.AllocationCount = 1;
       destroy_command.phAllocationList = allocs;
+    } else if (aperture->resource) {
+      destroy_command.hResource = aperture->resource;
     } else if (aperture->allocation) {
       D3DKMT_HANDLE allocs[1] = {aperture->allocation};
       destroy_command.AllocationCount = 1;

@@ -38,6 +38,7 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/raw_ostream.h"
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
@@ -1065,13 +1066,18 @@ json::Object makeKernelJSON(const std::string &name, const std::string &id,
 
 namespace {
 
+constexpr uint32_t kAxlfSectionBitstream = 0;
+constexpr uint32_t kAxlfSectionEmbeddedMetadata = 2;
 constexpr uint32_t kAxlfSectionMemTopology = 6;
 constexpr uint32_t kAxlfSectionConnectivity = 7;
 constexpr uint32_t kAxlfSectionIpLayout = 8;
 constexpr uint32_t kAxlfSectionBuildMetadata = 14;
+constexpr uint32_t kAxlfSectionAskGroupTopology = 26;
+constexpr uint32_t kAxlfSectionAskGroupConnectivity = 27;
 constexpr uint32_t kAxlfSectionAiePartition = 32;
 
 constexpr uint8_t kMemDram = 2;
+constexpr uint32_t kIpKernel = 1;
 constexpr uint32_t kIpPsKernel = 7;
 constexpr uint8_t kCdoPrimary = 1;
 constexpr uint8_t kCdoPrePost = 3;
@@ -1306,39 +1312,61 @@ std::vector<uint8_t> buildMemTopologySection() {
   return section;
 }
 
-FailureOr<std::vector<uint8_t>> buildIpLayoutSection(StringRef kernelName,
-                                                     StringRef instanceName,
-                                                     uint64_t kernelId) {
-  std::string ipName = (kernelName + ":" + instanceName).str();
-  IpData ip = {};
-  ip.type = kIpPsKernel;
-  ip.properties = kPsSubtypeDpu | (kPsFunctionalDpu << 4) |
-                  ((kernelId & 0xfff) << 16);
-  ip.baseAddress = std::numeric_limits<uint64_t>::max();
-  if (failed(copyCString(MutableArrayRef<uint8_t>(ip.name, sizeof(ip.name)),
-                         ipName, "IP_LAYOUT name"))) {
+FailureOr<std::vector<uint8_t>> buildIpLayoutSection(
+    StringRef kernelName, StringRef dpuName, StringRef instanceName,
+    uint64_t kernelId) {
+  IpData userIp = {};
+  userIp.type = kIpKernel;
+  userIp.properties = 0x101;
+  userIp.baseAddress = 0x80000;
+  std::string userIpName = (kernelName + ":" + instanceName).str();
+  if (failed(copyCString(
+          MutableArrayRef<uint8_t>(userIp.name, sizeof(userIp.name)),
+          userIpName, "IP_LAYOUT user kernel name"))) {
+    return failure();
+  }
+
+  IpData dpuIp = {};
+  dpuIp.type = kIpPsKernel;
+  dpuIp.properties = kPsSubtypeDpu | (kPsFunctionalDpu << 4) |
+                     ((kernelId & 0xfff) << 16);
+  dpuIp.baseAddress = std::numeric_limits<uint64_t>::max();
+  std::string dpuIpName = (dpuName + ":" + instanceName).str();
+  if (failed(copyCString(
+          MutableArrayRef<uint8_t>(dpuIp.name, sizeof(dpuIp.name)), dpuIpName,
+          "IP_LAYOUT DPU name"))) {
     return failure();
   }
 
   std::vector<uint8_t> section;
-  int32_t count = 1;
+  int32_t count = 2;
   uint32_t reserved = 0;
   appendPod(section, count);
   appendPod(section, reserved);
-  appendPod(section, ip);
+  appendPod(section, userIp);
+  appendPod(section, dpuIp);
   return section;
 }
 
-std::vector<uint8_t> buildConnectivitySection() {
+std::vector<uint8_t> buildConnectivitySection(bool groupConnectivity) {
   std::vector<Connection> connections = {
-      {/*argIndex=*/1, /*ipLayoutIndex=*/0, /*memDataIndex=*/1},
-      {/*argIndex=*/3, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
-      {/*argIndex=*/4, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
-      {/*argIndex=*/5, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
-      {/*argIndex=*/6, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
-      {/*argIndex=*/7, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
-      {/*argIndex=*/8, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
+      {/*argIndex=*/0, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
+      {/*argIndex=*/1, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
+      {/*argIndex=*/2, /*ipLayoutIndex=*/0, /*memDataIndex=*/0},
+      {/*argIndex=*/1, /*ipLayoutIndex=*/1, /*memDataIndex=*/0},
+      {/*argIndex=*/2, /*ipLayoutIndex=*/1, /*memDataIndex=*/0},
+      {/*argIndex=*/3, /*ipLayoutIndex=*/1, /*memDataIndex=*/0},
+      {/*argIndex=*/4, /*ipLayoutIndex=*/1, /*memDataIndex=*/0},
+      {/*argIndex=*/5, /*ipLayoutIndex=*/1, /*memDataIndex=*/1},
+      {/*argIndex=*/7, /*ipLayoutIndex=*/1, /*memDataIndex=*/0},
   };
+  if (groupConnectivity) {
+    const size_t connectionCount = connections.size();
+    connections.reserve(connectionCount * 2);
+    for (size_t i = 0; i < connectionCount; ++i) {
+      connections.push_back(connections[i]);
+    }
+  }
 
   std::vector<uint8_t> section;
   int32_t count = static_cast<int32_t>(connections.size());
@@ -1417,11 +1445,116 @@ FailureOr<std::vector<uint8_t>> buildAiePartitionSection(ArrayRef<uint8_t> pdi,
 }
 
 std::vector<uint8_t> buildBuildMetadataSection(StringRef kernelName) {
-  json::Object metadata{{"kernels",
-                         json::Array{json::Object{{"name", kernelName}}}}};
+  json::Object xclbin{
+      {"xclbin_name", (kernelName + ".link").str()},
+      {"user_regions",
+       json::Array{json::Object{{"kernels",
+                                  json::Array{json::Object{
+                                      {"name", kernelName}}}}}}}};
+  json::Object metadata{
+      {"schema_version", json::Object{{"major", 1}, {"minor", 0}}},
+      {"build_metadata", json::Object{{"xclbin", std::move(xclbin)}}}};
   std::string metadataStr =
       llvm::formatv("{0:2}", json::Value(std::move(metadata))).str();
   return std::vector<uint8_t>(metadataStr.begin(), metadataStr.end());
+}
+
+std::string xmlEscape(StringRef value) {
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (char c : value) {
+    switch (c) {
+      case '&':
+        escaped += "&amp;";
+        break;
+      case '<':
+        escaped += "&lt;";
+        break;
+      case '>':
+        escaped += "&gt;";
+        break;
+      case '"':
+        escaped += "&quot;";
+        break;
+      case '\'':
+        escaped += "&apos;";
+        break;
+      default:
+        escaped.push_back(c);
+        break;
+    }
+  }
+  return escaped;
+}
+
+std::vector<uint8_t> buildEmbeddedMetadataSection(StringRef kernelName,
+                                                  StringRef dpuName,
+                                                  StringRef instanceName,
+                                                  uint64_t kernelId) {
+  std::string kernel = xmlEscape(kernelName);
+  std::string dpu = xmlEscape(dpuName);
+  std::string instance = xmlEscape(instanceName);
+  std::string xml;
+  llvm::raw_string_ostream os(xml);
+  os << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n";
+  os << "<project name=\"" << kernel << ".link\">\n";
+  os << "  <platform vendor=\"xilinx\" boardid=\"v1\" name=\"ipu\" "
+        "featureRomTime=\"0\">\n";
+  os << "    <version major=\"0\" minor=\"0\"/>\n";
+  os << "    <device name=\"fpga0\" "
+        "fpgaDevice=\"virtex7:xc7vx485t:ffg1157:-1\" addrWidth=\"0\">\n";
+  os << "      <core name=\"OCL_REGION_0\" target=\"hw_em\" "
+        "type=\"clc_region\" clockFreq=\"0MHz\" numComputeUnits=\"1\">\n";
+  os << "        <kernelClocks>\n";
+  os << "          <clock port=\"DATA_CLK\" frequency=\"500.000000MHz\"/>\n";
+  os << "        </kernelClocks>\n";
+  os << "        <kernel name=\"" << kernel
+     << "\" language=\"c\" hwControlProtocol=\"ap_ctrl_chain\">\n";
+  os << "          <port name=\"S_AXI_CONTROL\" mode=\"slave\" "
+        "range=\"0x1000\" dataWidth=\"32\" portType=\"addressable\" "
+        "base=\"0x0\"/>\n";
+  os << "          <instance name=\"" << instance << "\">\n";
+  os << "            <addrRemap base=\"0x00080000\" range=\"0x10000\" "
+        "port=\"S_AXI_CONTROL\"/>\n";
+  os << "          </instance>\n";
+  os << "        </kernel>\n";
+  os << "        <kernel name=\"" << dpu
+     << "\" language=\"c\" type=\"dpu\">\n";
+  os << "          <extended-data subtype=\"1\" functional=\"0\" "
+        "dpu_kernel_id=\""
+     << llvm::formatv("{0:x}", kernelId) << "\"/>\n";
+  os << "          <arg name=\"opcode\" addressQualifier=\"0\" id=\"0\" "
+        "size=\"0x8\" offset=\"0x00\" hostOffset=\"0x0\" hostSize=\"0x8\" "
+        "type=\"uint64_t\"/>\n";
+  os << "          <arg name=\"ifm\" addressQualifier=\"1\" id=\"1\" "
+        "size=\"0x8\" offset=\"0x08\" hostOffset=\"0x0\" hostSize=\"0x8\" "
+        "type=\"char *\"/>\n";
+  os << "          <arg name=\"param\" addressQualifier=\"1\" id=\"2\" "
+        "size=\"0x8\" offset=\"0x10\" hostOffset=\"0x0\" hostSize=\"0x8\" "
+        "type=\"char *\"/>\n";
+  os << "          <arg name=\"ofm\" addressQualifier=\"1\" id=\"3\" "
+        "size=\"0x8\" offset=\"0x18\" hostOffset=\"0x0\" hostSize=\"0x8\" "
+        "type=\"char *\"/>\n";
+  os << "          <arg name=\"inter\" addressQualifier=\"1\" id=\"4\" "
+        "size=\"0x8\" offset=\"0x20\" hostOffset=\"0x0\" hostSize=\"0x8\" "
+        "type=\"char *\"/>\n";
+  os << "          <arg name=\"instruct\" addressQualifier=\"1\" id=\"5\" "
+        "size=\"0x8\" offset=\"0x28\" hostOffset=\"0x0\" hostSize=\"0x8\" "
+        "type=\"char *\"/>\n";
+  os << "          <arg name=\"nistruct\" addressQualifier=\"0\" id=\"6\" "
+        "size=\"0x4\" offset=\"0x30\" hostOffset=\"0x0\" hostSize=\"0x4\" "
+        "type=\"uint32_t\"/>\n";
+  os << "          <arg name=\"mc\" addressQualifier=\"1\" id=\"7\" "
+        "size=\"0x8\" offset=\"0x34\" hostOffset=\"0x0\" hostSize=\"0x8\" "
+        "type=\"char *\"/>\n";
+  os << "          <instance name=\"" << instance << "\"/>\n";
+  os << "        </kernel>\n";
+  os << "      </core>\n";
+  os << "    </device>\n";
+  os << "  </platform>\n";
+  os << "</project>\n";
+  os.flush();
+  return std::vector<uint8_t>(xml.begin(), xml.end());
 }
 
 LogicalResult writeAxlf(StringRef outputPath,
@@ -1521,24 +1654,38 @@ LogicalResult generateAMDXDNAContextXCLBin(
   ArrayRef<uint8_t> pdiBytes(
       reinterpret_cast<const uint8_t *>((*pdiBuffer)->getBufferStart()),
       (*pdiBuffer)->getBufferSize());
+  constexpr StringLiteral kDpuName = "DPU_PDI_0";
   FailureOr<std::vector<uint8_t>> ipLayout =
-      buildIpLayoutSection(xclBinKernelName, xclBinInstanceName, *kernelId);
+      buildIpLayoutSection(xclBinKernelName, kDpuName, xclBinInstanceName,
+                           *kernelId);
   if (failed(ipLayout)) return failure();
   FailureOr<std::vector<uint8_t>> aiePartition =
       buildAiePartitionSection(pdiBytes, *kernelId);
   if (failed(aiePartition)) return failure();
 
   std::vector<XclbinSectionPayload> sections;
+  sections.push_back({kAxlfSectionBitstream, "dummy_bitstream", {}});
   sections.push_back({kAxlfSectionBuildMetadata, "BUILD_METADATA",
                       buildBuildMetadataSection(xclBinKernelName)});
   sections.push_back(
       {kAxlfSectionMemTopology, "MEM_TOPOLOGY", buildMemTopologySection()});
+  sections.push_back({kAxlfSectionAskGroupTopology, "",
+                      buildMemTopologySection()});
   sections.push_back(
       {kAxlfSectionIpLayout, "IP_LAYOUT", std::move(*ipLayout)});
   sections.push_back({kAxlfSectionConnectivity, "CONNECTIVITY",
-                      buildConnectivitySection()});
+                      buildConnectivitySection(/*groupConnectivity=*/false)});
+  sections.push_back(
+      {kAxlfSectionAskGroupConnectivity, "conn",
+       buildConnectivitySection(/*groupConnectivity=*/true)});
   sections.push_back({kAxlfSectionAiePartition, "AIE_PARTITION",
                       std::move(*aiePartition)});
+  // AXLF stores section names in a 16-byte C string, so the canonical
+  // EMBEDDED_METADATA spelling does not fit. Consumers key on the numeric kind.
+  sections.push_back({kAxlfSectionEmbeddedMetadata, "EMBEDDED_META",
+                      buildEmbeddedMetadataSection(
+                          xclBinKernelName, kDpuName, xclBinInstanceName,
+                          *kernelId)});
   return writeAxlf(output, sections);
 }
 
