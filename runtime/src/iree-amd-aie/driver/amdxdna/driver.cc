@@ -45,6 +45,7 @@ static bool iree_hal_amdxdna_mcdm_diagnostic_stage_is_valid(
          iree_string_view_equal(value, IREE_SV("create-command")) ||
          iree_string_view_equal(value, IREE_SV("sync-buffer")) ||
          iree_string_view_equal(value, IREE_SV("ready-submit")) ||
+         iree_string_view_equal(value, IREE_SV("stage-aperture")) ||
          iree_string_view_equal(value, IREE_SV("submit")) ||
          iree_string_view_equal(value, IREE_SV("trace"));
 }
@@ -52,6 +53,7 @@ static bool iree_hal_amdxdna_mcdm_diagnostic_stage_is_valid(
 static bool iree_hal_amdxdna_mcdm_submit_mode_is_valid(
     iree_string_view_t value) {
   return iree_string_view_is_empty(value) ||
+         iree_string_view_equal(value, IREE_SV("qhdl")) ||
          iree_string_view_equal(value, IREE_SV("direct")) ||
          iree_string_view_equal(value, IREE_SV("aperture"));
 }
@@ -125,7 +127,8 @@ iree_status_t iree_hal_amdxdna_device_options_parse(
             "Option 'amdxdna_mcdm_diagnostic_stop_after' expected one of: "
             "none | load-api | find-adapter | create-device | alloc-buffer | "
             "context-blob | create-context | open-cu | create-command | "
-            "sync-buffer | ready-submit | submit | trace. Got: '%.*s'",
+            "sync-buffer | ready-submit | stage-aperture | submit | trace. "
+            "Got: '%.*s'",
             (int)value.size, value.data);
       }
       params->mcdm_diagnostic_stop_after = value;
@@ -134,8 +137,8 @@ iree_status_t iree_hal_amdxdna_device_options_parse(
       if (!iree_hal_amdxdna_mcdm_submit_mode_is_valid(value)) {
         return iree_make_status(
             IREE_STATUS_FAILED_PRECONDITION,
-            "Option 'amdxdna_mcdm_submit_mode' expected one of: direct | "
-            "aperture. Got: '%.*s'",
+            "Option 'amdxdna_mcdm_submit_mode' expected one of: qhdl | "
+            "direct | aperture. Got: '%.*s'",
             (int)value.size, value.data);
       }
       params->mcdm_submit_mode = value;

@@ -7,6 +7,7 @@
 #include "iree-amd-aie/driver/amdxdna/native.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +27,12 @@ namespace {
 constexpr uint64_t kMaxExecBoSize = 4096;
 constexpr char kAllowUnsafeApertureSubmitEnv[] =
     "IREE_AMDXDNA_MCDM_ALLOW_UNSAFE_APERTURE_SUBMIT";
+constexpr char kAllowUnsafeQhdlSubmitEnv[] =
+    "IREE_AMDXDNA_MCDM_ALLOW_UNSAFE_QHDL_SUBMIT";
+constexpr uint32_t kXgqCmdOpStartCuIdx = 0x100;
+constexpr uint32_t kXgqSqCmdNew = 1;
+constexpr uint32_t kXgqCuDomainPl = 0;
+constexpr size_t kXgqHeaderWords = 2;
 
 enum class DiagnosticStage : uint8_t {
   none = 0,
@@ -39,16 +46,19 @@ enum class DiagnosticStage : uint8_t {
   create_command,
   sync_buffer,
   ready_submit,
+  stage_aperture,
   submit,
   trace,
 };
 
 enum class SubmitMode : uint8_t {
+  qhdl,
   direct,
   aperture,
 };
 
 struct BoundBuffer {
+  size_t position = 0;
   iree_hal_amdxdna_native_buffer_t* buffer = nullptr;
   iree_device_size_t offset = 0;
   iree_device_size_t size = 0;
@@ -96,6 +106,8 @@ const char* diagnostic_stage_name(DiagnosticStage stage) {
       return "sync-buffer";
     case DiagnosticStage::ready_submit:
       return "ready-submit";
+    case DiagnosticStage::stage_aperture:
+      return "stage-aperture";
     case DiagnosticStage::submit:
       return "submit";
     case DiagnosticStage::trace:
@@ -131,6 +143,8 @@ bool parse_diagnostic_stage(iree_string_view_t value,
     *out_stage = DiagnosticStage::sync_buffer;
   } else if (iree_string_view_equal(value, IREE_SV("ready-submit"))) {
     *out_stage = DiagnosticStage::ready_submit;
+  } else if (iree_string_view_equal(value, IREE_SV("stage-aperture"))) {
+    *out_stage = DiagnosticStage::stage_aperture;
   } else if (iree_string_view_equal(value, IREE_SV("submit"))) {
     *out_stage = DiagnosticStage::submit;
   } else if (iree_string_view_equal(value, IREE_SV("trace"))) {
@@ -147,6 +161,10 @@ bool parse_submit_mode(iree_string_view_t value, SubmitMode* out_mode) {
       iree_string_view_equal(value, IREE_SV("direct"))) {
     return true;
   }
+  if (iree_string_view_equal(value, IREE_SV("qhdl"))) {
+    *out_mode = SubmitMode::qhdl;
+    return true;
+  }
   if (iree_string_view_equal(value, IREE_SV("aperture"))) {
     *out_mode = SubmitMode::aperture;
     return true;
@@ -155,14 +173,32 @@ bool parse_submit_mode(iree_string_view_t value, SubmitMode* out_mode) {
 }
 
 iree_status_t require_submit_mode_opt_in(SubmitMode submit_mode) {
-  if (submit_mode != SubmitMode::aperture) return iree_ok_status();
-  if (env_flag_enabled(kAllowUnsafeApertureSubmitEnv)) return iree_ok_status();
-  return iree_make_status(
-      IREE_STATUS_FAILED_PRECONDITION,
-      "amdxdna_mcdm_submit_mode=aperture is disabled by default because the "
-      "Windows MCDM exec-BO staging contract is not fully mapped yet; set "
-      "%s=1 to opt in to this unsafe probe mode",
-      kAllowUnsafeApertureSubmitEnv);
+  switch (submit_mode) {
+    case SubmitMode::direct:
+      return iree_ok_status();
+    case SubmitMode::aperture:
+      if (env_flag_enabled(kAllowUnsafeApertureSubmitEnv)) {
+        return iree_ok_status();
+      }
+      return iree_make_status(
+          IREE_STATUS_FAILED_PRECONDITION,
+          "amdxdna_mcdm_submit_mode=aperture is disabled by default because "
+          "the Windows MCDM exec-BO staging contract is not fully mapped yet; "
+          "set %s=1 to opt in to this unsafe probe mode",
+          kAllowUnsafeApertureSubmitEnv);
+    case SubmitMode::qhdl:
+      if (env_flag_enabled(kAllowUnsafeQhdlSubmitEnv)) {
+        return iree_ok_status();
+      }
+      return iree_make_status(
+          IREE_STATUS_FAILED_PRECONDITION,
+          "amdxdna_mcdm_submit_mode=qhdl is disabled by default because the "
+          "0x268 qhdl block is an internal XRT object layout, not the public "
+          "KMT submit packet; set %s=1 only for controlled probe runs",
+          kAllowUnsafeQhdlSubmitEnv);
+  }
+  return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                          "unknown amdxdna Windows MCDM submit mode");
 }
 
 iree_status_t validate_device_size_fits_u64(iree_device_size_t size) {
@@ -230,6 +266,13 @@ ert_start_kernel_cmd* command_start_packet(
 
 ert_packet* command_packet(iree_hal_amdxdna_native_command_t* command);
 
+uint32_t first_set_bit(uint32_t value) {
+  for (uint32_t i = 0; i < 32; ++i) {
+    if (value & (uint32_t{1} << i)) return i;
+  }
+  return 0;
+}
+
 }  // namespace
 
 struct iree_hal_amdxdna_native_device_t {
@@ -264,6 +307,8 @@ struct iree_hal_amdxdna_native_queue_t {
 struct iree_hal_amdxdna_native_context_t {
   iree_hal_amdxdna_native_device_t* device = nullptr;
   mcdm::Context context;
+  mcdm::CommandControlBuffer command_control;
+  bool has_command_control = false;
   mcdm::CommandAperture command_aperture;
   bool has_command_aperture = false;
   mcdm::ContextBlobInfo info;
@@ -271,10 +316,13 @@ struct iree_hal_amdxdna_native_context_t {
 
   iree_hal_amdxdna_native_context_t(
       iree_hal_amdxdna_native_device_t* device, mcdm::Context context,
+      mcdm::CommandControlBuffer command_control, bool has_command_control,
       mcdm::CommandAperture command_aperture, bool has_command_aperture,
       mcdm::ContextBlobInfo info)
       : device(device),
         context(context),
+        command_control(command_control),
+        has_command_control(has_command_control),
         command_aperture(command_aperture),
         has_command_aperture(has_command_aperture),
         info(std::move(info)) {
@@ -394,15 +442,115 @@ void trace_command_packet(const char* phase,
     const mcdm::Buffer& buffer = bound.buffer->buffer;
     const mcdm::BufferKindInfo kind = mcdm::GetBufferKindInfo(buffer.kind);
     std::fprintf(stderr,
-                 "[amdxdna:mcdm] packet %s: bound[%zu] kind=%s alloc=0x%08x "
-                 "gpu_va=0x%llx offset=%llu size=%llu bo_size=%llu\n",
-                 phase, i, kind.name, static_cast<unsigned>(buffer.allocation),
+                 "[amdxdna:mcdm] packet %s: bound[%zu] pos=%zu kind=%s "
+                 "alloc=0x%08x gpu_va=0x%llx offset=%llu size=%llu "
+                 "bo_size=%llu\n",
+                 phase, i, bound.position, kind.name,
+                 static_cast<unsigned>(buffer.allocation),
                  static_cast<unsigned long long>(buffer.gpu_va),
                  static_cast<unsigned long long>(bound.offset),
                  static_cast<unsigned long long>(bound.size),
                  static_cast<unsigned long long>(buffer.size));
   }
   std::fflush(stderr);
+}
+
+iree_status_t build_xgq_start_cuidx_words(
+    iree_hal_amdxdna_native_command_t* command,
+    std::vector<uint32_t>* out_words) {
+  IREE_ASSERT_ARGUMENT(command);
+  IREE_ASSERT_ARGUMENT(out_words);
+  out_words->clear();
+
+  if (IREE_UNLIKELY(command->opcode !=
+                    iree_hal_amdxdna_native_command_opcode_t::start_cu)) {
+    return iree_make_status(
+        IREE_STATUS_UNIMPLEMENTED,
+        "amdxdna Windows MCDM aperture submit only supports START_CU today");
+  }
+
+  ert_start_kernel_cmd* packet = command_start_packet(command);
+  const uint32_t mask_words = 1 + packet->extra_cu_masks;
+  const uint32_t skipped_control_words = 4;
+  if (IREE_UNLIKELY(packet->count <
+                    mask_words + skipped_control_words)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "amdxdna Windows MCDM START_CU packet is too small for XGQ "
+        "translation");
+  }
+
+  const uint32_t payload_words =
+      packet->count - mask_words - skipped_control_words;
+  const uint32_t payload_bytes = payload_words * sizeof(uint32_t);
+  if (IREE_UNLIKELY(payload_bytes > 0x7fff)) {
+    return iree_make_status(
+        IREE_STATUS_OUT_OF_RANGE,
+        "amdxdna Windows MCDM XGQ payload is too large");
+  }
+
+  out_words->resize(kXgqHeaderWords + payload_words);
+  (*out_words)[0] = (kXgqSqCmdNew << 31) | (payload_bytes << 16) |
+                    kXgqCmdOpStartCuIdx;
+  const uint32_t cu_idx = first_set_bit(packet->cu_mask);
+  (*out_words)[1] = (cu_idx << 16) | (kXgqCuDomainPl << 28);
+
+  const uint32_t* regmap = get_ert_regmap_begin(packet);
+  const uint32_t* payload = regmap + skipped_control_words;
+  if (payload_words > 0) {
+    std::memcpy(out_words->data() + kXgqHeaderWords, payload,
+                payload_bytes);
+  }
+  return iree_ok_status();
+}
+
+void trace_xgq_words(iree_hal_amdxdna_native_command_t* command,
+                     const std::vector<uint32_t>& words,
+                     const mcdm::CommandAperture& aperture) {
+  if (!diagnostic_trace_packets(command->device)) return;
+  const size_t word_count = std::min<size_t>(words.size(), 24);
+  std::fprintf(stderr,
+               "[amdxdna:mcdm] aperture xgq: alloc=0x%08x gpu_alloc=0x%08x "
+               "gpu_va=0x%llx bytes=%zu aperture_size=%llu\n",
+               static_cast<unsigned>(aperture.allocation),
+               static_cast<unsigned>(aperture.gpu_allocation),
+               static_cast<unsigned long long>(aperture.gpu_va),
+               words.size() * sizeof(uint32_t),
+               static_cast<unsigned long long>(aperture.allocation_size));
+  std::fprintf(stderr, "[amdxdna:mcdm] aperture xgq: words");
+  for (size_t i = 0; i < word_count; ++i) {
+    std::fprintf(stderr, " %08x", words[i]);
+  }
+  std::fprintf(stderr, "\n");
+  std::fflush(stderr);
+}
+
+iree_status_t stage_xgq_command_aperture(
+    iree_hal_amdxdna_native_queue_t* queue,
+    iree_hal_amdxdna_native_command_t* command) {
+  mcdm::CommandAperture& aperture = queue->context->command_aperture;
+  if (IREE_UNLIKELY(!aperture.cpu_ptr || aperture.allocation_size == 0)) {
+    return iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "amdxdna Windows MCDM command aperture is not CPU mapped");
+  }
+
+  std::vector<uint32_t> xgq_words;
+  IREE_RETURN_IF_ERROR(build_xgq_start_cuidx_words(command, &xgq_words));
+  const size_t xgq_bytes = xgq_words.size() * sizeof(uint32_t);
+  if (IREE_UNLIKELY(xgq_bytes > aperture.allocation_size)) {
+    return iree_make_status(
+        IREE_STATUS_RESOURCE_EXHAUSTED,
+        "amdxdna Windows MCDM XGQ packet does not fit command aperture");
+  }
+
+  std::memset(aperture.cpu_ptr, 0,
+              static_cast<size_t>(aperture.allocation_size));
+  std::memcpy(aperture.cpu_ptr, xgq_words.data(), xgq_bytes);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  FlushProcessWriteBuffers();
+  trace_xgq_words(command, xgq_words, aperture);
+  return iree_ok_status();
 }
 
 iree_status_t check_pkt_count_capacity(
@@ -433,7 +581,7 @@ void bind_buffer_ref(iree_hal_amdxdna_native_command_t* command,
                      size_t position, iree_hal_amdxdna_native_buffer_t* buffer,
                      iree_device_size_t offset, iree_device_size_t size) {
   if (position == 0) command->bound_buffers.clear();
-  command->bound_buffers.push_back(BoundBuffer{buffer, offset, size});
+  command->bound_buffers.push_back(BoundBuffer{position, buffer, offset, size});
 }
 
 }  // namespace
@@ -676,26 +824,69 @@ iree_status_t iree_hal_amdxdna_native_device_create_context(
     return status;
   }
 
+  mcdm::CommandControlBuffer command_control = {};
+  bool has_command_control = false;
+
   mcdm::CommandAperture command_aperture = {};
   bool has_command_aperture = false;
-  if (device->submit_mode == SubmitMode::aperture) {
+  if (device->submit_mode == SubmitMode::aperture ||
+      device->submit_mode == SubmitMode::qhdl) {
     if (!mcdm::CreateCommandAperture(device->api, device->device, context,
                                      &command_aperture, &error)) {
+      if (has_command_control) {
+        mcdm::DestroyCommandControlBuffer(device->api, device->device,
+                                          &command_control);
+      }
       mcdm::DestroyContext(device->api, &context);
       return status_from_mcdm_error(
           "amdxdna Windows MCDM command aperture creation failed", error);
     }
     has_command_aperture = true;
+    if (device->submit_mode == SubmitMode::qhdl) {
+      if (command_aperture.cpu_ptr) {
+        uint64_t initialized = 1;
+        std::memset(command_aperture.cpu_ptr, 0,
+                    static_cast<size_t>(command_aperture.allocation_size));
+        std::memcpy(command_aperture.cpu_ptr, &initialized,
+                    sizeof(initialized));
+      }
+      command_control.size = command_aperture.allocation_size;
+      command_control.allocation = command_aperture.allocation;
+      command_control.resource = command_aperture.resource;
+      command_control.cpu_ptr = command_aperture.cpu_ptr;
+      command_control.next_slot_offset = 8;
+      has_command_control = true;
+      if (!mcdm::SubmitAndWaitCommandAperture(
+              device->api, device->device, &context, command_aperture,
+              &error)) {
+        mcdm::DestroyCommandAperture(device->api, device->device,
+                                     &command_aperture);
+        mcdm::DestroyContext(device->api, &context);
+        return status_from_mcdm_error(
+            "amdxdna Windows MCDM command aperture bootstrap failed", error);
+      }
+    }
   }
 
   *out_context = new iree_hal_amdxdna_native_context_t(
-      device, context, command_aperture, has_command_aperture, info);
+      device, context, command_control, has_command_control, command_aperture,
+      has_command_aperture, info);
   return iree_ok_status();
 }
 
 void iree_hal_amdxdna_native_context_destroy(
     iree_hal_amdxdna_native_context_t* context) {
   if (!context) return;
+  const bool command_control_aliases_aperture =
+      context->has_command_control && context->has_command_aperture &&
+      context->command_control.allocation ==
+          context->command_aperture.allocation &&
+      context->command_control.cpu_ptr == context->command_aperture.cpu_ptr;
+  if (context->has_command_control && !command_control_aliases_aperture) {
+    mcdm::DestroyCommandControlBuffer(context->device->api,
+                                      context->device->device,
+                                      &context->command_control);
+  }
   if (context->has_command_aperture) {
     mcdm::DestroyCommandAperture(context->device->api, context->device->device,
                                  &context->command_aperture);
@@ -982,7 +1173,7 @@ iree_status_t iree_hal_amdxdna_native_command_prepare_chain(
     chain_data->data[i] = commands[i]->exec_buffer->buffer.allocation;
     trace_command_packet("chain-slot", commands[i]);
     command->bound_buffers.push_back(BoundBuffer{
-        commands[i]->exec_buffer.get(), 0,
+        i, commands[i]->exec_buffer.get(), 0,
         iree_hal_amdxdna_native_buffer_size(commands[i]->exec_buffer.get())});
     for (const BoundBuffer& bound : commands[i]->bound_buffers) {
       command->bound_buffers.push_back(bound);
@@ -1024,6 +1215,7 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
   IREE_RETURN_IF_ERROR(
       diagnostic_after(command->device, DiagnosticStage::ready_submit));
 
+  bool packet_state_from_completion_slot = false;
   if (command->device->submit_mode == SubmitMode::aperture) {
     if (!queue->context->has_command_aperture) {
       return iree_make_status(
@@ -1031,6 +1223,9 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
           "amdxdna Windows MCDM aperture submit requested without command "
           "aperture");
     }
+    IREE_RETURN_IF_ERROR(stage_xgq_command_aperture(queue, command));
+    IREE_RETURN_IF_ERROR(
+        diagnostic_after(command->device, DiagnosticStage::stage_aperture));
     if (!mcdm::SubmitAndWaitCommandAperture(
             command->device->api, command->device->device,
             &queue->context->context, queue->context->command_aperture,
@@ -1038,6 +1233,31 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
       return status_from_mcdm_error(
           "amdxdna Windows MCDM command aperture submit failed", error);
     }
+  } else if (command->device->submit_mode == SubmitMode::qhdl) {
+    if (command->opcode ==
+        iree_hal_amdxdna_native_command_opcode_t::command_chain) {
+      return iree_make_status(
+          IREE_STATUS_UNIMPLEMENTED,
+          "amdxdna Windows MCDM qhdl submit does not support command chains "
+          "yet; use --amdxdna_cmd_chain=false for the first e2e dispatch");
+    }
+    if (!queue->context->has_command_control) {
+      return iree_make_status(
+          IREE_STATUS_FAILED_PRECONDITION,
+          "amdxdna Windows MCDM qhdl submit requested without command control "
+          "buffer");
+    }
+    const uint32_t command_bytes = (packet->count + 1) * sizeof(uint32_t);
+    if (!mcdm::SubmitAndWaitQhdlCommand(
+            command->device->api, command->device->device,
+            &queue->context->context, &queue->context->command_control,
+            command->exec_buffer->buffer, command_bytes, 3,
+            static_cast<uint32_t>(command->exec_buffer->buffer.allocation),
+            &packet->header, &error)) {
+      return status_from_mcdm_error(
+          "amdxdna Windows MCDM qhdl command submit failed", error);
+    }
+    packet_state_from_completion_slot = true;
   } else {
     if (!mcdm::SubmitAndWaitBuffer(command->device->api,
                                    command->device->device,
@@ -1051,9 +1271,11 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
   IREE_RETURN_IF_ERROR(diagnostic_after(command->device,
                                         DiagnosticStage::submit));
 
-  IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
-      command->exec_buffer.get(),
-      iree_hal_amdxdna_native_sync_direction_t::device_to_host));
+  if (!packet_state_from_completion_slot) {
+    IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
+        command->exec_buffer.get(),
+        iree_hal_amdxdna_native_sync_direction_t::device_to_host));
+  }
   trace_command_packet("after-readback", command);
 
   if (packet->state == ERT_CMD_STATE_COMPLETED) return iree_ok_status();

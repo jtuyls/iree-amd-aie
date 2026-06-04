@@ -25,11 +25,12 @@ IREE_FLAG(string, amdxdna_mcdm_diagnostic_stop_after, "",
           "Windows MCDM bring-up gate. Empty/none runs normally; otherwise "
           "stop after one of: load-api, find-adapter, create-device, "
           "alloc-buffer, context-blob, create-context, open-cu, "
-          "create-command, sync-buffer, ready-submit, submit. Use trace to "
-          "run normally while printing packet diagnostics.");
+          "create-command, sync-buffer, ready-submit, stage-aperture, submit. "
+          "Use trace to run normally while printing packet diagnostics.");
 IREE_FLAG(string, amdxdna_mcdm_submit_mode, "",
-          "Windows MCDM submit mode. Empty/direct submits the exec BO directly; "
-          "aperture submits through the experimental command aperture path.");
+          "Windows MCDM submit mode. Empty/direct is a diagnostic "
+          "negative-control path; qhdl and aperture are unsafe experimental "
+          "probe paths guarded by environment opt-ins.");
 
 static const iree_string_view_t key_amdxdna_n_core_rows =
     iree_string_view_literal("amdxdna_n_core_rows");

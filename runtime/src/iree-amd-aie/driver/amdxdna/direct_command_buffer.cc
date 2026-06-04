@@ -395,6 +395,22 @@ constexpr uint64_t kDdrAieAddrOffset = 0x80000000ULL;
 constexpr uint32_t kWrite32ConstantSentinel = 0xA1EC0000u;
 constexpr uint32_t kWrite32ConstantMask = 0xFFFF0000u;
 
+constexpr bool iree_hal_amdxdna_dispatch_uses_npu_payload() {
+#if defined(_WIN32)
+  return true;
+#else
+  return false;
+#endif
+}
+
+constexpr iree_hal_amdxdna_native_command_opcode_t
+iree_hal_amdxdna_dispatch_command_opcode() {
+  if (iree_hal_amdxdna_dispatch_uses_npu_payload()) {
+    return iree_hal_amdxdna_native_command_opcode_t::start_npu;
+  }
+  return iree_hal_amdxdna_native_command_opcode_t::start_cu;
+}
+
 // Size in bytes of one XAie transaction operation starting at byte offset `p`.
 // Returns 0 on malformed/truncated input.
 uint32_t iree_hal_amdxdna_txn_op_size(const uint8_t* b, size_t total,
@@ -822,19 +838,28 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_normal_run(
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_hal_amdxdna_native_command_create(
               command_buffer->device->native_device,
-              iree_hal_amdxdna_native_command_opcode_t::start_cu, &command));
+              iree_hal_amdxdna_dispatch_command_opcode(), &command));
   // Add the kernel arguments.
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_hal_amdxdna_native_command_set_cu_index(command.get(), cu_idx));
-  IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0, iree_hal_amdxdna_native_command_add_arg_64(
-              command.get(), kAmdxdnaControlCodeOpcode));
-  IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0, iree_hal_amdxdna_native_command_add_buffer_arg(
-              command.get(), ctrl_code_buffer.get()));
-  IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0, iree_hal_amdxdna_native_command_add_arg_32(command.get(),
-                                                     asm_inst.size()));
+  if (iree_hal_amdxdna_dispatch_uses_npu_payload()) {
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_amdxdna_native_command_add_control_buffer(
+                command.get(), ctrl_code_buffer.get()));
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_amdxdna_native_command_add_arg_32(
+                command.get(), kAie2ExecBufferKernelOpTxn));
+  } else {
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_amdxdna_native_command_add_arg_64(
+                command.get(), kAmdxdnaControlCodeOpcode));
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_amdxdna_native_command_add_buffer_arg(
+                command.get(), ctrl_code_buffer.get()));
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_amdxdna_native_command_add_arg_32(command.get(),
+                                                       asm_inst.size()));
+  }
   for (iree_host_size_t j = 0; j < bindings.count; ++j) {
     iree_hal_amdxdna_native_buffer_t* native_buffer =
         iree_hal_amdxdna_buffer_handle(
@@ -919,19 +944,28 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_reconfigure(
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_hal_amdxdna_native_command_create(
               command_buffer->device->native_device,
-              iree_hal_amdxdna_native_command_opcode_t::start_cu, &command));
+              iree_hal_amdxdna_dispatch_command_opcode(), &command));
   // Add the kernel arguments.
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_hal_amdxdna_native_command_set_cu_index(command.get(), cu_idx));
-  IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0, iree_hal_amdxdna_native_command_add_arg_64(
-              command.get(), kAmdxdnaControlCodeOpcode));
-  IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0, iree_hal_amdxdna_native_command_add_buffer_arg(
-              command.get(), ctrlpkt_inst_buffer.get()));
-  IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0, iree_hal_amdxdna_native_command_add_arg_32(command.get(),
-                                                     ctrlpkt_inst.size()));
+  if (iree_hal_amdxdna_dispatch_uses_npu_payload()) {
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_amdxdna_native_command_add_control_buffer(
+                command.get(), ctrlpkt_inst_buffer.get()));
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_amdxdna_native_command_add_arg_32(
+                command.get(), kAie2ExecBufferKernelOpTxn));
+  } else {
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_amdxdna_native_command_add_arg_64(
+                command.get(), kAmdxdnaControlCodeOpcode));
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_amdxdna_native_command_add_buffer_arg(
+                command.get(), ctrlpkt_inst_buffer.get()));
+    IREE_RETURN_AND_END_ZONE_IF_ERROR(
+        z0, iree_hal_amdxdna_native_command_add_arg_32(command.get(),
+                                                       ctrlpkt_inst.size()));
+  }
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_hal_amdxdna_native_command_add_buffer_arg(
               command.get(), ctrlpkt_seq_buffer.get()));

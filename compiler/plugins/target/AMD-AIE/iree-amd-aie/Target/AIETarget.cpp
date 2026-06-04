@@ -609,9 +609,18 @@ LogicalResult AIETargetBackend::serializeExecutable(
                                         ".ctrlpkt_seq.txt");
     llvm::sys::path::append(ctrlpktSeqPath, ctrlpktSeqFileName);
 
-    // Convert ordinal to hexadecimal string for kernel id.
+    // Strix Windows MCDM contexts use DPU kernel ids in the 0x100 range.
+    // Keep the historic ordinal ids unless we are emitting the hidden context
+    // xclbin wrapper consumed by that driver path.
+    uint64_t xclBinKernelId = ordinal;
+    if (options.deviceHal == AMDAIEOptions::DeviceHAL::AMDXDNA &&
+        options.emitAMDXDNAContextXclbin) {
+      xclBinKernelId += 0x100;
+    }
+
+    // Convert kernel id to a hexadecimal string.
     std::stringstream ordinalHex;
-    ordinalHex << "0x" << std::hex << ordinal;
+    ordinalHex << "0x" << std::hex << xclBinKernelId;
 
     ParserConfig pcfg(variantOp->getContext());
     llvm::SourceMgr srcMgr;

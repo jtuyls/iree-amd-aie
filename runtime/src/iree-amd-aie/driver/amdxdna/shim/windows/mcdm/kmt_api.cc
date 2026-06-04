@@ -7,6 +7,9 @@
 #include "kmt_api.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <vector>
@@ -20,9 +23,16 @@ constexpr uint64_t kCommandApertureAllocationSize = 0x1000;
 constexpr D3DGPU_VIRTUAL_ADDRESS kCommandApertureGpuVaBase = 0x04000000;
 constexpr uint64_t kCommandApertureGpuVaSize = 0x04000000;
 constexpr uint32_t kCommandAperturePrivateType = 0x332b;
-constexpr uint32_t kCommandApertureGpuAllocationDelta = 0x40;
-constexpr uint32_t kCommandApertureCleanupAllocationDelta = 0xc0;
+constexpr uint64_t kCommandControlBufferSize = 0x1000;
+constexpr uint32_t kQhdlSubmitPrivateSize = 0x268;
+constexpr uint32_t kQhdlSubmitPacketOffset = 0x68;
+constexpr uint32_t kQhdlCompletionSlotSize = 8;
 constexpr uint32_t kSubmitPrivateQwords = 13;  // 104 bytes on current driver.
+constexpr char kApertureLockHandleDeltaEnv[] =
+    "IREE_AMDXDNA_MCDM_APERTURE_LOCK_HANDLE_DELTA";
+constexpr char kApertureGpuHandleDeltaEnv[] =
+    "IREE_AMDXDNA_MCDM_APERTURE_GPU_HANDLE_DELTA";
+constexpr char kTraceQhdlEnv[] = "IREE_AMDXDNA_MCDM_TRACE_QHDL";
 
 template <typename Fn>
 Fn ResolveKmtProc(const char* name) {
@@ -63,6 +73,19 @@ uint32_t Flags32(const D3DKMT_CREATEALLOCATIONFLAGS& flags) {
   return value;
 }
 
+bool TraceQhdlEnabled() {
+  const char* value = std::getenv(kTraceQhdlEnv);
+  return value && value[0] && value[0] != '0';
+}
+
+void WriteU32(std::vector<uint8_t>* data, size_t offset, uint32_t value) {
+  std::memcpy(data->data() + offset, &value, sizeof(value));
+}
+
+void WriteU64(std::vector<uint8_t>* data, size_t offset, uint64_t value) {
+  std::memcpy(data->data() + offset, &value, sizeof(value));
+}
+
 struct AllocPrivate {
   uint64_t reserved0 = 0;
   uint64_t requested_size = 0;
@@ -81,6 +104,15 @@ static_assert(sizeof(AllocPrivate) == 56,
 
 uint64_t AlignUpToPage(uint64_t value) {
   return (value + 4095u) & ~uint64_t{4095u};
+}
+
+uint32_t ReadHandleDeltaEnv(const char* name, uint32_t default_value) {
+  const char* text = std::getenv(name);
+  if (!text || !*text) return default_value;
+  char* end = nullptr;
+  unsigned long value = std::strtoul(text, &end, 0);
+  if (!end || *end != '\0') return default_value;
+  return static_cast<uint32_t>(value);
 }
 
 }  // namespace
@@ -522,11 +554,27 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
   aperture.allocation = command_info.hAllocation;
   aperture.resource = create_command.hResource;
 
+  const uint32_t lock_handle_delta =
+      ReadHandleDeltaEnv(kApertureLockHandleDeltaEnv, 0);
+  const uint32_t gpu_handle_delta =
+      ReadHandleDeltaEnv(kApertureGpuHandleDeltaEnv, 0x40);
+  const D3DKMT_HANDLE lock_allocation =
+      aperture.allocation + lock_handle_delta;
+  aperture.cleanup_allocation = lock_allocation;
+
   D3DKMT_LOCK2 lock = {};
   lock.hDevice = device.device;
-  lock.hAllocation = aperture.allocation;
+  lock.hAllocation = lock_allocation;
   status = api.lock2(&lock);
-  if (!CheckStatus("D3DKMTLock2(command aperture)", status, out_error)) {
+  if (status != 0) {
+    if (out_error) {
+      std::ostringstream os;
+      os << "D3DKMTLock2(command aperture) failed with "
+         << NtStatusToString(status) << " allocation=0x" << std::hex
+         << aperture.allocation << " lock_allocation=0x" << lock_allocation
+         << " resource=0x" << aperture.resource;
+      *out_error = os.str();
+    }
     DestroyCommandAperture(api, device, &aperture);
     return false;
   }
@@ -536,23 +584,28 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
                 static_cast<size_t>(aperture.allocation_size));
   }
 
-  // XRT's NPU command aperture is exposed as a small cluster of related
-  // handles. The returned allocation is CPU-locked, +0x40 is GPU mapped and
-  // named in submit private data, and +0xc0 is used for cleanup.
-  aperture.gpu_allocation =
-      aperture.allocation + kCommandApertureGpuAllocationDelta;
+  aperture.gpu_allocation = aperture.allocation + gpu_handle_delta;
 
   D3DDDI_MAPGPUVIRTUALADDRESS map = {};
   map.hPagingQueue = device.paging_queue;
   map.hAllocation = aperture.gpu_allocation;
-  // Let the MCDM driver choose the aperture VA. XRT leaves BaseAddress unset
-  // here and the driver returns the context-owned 0x04000000 window.
-  map.BaseAddress = 0;
+  map.BaseAddress = kCommandApertureGpuVaBase;
   map.SizeInPages = kCommandApertureGpuVaSize / kPageSize;
   map.Protection.Write = 1;
   status = api.map_gpu_virtual_address(&map);
-  if (!CheckStatusOrPending("D3DKMTMapGpuVirtualAddress(command aperture)",
-                            status, out_error)) {
+  if (status != 0 && status != kStatusPending) {
+    if (out_error) {
+      std::ostringstream os;
+      os << "D3DKMTMapGpuVirtualAddress(command aperture) failed with "
+         << NtStatusToString(status) << " allocation=0x" << std::hex
+         << aperture.allocation << " gpu_allocation=0x"
+         << aperture.gpu_allocation << " lock_allocation=0x"
+         << lock_allocation << " resource=0x" << aperture.resource
+         << " base=0x" << kCommandApertureGpuVaBase << " pages=0x"
+         << map.SizeInPages << " lock_delta=0x" << lock_handle_delta
+         << " gpu_delta=0x" << gpu_handle_delta;
+      *out_error = os.str();
+    }
     DestroyCommandAperture(api, device, &aperture);
     return false;
   }
@@ -582,9 +635,6 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
     DestroyCommandAperture(api, device, &aperture);
     return false;
   }
-  aperture.cleanup_allocation =
-      aperture.allocation + kCommandApertureCleanupAllocationDelta;
-
   D3DKMT_HANDLE wait_objects[1] = {device.paging_sync_object};
   UINT64 wait_values[1] = {resident.PagingFenceValue};
   D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMGPU wait = {};
@@ -601,6 +651,95 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
 
   *out_aperture = aperture;
   return true;
+}
+
+bool CreateCommandControlBuffer(const KmtApi& api, const Device& device,
+                                CommandControlBuffer* out_buffer,
+                                std::string* out_error) {
+  if (!out_buffer) {
+    if (out_error) {
+      *out_error = "CreateCommandControlBuffer called with null output";
+    }
+    return false;
+  }
+
+  AllocPrivate command_private = {};
+  command_private.requested_size = kCommandControlBufferSize;
+  command_private.aligned_size = kCommandControlBufferSize;
+  command_private.private_type = kCommandAperturePrivateType;
+  command_private.policy = 0;
+
+  D3DDDI_ALLOCATIONINFO2 command_info = {};
+  command_info.pPrivateDriverData = &command_private;
+  command_info.PrivateDriverDataSize = sizeof(command_private);
+
+  D3DKMT_CREATEALLOCATION create_command = {};
+  create_command.hDevice = device.device;
+  create_command.Flags.CreateResource = 1;
+  create_command.Flags.CreateShared = 1;
+  create_command.NumAllocations = 1;
+  create_command.pAllocationInfo2 = &command_info;
+
+  NTSTATUS status = api.create_allocation2(&create_command);
+  if (!CheckStatus("D3DKMTCreateAllocation2(command control)", status,
+                   out_error)) {
+    return false;
+  }
+
+  CommandControlBuffer buffer = {};
+  buffer.size = kCommandControlBufferSize;
+  buffer.allocation = command_info.hAllocation;
+  buffer.resource = create_command.hResource;
+
+  D3DKMT_LOCK2 lock = {};
+  lock.hDevice = device.device;
+  lock.hAllocation = buffer.allocation;
+  status = api.lock2(&lock);
+  if (!CheckStatus("D3DKMTLock2(command control)", status, out_error)) {
+    DestroyCommandControlBuffer(api, device, &buffer);
+    return false;
+  }
+  buffer.cpu_ptr = lock.pData;
+  buffer.next_slot_offset = kQhdlCompletionSlotSize;
+  if (buffer.cpu_ptr) {
+    std::memset(buffer.cpu_ptr, 0, static_cast<size_t>(buffer.size));
+    uint64_t initialized = 1;
+    std::memcpy(buffer.cpu_ptr, &initialized, sizeof(initialized));
+  }
+
+  *out_buffer = buffer;
+  return true;
+}
+
+void DestroyCommandControlBuffer(const KmtApi& api, const Device& device,
+                                 CommandControlBuffer* buffer) {
+  if (!buffer || !buffer->allocation) return;
+  if (buffer->cpu_ptr) {
+    D3DKMT_UNLOCK2 unlock = {};
+    unlock.hDevice = device.device;
+    unlock.hAllocation = buffer->allocation;
+    api.unlock2(&unlock);
+    buffer->cpu_ptr = nullptr;
+  }
+  if (buffer->resource) {
+    D3DKMT_DESTROYALLOCATION2 destroy = {};
+    destroy.hDevice = device.device;
+    destroy.hResource = buffer->resource;
+    destroy.Flags.AssumeNotInUse = 1;
+    api.destroy_allocation2(&destroy);
+  } else {
+    D3DKMT_HANDLE allocs[1] = {buffer->allocation};
+    D3DKMT_DESTROYALLOCATION2 destroy = {};
+    destroy.hDevice = device.device;
+    destroy.AllocationCount = 1;
+    destroy.phAllocationList = allocs;
+    destroy.Flags.AssumeNotInUse = 1;
+    api.destroy_allocation2(&destroy);
+  }
+  buffer->allocation = 0;
+  buffer->resource = 0;
+  buffer->size = 0;
+  buffer->next_slot_offset = 0;
 }
 
 bool SubmitAndWaitCommandAperture(const KmtApi& api, const Device& device,
@@ -662,6 +801,140 @@ bool SubmitAndWaitCommandAperture(const KmtApi& api, const Device& device,
   if (wait_event) CloseHandle(wait_event);
   return CheckStatus("D3DKMTWaitForSynchronizationObjectFromCpu", status,
                      out_error);
+}
+
+bool SubmitAndWaitQhdlCommand(const KmtApi& api, const Device& device,
+                              Context* context,
+                              CommandControlBuffer* control,
+                              const Buffer& command_buffer,
+                              uint32_t command_bytes, uint32_t command_state,
+                              uint32_t command_allocation_tag,
+                              uint32_t* packet_header,
+                              std::string* out_error) {
+  if (!context || !context->hw_queue) {
+    if (out_error) {
+      *out_error = "SubmitAndWaitQhdlCommand called without an HW queue";
+    }
+    return false;
+  }
+  if (!control || !control->allocation || !control->cpu_ptr ||
+      control->size < kQhdlCompletionSlotSize * 2) {
+    if (out_error) {
+      *out_error = "SubmitAndWaitQhdlCommand called without a command control buffer";
+    }
+    return false;
+  }
+  if (!command_buffer.allocation || !command_buffer.gpu_va ||
+      command_buffer.size == 0) {
+    if (out_error) {
+      *out_error = "SubmitAndWaitQhdlCommand called with an invalid command BO";
+    }
+    return false;
+  }
+  if (!packet_header || command_bytes == 0 ||
+      command_bytes > kQhdlSubmitPrivateSize - kQhdlSubmitPacketOffset) {
+    if (out_error) {
+      std::ostringstream os;
+      os << "SubmitAndWaitQhdlCommand called with invalid packet bytes "
+         << command_bytes;
+      *out_error = os.str();
+    }
+    return false;
+  }
+
+  if (!WaitForBufferResidency(api, device, *context, command_buffer,
+                              "qhdl-command", out_error)) {
+    return false;
+  }
+
+  uint32_t completion_offset = control->next_slot_offset;
+  if (completion_offset + kQhdlCompletionSlotSize > control->size) {
+    completion_offset = 0;
+  }
+  control->next_slot_offset =
+      completion_offset + kQhdlCompletionSlotSize >= control->size
+          ? 0
+          : completion_offset + kQhdlCompletionSlotSize;
+
+  uint8_t* completion_slot =
+      static_cast<uint8_t*>(control->cpu_ptr) + completion_offset;
+  std::memset(completion_slot, 0, kQhdlCompletionSlotSize);
+
+  std::vector<uint8_t> private_data(kQhdlSubmitPrivateSize, 0);
+  // XRT's qhdl submit block is intentionally sparse for the normal ERT path:
+  // +0x00 = command state/type, +0x08 = command allocation, +0x28..0x38 =
+  // the completion slot in the armed command aperture, +0x68 = packet bytes.
+  WriteU32(&private_data, 0x00, command_state);
+  WriteU64(&private_data, 0x08, command_allocation_tag
+                                ? command_allocation_tag
+                                : command_buffer.allocation);
+  WriteU64(&private_data, 0x28, control->allocation);
+  WriteU32(&private_data, 0x30, completion_offset);
+  WriteU32(&private_data, 0x34, kQhdlCompletionSlotSize);
+  WriteU64(&private_data, 0x38,
+           reinterpret_cast<uint64_t>(completion_slot));
+  std::memcpy(private_data.data() + kQhdlSubmitPacketOffset, packet_header,
+              command_bytes);
+
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  FlushProcessWriteBuffers();
+
+  uint64_t fence_id = context->next_fence_id++;
+  D3DKMT_SUBMITCOMMANDTOHWQUEUE submit = {};
+  submit.hHwQueue = context->hw_queue;
+  submit.HwQueueProgressFenceId = fence_id;
+  submit.CommandBuffer = command_buffer.gpu_va;
+  submit.CommandLength =
+      static_cast<UINT>(command_buffer.size + kQhdlSubmitPacketOffset);
+  submit.PrivateDriverDataSize = static_cast<UINT>(private_data.size());
+  submit.pPrivateDriverData = private_data.data();
+  if (TraceQhdlEnabled()) {
+    std::fprintf(stderr,
+                 "[amdxdna:mcdm] qhdl submit: hwq=0x%08x fence=%llu "
+                 "cmd_alloc=0x%08x cmd_va=0x%llx cmd_len=%u "
+                 "slot_alloc=0x%08x slot_off=0x%x slot_ptr=0x%llx "
+                 "private_size=%u header=0x%08x\n",
+                 static_cast<unsigned>(context->hw_queue),
+                 static_cast<unsigned long long>(fence_id),
+                 static_cast<unsigned>(command_buffer.allocation),
+                 static_cast<unsigned long long>(command_buffer.gpu_va),
+                 static_cast<unsigned>(submit.CommandLength),
+                 static_cast<unsigned>(control->allocation),
+                 static_cast<unsigned>(completion_offset),
+                 static_cast<unsigned long long>(
+                     reinterpret_cast<uintptr_t>(completion_slot)),
+                 static_cast<unsigned>(submit.PrivateDriverDataSize),
+                 packet_header ? *packet_header : 0);
+    std::fflush(stderr);
+  }
+  NTSTATUS status = api.submit_command_to_hw_queue(&submit);
+  if (!CheckStatus("D3DKMTSubmitCommandToHwQueue(qhdl)", status, out_error)) {
+    return false;
+  }
+
+  uint32_t completion_header = 0;
+  const uint64_t deadline = GetTickCount64() + 5000;
+  do {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    std::memcpy(&completion_header, completion_slot,
+                sizeof(completion_header));
+    if ((completion_header & 0xFu) >= 4) break;
+    Sleep(1);
+  } while (GetTickCount64() < deadline);
+  if (packet_header) {
+    uint32_t state_delta = (*packet_header ^ completion_header) & 0xFu;
+    *packet_header ^= state_delta;
+  }
+  if ((completion_header & 0xFu) < 4) {
+    if (out_error) {
+      std::ostringstream os;
+      os << "qhdl completion slot did not complete: header=0x" << std::hex
+         << completion_header << " offset=0x" << completion_offset;
+      *out_error = os.str();
+    }
+    return false;
+  }
+  return true;
 }
 
 bool SubmitAndWaitBuffer(const KmtApi& api, const Device& device,
@@ -766,17 +1039,17 @@ void DestroyCommandAperture(const KmtApi& api, const Device& device,
     aperture->gpu_resource = 0;
   }
 
-  if (aperture->cleanup_allocation || aperture->allocation ||
-      aperture->resource) {
+  if (aperture->resource || aperture->cleanup_allocation ||
+      aperture->allocation) {
     D3DKMT_DESTROYALLOCATION2 destroy_command = {};
     destroy_command.hDevice = device.device;
     destroy_command.Flags.AssumeNotInUse = 1;
-    if (aperture->cleanup_allocation) {
+    if (aperture->resource) {
+      destroy_command.hResource = aperture->resource;
+    } else if (aperture->cleanup_allocation) {
       D3DKMT_HANDLE allocs[1] = {aperture->cleanup_allocation};
       destroy_command.AllocationCount = 1;
       destroy_command.phAllocationList = allocs;
-    } else if (aperture->resource) {
-      destroy_command.hResource = aperture->resource;
     } else if (aperture->allocation) {
       D3DKMT_HANDLE allocs[1] = {aperture->allocation};
       destroy_command.AllocationCount = 1;

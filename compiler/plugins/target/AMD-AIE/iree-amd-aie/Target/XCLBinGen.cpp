@@ -1074,6 +1074,7 @@ constexpr uint32_t kAxlfSectionAiePartition = 32;
 constexpr uint8_t kMemDram = 2;
 constexpr uint32_t kIpPsKernel = 7;
 constexpr uint8_t kCdoPrimary = 1;
+constexpr uint8_t kCdoPrePost = 3;
 constexpr uint16_t kPsSubtypeDpu = 1;
 constexpr uint16_t kPsFunctionalDpu = 0;
 
@@ -1281,7 +1282,9 @@ FailureOr<uint64_t> parseUInt64(StringRef value, const char *fieldName) {
 std::vector<uint8_t> buildMemTopologySection() {
   std::vector<uint8_t> section;
   int32_t count = 2;
+  uint32_t reserved = 0;
   appendPod(section, count);
+  appendPod(section, reserved);
 
   MemData host = {};
   host.type = kMemDram;
@@ -1319,7 +1322,9 @@ FailureOr<std::vector<uint8_t>> buildIpLayoutSection(StringRef kernelName,
 
   std::vector<uint8_t> section;
   int32_t count = 1;
+  uint32_t reserved = 0;
   appendPod(section, count);
+  appendPod(section, reserved);
   appendPod(section, ip);
   return section;
 }
@@ -1364,7 +1369,7 @@ FailureOr<std::vector<uint8_t>> buildAiePartitionSection(ArrayRef<uint8_t> pdi,
   if (failed(kernelCommitId)) return failure();
   partition.kernelCommitId = *kernelCommitId;
 
-  uint16_t startColumn = 1;
+  uint16_t startColumn = 0;
   FailureOr<uint32_t> startColumnsOffset =
       appendHeapPod(section, startColumn, /*align=*/true);
   if (failed(startColumnsOffset)) return failure();
@@ -1380,18 +1385,18 @@ FailureOr<std::vector<uint8_t>> buildAiePartitionSection(ArrayRef<uint8_t> pdi,
   aiePdi.pdiImage.offset = *pdiImageOffset;
 
   CdoGroup cdo = {};
-  FailureOr<uint32_t> cdoName = appendHeapCString(section, "DPU");
+  FailureOr<uint32_t> cdoName = appendHeapCString(section, "DPU_PDI_0");
   if (failed(cdoName)) return failure();
   cdo.nameOffset = *cdoName;
-  cdo.cdoType = kCdoPrimary;
-  cdo.pdiId = 0x01;
+  cdo.cdoType = kCdoPrePost;
+  cdo.pdiId = 0xf0;
   cdo.dpuKernelIds.size = 1;
   FailureOr<uint32_t> kernelIdsOffset =
       appendHeapPod(section, kernelId, /*align=*/true);
   if (failed(kernelIdsOffset)) return failure();
   cdo.dpuKernelIds.offset = *kernelIdsOffset;
   cdo.preCdoGroups.size = 1;
-  uint64_t preCdoGroup = 0xC1;
+  uint64_t preCdoGroup = 0xc0;
   FailureOr<uint32_t> preCdoGroupsOffset =
       appendHeapPod(section, preCdoGroup, /*align=*/true);
   if (failed(preCdoGroupsOffset)) return failure();
@@ -1435,6 +1440,13 @@ LogicalResult writeAxlf(StringRef outputPath,
       std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
   fileHeader.uniqueId = now;
   fileHeader.header.timeStamp = now;
+  fileHeader.header.mode = 4;
+  fileHeader.header.actionMask = 1;
+  if (failed(copyCString(fileHeader.header.platformVbnv,
+                         sizeof(fileHeader.header.platformVbnv),
+                         "xilinx_v1_ipu_0_0", "AXLF platform VBNV"))) {
+    return failure();
+  }
   fileHeader.header.numSections = static_cast<uint32_t>(sections.size());
   std::array<uint8_t, 16> axlfUuid = makeUuidBytes();
   std::memcpy(fileHeader.header.uuid, axlfUuid.data(), axlfUuid.size());
