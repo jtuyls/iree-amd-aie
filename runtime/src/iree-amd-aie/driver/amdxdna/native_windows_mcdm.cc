@@ -11,6 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #include <limits>
 #include <string>
 #include <utility>
@@ -29,10 +32,20 @@ constexpr char kAllowUnsafeApertureSubmitEnv[] =
     "IREE_AMDXDNA_MCDM_ALLOW_UNSAFE_APERTURE_SUBMIT";
 constexpr char kAllowUnsafeQhdlSubmitEnv[] =
     "IREE_AMDXDNA_MCDM_ALLOW_UNSAFE_QHDL_SUBMIT";
-constexpr char kAllowPathbSubmitEnv[] =
-    "IREE_AMDXDNA_MCDM_ALLOW_PATHB_SUBMIT";
-constexpr char kXrtCodeStageAfterPreSyncEnv[] =
-    "IREE_AMDXDNA_MCDM_XRT_CODE_STAGE_AFTER_PRESYNC";
+constexpr char kXrtCodeStageSyncEnv[] =
+    "IREE_AMDXDNA_MCDM_XRT_CODE_STAGE_SYNC";
+constexpr char kXrtWaitPreSyncEnv[] =
+    "IREE_AMDXDNA_MCDM_XRT_WAIT_PRESYNC";
+constexpr char kXrtCodeStageReadbackEnv[] =
+    "IREE_AMDXDNA_MCDM_XRT_CODE_STAGE_READBACK";
+constexpr char kXrtBoundReadbackEnv[] =
+    "IREE_AMDXDNA_MCDM_XRT_BOUND_READBACK";
+constexpr char kXrtBoundReadbackIncludeOutputsEnv[] =
+    "IREE_AMDXDNA_MCDM_XRT_BOUND_READBACK_INCLUDE_OUTPUTS";
+constexpr char kXrtOutputReadbackEnv[] =
+    "IREE_AMDXDNA_MCDM_XRT_OUTPUT_READBACK";
+constexpr char kXrtHostSfenceEnv[] =
+    "IREE_AMDXDNA_MCDM_XRT_HOST_SFENCE";
 constexpr uint32_t kXgqCmdOpStartCuIdx = 0x100;
 constexpr uint32_t kXgqSqCmdNew = 1;
 constexpr uint32_t kXgqCuDomainPl = 0;
@@ -98,6 +111,16 @@ uint32_t env_u32(const char* name, uint32_t default_value = 0) {
     return default_value;
   }
   return static_cast<uint32_t>(parsed);
+}
+
+void flush_host_writes_to_mcdm() {
+#if defined(_MSC_VER)
+  if (env_flag_enabled(kXrtHostSfenceEnv)) {
+    _mm_sfence();
+  }
+#endif
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  FlushProcessWriteBuffers();
 }
 
 iree_status_t status_from_mcdm_error(const char* label,
@@ -225,14 +248,7 @@ iree_status_t require_submit_mode_opt_in(SubmitMode submit_mode) {
           "KMT submit packet; set %s=1 only for controlled probe runs",
           kAllowUnsafeQhdlSubmitEnv);
     case SubmitMode::pathb:
-      if (env_flag_enabled(kAllowPathbSubmitEnv)) {
-        return iree_ok_status();
-      }
-      return iree_make_status(
-          IREE_STATUS_FAILED_PRECONDITION,
-          "amdxdna_mcdm_submit_mode=pathb performs a real per-dispatch NPU "
-          "submit reconstructed from xrt_core; set %s=1 to opt in",
-          kAllowPathbSubmitEnv);
+      return iree_ok_status();
   }
   return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
                           "unknown amdxdna Windows MCDM submit mode");
@@ -430,8 +446,7 @@ namespace {
 bool pathb_stage_code_after_presync(
     iree_hal_amdxdna_native_command_t* command) {
   return command && command->device &&
-         command->device->submit_mode == SubmitMode::pathb &&
-         env_flag_enabled(kXrtCodeStageAfterPreSyncEnv);
+         command->device->submit_mode == SubmitMode::pathb;
 }
 
 bool diagnostic_enabled(iree_hal_amdxdna_native_device_t* device) {
@@ -639,8 +654,7 @@ iree_status_t stage_xgq_command_aperture(
   std::memset(aperture.cpu_ptr, 0,
               static_cast<size_t>(aperture.allocation_size));
   std::memcpy(aperture.cpu_ptr, xgq_words.data(), xgq_bytes);
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-  FlushProcessWriteBuffers();
+  flush_host_writes_to_mcdm();
   trace_xgq_words(command, xgq_words, aperture);
   return iree_ok_status();
 }
@@ -727,8 +741,7 @@ iree_status_t stage_windows_dpu_command_aperture(
   std::memcpy(aperture.code_cpu_ptr, command->control_buffer->buffer.cpu_ptr,
               static_cast<size_t>(command->control_buffer_size));
   const uint64_t instruction_va = aperture.code_gpu_va;  // 0x04008000
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-  FlushProcessWriteBuffers();
+  flush_host_writes_to_mcdm();
   trace_windows_dpu_aperture(command, aperture, 0, instruction_va,
                              static_cast<size_t>(command->control_buffer_size));
   return iree_ok_status();
@@ -764,8 +777,46 @@ iree_status_t stage_windows_dpu_code_buffer(
   std::memset(aperture.code_cpu_ptr, 0, static_cast<size_t>(aperture.code_size));
   std::memcpy(aperture.code_cpu_ptr, command->control_buffer->buffer.cpu_ptr,
               static_cast<size_t>(command->control_buffer_size));
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-  FlushProcessWriteBuffers();
+  flush_host_writes_to_mcdm();
+  if (env_flag_enabled(kXrtCodeStageReadbackEnv)) {
+    volatile const uint32_t* code_words =
+        reinterpret_cast<volatile const uint32_t*>(aperture.code_cpu_ptr);
+    volatile uint32_t checksum = 0;
+    const size_t readback_words =
+        std::min<size_t>(command->control_buffer_size / sizeof(uint32_t), 64);
+    for (size_t i = 0; i < readback_words; ++i) {
+      checksum ^= code_words[i];
+    }
+    if (env_flag_enabled("IREE_AMDXDNA_MCDM_TRACE_QHDL")) {
+      std::fprintf(stderr,
+                   "[amdxdna:mcdm] pathb code-readback: words=%zu "
+                   "checksum=0x%08x\n",
+                   readback_words, static_cast<uint32_t>(checksum));
+      std::fflush(stderr);
+    }
+  }
+  if (env_flag_enabled(kXrtCodeStageSyncEnv) ||
+      (command && command->device &&
+       command->device->submit_mode == SubmitMode::pathb)) {
+    std::string error;
+    if (!mcdm::SyncCommandApertureCode(
+            command->device->api, command->device->device, aperture,
+            kWindowsDpuInstructionApertureOffset,
+            static_cast<uint64_t>(command->control_buffer_size), &error)) {
+      return status_from_mcdm_error(
+          "amdxdna Windows MCDM aperture code sync failed", error);
+    }
+  }
+  if (command && command->device &&
+      command->device->submit_mode == SubmitMode::pathb) {
+    std::string error;
+    if (!mcdm::RefreshCommandApertureGpuMapping(
+            command->device->api, command->device->device, &aperture,
+            &error)) {
+      return status_from_mcdm_error(
+          "amdxdna Windows MCDM aperture code relock failed", error);
+    }
+  }
   trace_windows_dpu_aperture(command, aperture, 0, aperture.code_gpu_va,
                              static_cast<size_t>(command->control_buffer_size));
   return iree_ok_status();
@@ -809,6 +860,56 @@ void bind_buffer_ref(iree_hal_amdxdna_native_command_t* command,
                      iree_device_size_t offset, iree_device_size_t size) {
   if (position == 0) command->bound_buffers.clear();
   command->bound_buffers.push_back(BoundBuffer{position, buffer, offset, size});
+}
+
+void readback_pathb_bound_buffers(iree_hal_amdxdna_native_command_t* command,
+                                  const char* phase, bool outputs_only) {
+  if (!env_flag_enabled(outputs_only ? kXrtOutputReadbackEnv
+                                     : kXrtBoundReadbackEnv)) {
+    return;
+  }
+  for (size_t i = 0; i < command->bound_buffers.size(); ++i) {
+    const BoundBuffer& bound = command->bound_buffers[i];
+    if (!bound.buffer || !bound.buffer->buffer.cpu_ptr) continue;
+    // Current Windows DPU regmap ABI is:
+    //   opcode, ifm, param, ofm, ...
+    // so bound positions 1 and 2 are host-written inputs, while 3 is the first
+    // device-written output. Keep the diagnostic from pre-reading output zeros.
+    const bool output_like_bound = bound.position >= 3;
+    if (outputs_only) {
+      if (!output_like_bound) continue;
+    } else if (output_like_bound &&
+               !env_flag_enabled(kXrtBoundReadbackIncludeOutputsEnv)) {
+      continue;
+    }
+    const uint64_t buffer_size = bound.buffer->buffer.size;
+    if (bound.offset >= buffer_size) continue;
+    const uint64_t available = buffer_size - bound.offset;
+    const uint64_t read_size =
+        std::min<uint64_t>(bound.size ? bound.size : available, available);
+    const size_t readback_words =
+        static_cast<size_t>(read_size / sizeof(uint32_t));
+    volatile const uint32_t* words = reinterpret_cast<volatile const uint32_t*>(
+        static_cast<const uint8_t*>(bound.buffer->buffer.cpu_ptr) +
+        static_cast<size_t>(bound.offset));
+    volatile uint32_t checksum = 0;
+    size_t nonzero_words = 0;
+    for (size_t j = 0; j < readback_words; ++j) {
+      const uint32_t word = words[j];
+      checksum ^= word;
+      if (word) ++nonzero_words;
+    }
+    if (env_flag_enabled("IREE_AMDXDNA_MCDM_TRACE_QHDL")) {
+      std::fprintf(stderr,
+                   "[amdxdna:mcdm] pathb %s-readback[%zu]: alloc=0x%08x "
+                   "pos=%zu words=%zu nonzero=%zu checksum=0x%08x\n",
+                   phase,
+                   i, static_cast<unsigned>(bound.buffer->buffer.allocation),
+                   bound.position, readback_words, nonzero_words,
+                   static_cast<uint32_t>(checksum));
+      std::fflush(stderr);
+    }
+  }
 }
 
 bool uses_windows_dpu_regmap(iree_hal_amdxdna_native_command_t* command) {
@@ -894,8 +995,7 @@ iree_status_t finalize_windows_dpu_regmap(
   if (pathb_stage_code_after_presync(command)) {
     std::memset(aperture.code_cpu_ptr, 0,
                 static_cast<size_t>(aperture.code_size));
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    FlushProcessWriteBuffers();
+    flush_host_writes_to_mcdm();
   } else {
     IREE_RETURN_IF_ERROR(stage_windows_dpu_code_buffer(queue, command));
   }
@@ -1184,8 +1284,7 @@ iree_status_t iree_hal_amdxdna_native_device_alloc_buffer(
 
   const bool defer_cacheable_pathb_alloc =
       device->submit_mode == SubmitMode::pathb &&
-      type == iree_hal_amdxdna_native_buffer_type_t::cacheable &&
-      env_flag_enabled("IREE_AMDXDNA_MCDM_DEFER_CACHEABLE_ALLOC");
+      type == iree_hal_amdxdna_native_buffer_type_t::cacheable;
   if (device->submit_mode == SubmitMode::pathb &&
       (!device->pathb_context_ready || defer_cacheable_pathb_alloc)) {
     out_buffer->reset(new iree_hal_amdxdna_native_buffer_t(
@@ -1411,8 +1510,7 @@ iree_status_t iree_hal_amdxdna_native_buffer_sync(
     return diagnostic_after(buffer->device, DiagnosticStage::sync_buffer);
   }
   if (direction == iree_hal_amdxdna_native_sync_direction_t::host_to_device) {
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    FlushProcessWriteBuffers();
+    flush_host_writes_to_mcdm();
     return diagnostic_after(buffer->device, DiagnosticStage::sync_buffer);
   }
   std::string error;
@@ -1813,8 +1911,9 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
       IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
           bound, iree_hal_amdxdna_native_sync_direction_t::host_to_device));
     }
-    if (command->control_buffer &&
-        command->control_buffer->buffer.cpu_ptr) {
+    readback_pathb_bound_buffers(command, "input", /*outputs_only=*/false);
+    if (env_flag_enabled("IREE_AMDXDNA_MCDM_TRACE_QHDL") &&
+        command->control_buffer && command->control_buffer->buffer.cpu_ptr) {
       const uint32_t* c =
           static_cast<const uint32_t*>(command->control_buffer->buffer.cpu_ptr);
       uint32_t nz = 0;
@@ -1833,10 +1932,13 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
           "amdxdna Windows MCDM pathb submit requested without command "
           "aperture");
     }
+    const bool wait_presync =
+        pathb_stage_code_after_presync(command) &&
+        env_flag_enabled(kXrtWaitPreSyncEnv);
     if (!mcdm::SubmitPathBApertureSync(
             command->device->api, command->device->device,
             &queue->context->context, queue->context->command_aperture,
-            /*offset=*/0x10000, /*wait_for_cpu=*/false, &error)) {
+            /*offset=*/0x10000, wait_presync, &error)) {
       return status_from_mcdm_error(
           "amdxdna Windows MCDM pathb pre-dispatch sync failed", error);
     }
@@ -1851,6 +1953,7 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
     IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
         command->exec_buffer.get(),
         iree_hal_amdxdna_native_sync_direction_t::host_to_device));
+    readback_pathb_bound_buffers(command, "submit", /*outputs_only=*/false);
     trace_command_packet("pathb-before-submit", command);
     if (!mcdm::SubmitAndWaitPathB(
             command->device->api, command->device->device,
@@ -1867,11 +1970,6 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
       return status_from_mcdm_error(
           "amdxdna Windows MCDM pathb post-dispatch sync failed", error);
     }
-    uint32_t post_sync_sleep_ms =
-        env_u32("IREE_AMDXDNA_MCDM_POST_SYNC_SLEEP_MS");
-    if (post_sync_sleep_ms) {
-      Sleep(post_sync_sleep_ms);
-    }
     // The NPU is not cache-coherent: invalidate every bound buffer (incl. the
     // output) device->host so the host reads the firmware's results, not stale
     // cache. This was missing and could masquerade as "no execution".
@@ -1881,11 +1979,7 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
       IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
           bound, iree_hal_amdxdna_native_sync_direction_t::device_to_host));
     }
-    // DIAGNOSTIC: force-complete so iree reads back + prints the output, to see
-    // whether the matmul actually executed despite an empty completion slot.
-    if (env_flag_enabled("IREE_AMDXDNA_MCDM_PATHB_FORCE_COMPLETE")) {
-      packet->state = ERT_CMD_STATE_COMPLETED;
-    }
+    readback_pathb_bound_buffers(command, "output", /*outputs_only=*/true);
   } else {
     if (!mcdm::SubmitAndWaitBuffer(command->device->api,
                                    command->device->device,

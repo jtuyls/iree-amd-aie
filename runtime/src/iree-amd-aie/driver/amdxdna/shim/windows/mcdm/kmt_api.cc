@@ -82,9 +82,21 @@ bool TraceQhdlEnabled() {
   return value && value[0] && value[0] != '0';
 }
 
-bool PathBExactFenceWaitsEnabled() {
-  const char* value = std::getenv("IREE_AMDXDNA_MCDM_XRT_EXACT_WAITS");
+bool EnvFlagEnabled(const char* name) {
+  const char* value = std::getenv(name);
   return value && value[0] && value[0] != '0';
+}
+
+bool XrtMinimalResidencyEnabled() {
+  return EnvFlagEnabled("IREE_AMDXDNA_MCDM_XRT_MINIMAL_RESIDENCY");
+}
+
+void InitializeCompletionSlot(uint8_t* slot_cpu) {
+  if (EnvFlagEnabled("IREE_AMDXDNA_MCDM_CCCC_COMPLETION_SLOT")) {
+    std::memset(slot_cpu, 0xCC, kQhdlCompletionSlotSize);
+    return;
+  }
+  std::memset(slot_cpu, 0, kQhdlCompletionSlotSize);
 }
 
 void WriteU32(std::vector<uint8_t>* data, size_t offset, uint32_t value) {
@@ -544,7 +556,9 @@ bool CreateBuffer(const KmtApi& api, const Device& device, BufferKind kind,
     return false;
   }
   buffer.paging_fence_value = resident.PagingFenceValue;
-  WaitForPagingFenceCpu(api, device, resident.PagingFenceValue);
+  if (!XrtMinimalResidencyEnabled()) {
+    WaitForPagingFenceCpu(api, device, resident.PagingFenceValue);
+  }
 
   // Carveout/heap BOs are device-local firmware heaps: XRT never Lock2s them
   // (no CPU access). Skip the lock + CPU sentinel write for them.
@@ -583,6 +597,59 @@ bool SyncBuffer(const KmtApi& api, const Device& device, const Buffer& buffer,
   invalidate.Length = length;
   NTSTATUS status = api.invalidate_cache(&invalidate);
   return CheckStatus("D3DKMTInvalidateCache", status, out_error);
+}
+
+bool LockCommandApertureGpuAfterBootstrap(const KmtApi& api,
+                                          const Device& device,
+                                          CommandAperture* aperture,
+                                          std::string* out_error);
+
+bool SyncCommandApertureCode(const KmtApi& api, const Device& device,
+                             const CommandAperture& aperture, uint64_t offset,
+                             uint64_t length, std::string* out_error) {
+  if (!aperture.gpu_allocation) {
+    if (out_error) {
+      *out_error = "SyncCommandApertureCode called before aperture setup";
+    }
+    return false;
+  }
+  D3DKMT_INVALIDATECACHE invalidate = {};
+  invalidate.hDevice = device.device;
+  invalidate.hAllocation = aperture.gpu_allocation;
+  invalidate.Offset = offset;
+  invalidate.Length = length;
+  NTSTATUS status = api.invalidate_cache(&invalidate);
+  return CheckStatus("D3DKMTInvalidateCache(command aperture code)", status,
+                     out_error);
+}
+
+bool RefreshCommandApertureGpuMapping(const KmtApi& api, const Device& device,
+                                       CommandAperture* aperture,
+                                       std::string* out_error) {
+  if (!aperture || !aperture->gpu_allocation) {
+    if (out_error) {
+      *out_error =
+          "RefreshCommandApertureGpuMapping called before aperture setup";
+    }
+    return false;
+  }
+  // The path-B code BO is written through the host mapping after bootstrap.
+  // Pair the cache invalidate with a lock transition so the MCDM miniport sees
+  // the freshly staged instruction bytes before the opcode-3 submit consumes
+  // the aperture.
+  if (aperture->gpu_cpu_ptr) {
+    D3DKMT_UNLOCK2 unlock = {};
+    unlock.hDevice = device.device;
+    unlock.hAllocation = aperture->gpu_allocation;
+    NTSTATUS status = api.unlock2(&unlock);
+    if (!CheckStatus("D3DKMTUnlock2(command aperture gpu refresh)", status,
+                     out_error)) {
+      return false;
+    }
+    aperture->gpu_cpu_ptr = nullptr;
+    aperture->code_cpu_ptr = nullptr;
+  }
+  return LockCommandApertureGpuAfterBootstrap(api, device, aperture, out_error);
 }
 
 bool RefreshBufferCpuMapping(const KmtApi& api, const Device& device,
@@ -638,6 +705,7 @@ bool TouchBufferCpuMapping(const KmtApi& api, const Device& device,
 bool WaitForBufferResidency(const KmtApi& api, const Device& device,
                             const Context& context, const Buffer& buffer,
                             const char* label, std::string* out_error) {
+  if (XrtMinimalResidencyEnabled()) return true;
   if (buffer.paging_fence_value == 0) return true;
 
   D3DKMT_HANDLE wait_objects[1] = {device.paging_sync_object};
@@ -1188,8 +1256,7 @@ bool WaitForHwQueueFenceCpu(const KmtApi& api, const Device& device,
                             const char* label, std::string* out_error) {
   HANDLE wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   D3DKMT_HANDLE wait_objects[1] = {context.progress_fence};
-  UINT64 wait_values[1] = {
-      PathBExactFenceWaitsEnabled() ? fence_id : fence_id + 1};
+  UINT64 wait_values[1] = {fence_id};
   if (TraceQhdlEnabled()) {
     std::fprintf(stderr,
                  "[amdxdna:mcdm] pathb wait: label=%s fence=%llu target=%llu\n",
@@ -1471,15 +1538,24 @@ bool SubmitAndWaitQhdlCommand(const KmtApi& api, const Device& device,
     return false;
   }
 
-  uint32_t completion_header = 0;
-  const uint64_t deadline = GetTickCount64() + 5000;
-  do {
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    std::memcpy(&completion_header, completion_slot,
-                sizeof(completion_header));
-    if ((completion_header & 0xFu) >= 4) break;
-    Sleep(1);
-  } while (GetTickCount64() < deadline);
+  if (!WaitForHwQueueFenceCpu(api, device, *context, fence_id,
+                              "D3DKMTWaitForSynchronizationObjectFromCpu(qhdl)",
+                              out_error)) {
+    return false;
+  }
+  std::string command_sync_err;
+  if (!SyncBuffer(api, device, command_buffer, 0, command_buffer.size,
+                  &command_sync_err)) {
+    if (out_error) {
+      *out_error = "qhdl command buffer invalidate failed: " + command_sync_err;
+    }
+    return false;
+  }
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  uint32_t completion_header = *packet_header;
+  if ((completion_header & 0xFu) < 4) {
+    std::memcpy(&completion_header, completion_slot, sizeof(completion_header));
+  }
   if (packet_header) {
     uint32_t state_delta = (*packet_header ^ completion_header) & 0xFu;
     *packet_header ^= state_delta;
@@ -1487,8 +1563,9 @@ bool SubmitAndWaitQhdlCommand(const KmtApi& api, const Device& device,
   if ((completion_header & 0xFu) < 4) {
     if (out_error) {
       std::ostringstream os;
-      os << "qhdl completion slot did not complete: header=0x" << std::hex
-         << completion_header << " offset=0x" << completion_offset;
+      os << "qhdl command did not complete after fence wait: state=0x"
+         << std::hex << completion_header << " slot_offset=0x"
+         << completion_offset;
       *out_error = os.str();
     }
     return false;
@@ -1534,8 +1611,7 @@ bool SubmitAndWaitBuffer(const KmtApi& api, const Device& device,
 
   HANDLE wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   D3DKMT_HANDLE wait_objects[1] = {context->progress_fence};
-  UINT64 wait_values[1] = {
-      PathBExactFenceWaitsEnabled() ? fence_id : fence_id + 1};
+  UINT64 wait_values[1] = {fence_id};
   if (TraceQhdlEnabled()) {
     std::fprintf(stderr,
                  "[amdxdna:mcdm] pathb wait: label=workload fence=%llu "
@@ -1676,7 +1752,10 @@ bool SubmitAndWaitCreateAie4Ctx(const KmtApi& api, const Device& device,
           ? kQhdlCompletionSlotSize
           : slot_offset + kQhdlCompletionSlotSize;
   uint8_t* slot_cpu = static_cast<uint8_t*>(ring.cpu_ptr) + slot_offset;
-  std::memset(slot_cpu, 0xCC, kQhdlCompletionSlotSize);  // sentinel: detect firmware write
+  // XRT leaves the 8-byte firmware completion slot zeroed before submit.
+  // Match that exactly: the driver treats this buffer as part of the private
+  // queue protocol, not just host-side scratch space.
+  InitializeCompletionSlot(slot_cpu);
 
   std::vector<uint8_t> priv(kCreateAie4CtxPrivateSize, 0);
   WriteU32(&priv, 0x00, kCmdCreateAie4Ctx);
@@ -1718,7 +1797,15 @@ bool SubmitAndWaitCreateAie4Ctx(const KmtApi& api, const Device& device,
 
   HANDLE wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   D3DKMT_HANDLE wait_objects[1] = {context->progress_fence};
-  UINT64 wait_values[1] = {fence_id + 1};
+  UINT64 wait_values[1] = {fence_id};
+  if (TraceQhdlEnabled()) {
+    std::fprintf(stderr,
+                 "[amdxdna:mcdm] pathb wait: label=create-aie4-ctx fence=%llu "
+                 "target=%llu\n",
+                 static_cast<unsigned long long>(fence_id),
+                 static_cast<unsigned long long>(wait_values[0]));
+    std::fflush(stderr);
+  }
   D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait = {};
   wait.hDevice = device.device;
   wait.ObjectCount = 1;
@@ -1794,7 +1881,10 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
           ? kQhdlCompletionSlotSize
           : slot_offset + kQhdlCompletionSlotSize;
   uint8_t* slot_cpu = static_cast<uint8_t*>(ring.cpu_ptr) + slot_offset;
-  std::memset(slot_cpu, 0xCC, kQhdlCompletionSlotSize);  // sentinel: detect firmware write
+  // XRT leaves the 8-byte firmware completion slot zeroed before submit.
+  // Match that exactly: the driver treats this buffer as part of the private
+  // queue protocol, not just host-side scratch space.
+  InitializeCompletionSlot(slot_cpu);
 
   // Build the 0x268 private packet (layout recovered from xrt_core
   // hwqueue_aie4::submit_command / FUN_1800304c0).
@@ -1866,7 +1956,15 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
 
   HANDLE wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   D3DKMT_HANDLE wait_objects[1] = {context->progress_fence};
-  UINT64 wait_values[1] = {fence_id + 1};
+  UINT64 wait_values[1] = {fence_id};
+  if (TraceQhdlEnabled()) {
+    std::fprintf(stderr,
+                 "[amdxdna:mcdm] pathb wait: label=opcode3 fence=%llu "
+                 "target=%llu\n",
+                 static_cast<unsigned long long>(fence_id),
+                 static_cast<unsigned long long>(wait_values[0]));
+    std::fflush(stderr);
+  }
   D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait = {};
   wait.hDevice = device.device;
   wait.ObjectCount = 1;
@@ -1885,28 +1983,56 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
     return false;
   }
 
-  uint32_t completion_sleep_ms =
-      ReadHandleDeltaEnv("IREE_AMDXDNA_MCDM_COMPLETION_SLEEP_MS", 0);
-  if (completion_sleep_ms) {
-    Sleep(completion_sleep_ms);
-  }
-  // The NPU is not cache-coherent: invalidate the ring before reading the slot
-  // so we observe the firmware's DMA-written completion, not stale cache.
-  {
-    std::string sync_err;
-    SyncBuffer(api, device, ring, 0, ring.size, &sync_err);
+  // XRT's public wait path reports completion through the ERT command packet
+  // state. After the submitted fence is signaled, invalidate and read the
+  // command BO first. The status-ring slot is a secondary source used only if
+  // the packet state has not been updated.
+  std::string command_sync_err;
+  if (!SyncBuffer(api, device, exec_buffer, 0, exec_buffer.size,
+                  &command_sync_err)) {
+    if (out_error) {
+      *out_error =
+          "pathb command buffer invalidate failed: " + command_sync_err;
+    }
+    return false;
   }
   std::atomic_thread_fence(std::memory_order_seq_cst);
+  uint32_t packet_state = packet_header ? *packet_header : 0;
   uint32_t slot_state = 0;
-  std::memcpy(&slot_state, slot_cpu, sizeof(slot_state));
+  if ((packet_state & 0xFu) < 4) {
+    std::string ring_sync_err;
+    if (!SyncBuffer(api, device, ring, 0, ring.size, &ring_sync_err)) {
+      if (out_error) {
+        *out_error = "pathb completion ring invalidate failed: " + ring_sync_err;
+      }
+      return false;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    std::memcpy(&slot_state, slot_cpu, sizeof(slot_state));
+  }
   if (packet_header) {
-    uint32_t delta = (*packet_header ^ slot_state) & 0xFu;
+    const uint32_t completion_state =
+        ((packet_state & 0xFu) >= 4) ? packet_state : slot_state;
+    uint32_t delta = (*packet_header ^ completion_state) & 0xFu;
     *packet_header ^= delta;
   }
   if (TraceQhdlEnabled()) {
-    std::fprintf(stderr, "[amdxdna:mcdm] pathb completion: slot_state=0x%08x\n",
-                 slot_state);
+    std::fprintf(stderr,
+                 "[amdxdna:mcdm] pathb completion: packet_state=0x%08x "
+                 "slot_state=0x%08x\n",
+                 packet_state, slot_state);
     std::fflush(stderr);
+  }
+  const uint32_t final_state = packet_header ? *packet_header : slot_state;
+  if ((final_state & 0xFu) < 4) {
+    if (out_error) {
+      std::ostringstream os;
+      os << "pathb command did not complete after fence wait: packet_state=0x"
+         << std::hex << packet_state << " slot_state=0x" << slot_state
+         << " slot_offset=0x" << slot_offset;
+      *out_error = os.str();
+    }
+    return false;
   }
   return true;
 }

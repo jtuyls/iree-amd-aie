@@ -175,6 +175,14 @@ bool CreateBuffer(const KmtApi& api, const Device& device, BufferKind kind,
 bool SyncBuffer(const KmtApi& api, const Device& device, const Buffer& buffer,
                 uint64_t offset, uint64_t length, std::string* out_error);
 
+bool SyncCommandApertureCode(const KmtApi& api, const Device& device,
+                             const CommandAperture& aperture, uint64_t offset,
+                             uint64_t length, std::string* out_error);
+
+bool RefreshCommandApertureGpuMapping(const KmtApi& api, const Device& device,
+                                      CommandAperture* aperture,
+                                      std::string* out_error);
+
 bool RefreshBufferCpuMapping(const KmtApi& api, const Device& device,
                              Buffer* buffer, std::string* out_error);
 
