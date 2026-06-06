@@ -1983,23 +1983,27 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
     return false;
   }
 
-  // XRT's public wait path reports completion through the ERT command packet
-  // state. After the submitted fence is signaled, invalidate and read the
-  // command BO first. The status-ring slot is a secondary source used only if
-  // the packet state has not been updated.
-  std::string command_sync_err;
-  if (!SyncBuffer(api, device, exec_buffer, 0, exec_buffer.size,
-                  &command_sync_err)) {
-    if (out_error) {
-      *out_error =
-          "pathb command buffer invalidate failed: " + command_sync_err;
-    }
-    return false;
-  }
-  std::atomic_thread_fence(std::memory_order_seq_cst);
-  uint32_t packet_state = packet_header ? *packet_header : 0;
+  // The progress fence means the KMT submit has reached the HW queue, but the
+  // firmware completion is reported through the command packet/status slot. Poll
+  // those explicit protocol locations with cache invalidation; do not use host
+  // sleeps as a correctness mechanism.
   uint32_t slot_state = 0;
-  if ((packet_state & 0xFu) < 4) {
+  uint32_t packet_state = packet_header ? *packet_header : 0;
+  const uint64_t deadline = GetTickCount64() + 5000;
+  while ((packet_state & 0xFu) < 4 && (slot_state & 0xFu) < 4) {
+    std::string command_sync_err;
+    if (!SyncBuffer(api, device, exec_buffer, 0, exec_buffer.size,
+                    &command_sync_err)) {
+      if (out_error) {
+        *out_error =
+            "pathb command buffer invalidate failed: " + command_sync_err;
+      }
+      return false;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    packet_state = packet_header ? *packet_header : 0;
+    if ((packet_state & 0xFu) >= 4) break;
+
     std::string ring_sync_err;
     if (!SyncBuffer(api, device, ring, 0, ring.size, &ring_sync_err)) {
       if (out_error) {
@@ -2009,6 +2013,9 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     std::memcpy(&slot_state, slot_cpu, sizeof(slot_state));
+    if ((slot_state & 0xFu) >= 4) break;
+    if (GetTickCount64() >= deadline) break;
+    YieldProcessor();
   }
   if (packet_header) {
     const uint32_t completion_state =
