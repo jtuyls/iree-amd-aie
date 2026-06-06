@@ -55,7 +55,8 @@ static bool iree_hal_amdxdna_mcdm_submit_mode_is_valid(
   return iree_string_view_is_empty(value) ||
          iree_string_view_equal(value, IREE_SV("qhdl")) ||
          iree_string_view_equal(value, IREE_SV("direct")) ||
-         iree_string_view_equal(value, IREE_SV("aperture"));
+         iree_string_view_equal(value, IREE_SV("aperture")) ||
+         iree_string_view_equal(value, IREE_SV("pathb"));
 }
 
 static iree_status_t iree_hal_amdxdna_parse_non_negative_int32_option(

@@ -28,6 +28,7 @@ enum class Stage {
   context,
   aperture,
   submit,
+  ctxcmd,
 };
 
 std::string NarrowArg(const wchar_t* arg) {
@@ -57,6 +58,8 @@ bool ParseStage(const std::string& text, Stage* out_stage) {
     *out_stage = Stage::aperture;
   } else if (text == "submit") {
     *out_stage = Stage::submit;
+  } else if (text == "ctxcmd") {
+    *out_stage = Stage::ctxcmd;
   } else {
     return false;
   }
@@ -116,7 +119,7 @@ bool RunBufferProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
 
 bool RunContextProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
                      const std::string& xclbin_path, bool create_aperture,
-                     bool submit, bool allow_unsafe_submit) {
+                     bool submit, bool allow_unsafe_submit, bool run_ctxcmd) {
   if (xclbin_path.empty()) {
     std::cerr << "--xclbin=PATH is required for context, aperture, and submit "
                  "stages\n";
@@ -139,6 +142,16 @@ bool RunContextProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
     return false;
   }
 
+  if (const char* dump = std::getenv("PROBE_DUMP_BLOB")) {
+    FILE* f = nullptr;
+    fopen_s(&f, dump, "wb");
+    if (f) {
+      fwrite(private_data.data(), 1, private_data.size(), f);
+      fclose(f);
+      std::cout << "blob_dumped=" << dump << " bytes=" << private_data.size()
+                << "\n";
+    }
+  }
   std::cout << "context.private_size=" << private_data.size()
             << " xclbin_size=" << xclbin.size()
             << " kernel=\"" << info.kernel_name << "\""
@@ -159,6 +172,28 @@ bool RunContextProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
             << " progress_fence_cpu=" << context.progress_fence_cpu
             << " progress_fence_gpu=0x" << std::hex
             << context.progress_fence_gpu << std::dec << "\n";
+
+  if (run_ctxcmd) {
+    // Fire CREATE_AIE4_CTX with the sentinel-initialized status ring and report
+    // whether the firmware wrote the completion slot (set TRACE_QHDL=1 to see
+    // the slot_state). If the firmware processes the queue, the slot changes
+    // from the 0xCC sentinel; if not, it stays 0xCCCCCCCC.
+    bool ok = mcdm::SubmitAndWaitCreateAie4Ctx(api, device, &context, &error);
+    std::cout << "create_aie4_ctx.result=" << (ok ? "ok" : "fail");
+    if (!ok) std::cout << " error=" << error;
+    std::cout << "\n";
+    // Safe teardown: destroying a context whose CREATE_AIE4_CTX the firmware
+    // never drained HANGS the KMD (UPDATE 8 wedge). When PROBE_NO_TEARDOWN is
+    // set, leak the context and exit instead of risking the wedge - use this
+    // until the firmware is confirmed to process the command (slot written).
+    if (std::getenv("PROBE_NO_TEARDOWN")) {
+      std::cout << "teardown.skipped=1 (leak to avoid firmware-drain wedge)\n";
+      std::cout.flush();
+      return ok;
+    }
+    mcdm::DestroyContext(api, &context);
+    return ok;
+  }
 
   if (submit && !allow_unsafe_submit) {
     mcdm::DestroyContext(api, &context);
@@ -190,13 +225,35 @@ bool RunContextProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
       return true;
     }
 
+    // ISOLATION: allocate IREE-like dispatch buffers before the kick to test
+    // whether buffer allocation/residency causes the IREE path's 0xc01e0200.
+    if (const char* pb = std::getenv("PROBE_BUFFERS")) {
+      int n = atoi(pb);
+      if (n <= 0) n = 1;
+      for (int i = 0; i < n; ++i) {
+        mcdm::Buffer b;
+        if (mcdm::CreateBuffer(api, device, mcdm::BufferKind::host_only, 4096,
+                               &b, &error)) {
+          std::cout << "probe_bo[" << i << "] gpu_va=0x" << std::hex << b.gpu_va
+                    << std::dec << "\n";
+        } else {
+          std::cout << "probe_bo[" << i << "] FAIL: " << error << "\n";
+        }
+      }
+    }
+
     bool ok =
-        mcdm::SubmitAndWaitCommandAperture(api, device, &context, aperture,
+        mcdm::SubmitAndWaitCommandAperture(api, device, &context, &aperture,
                                            &error);
     if (!ok) {
       std::cerr << "SubmitAndWaitCommandAperture failed: " << error << "\n";
     } else {
       std::cout << "submit.wait=ok\n";
+    }
+    if (std::getenv("PROBE_NO_TEARDOWN")) {
+      std::cout << "teardown.skipped=1\n";
+      std::cout.flush();
+      return ok;
     }
     mcdm::DestroyCommandAperture(api, device, &aperture);
     mcdm::DestroyContext(api, &context);
@@ -211,6 +268,22 @@ bool RunContextProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  if (std::getenv("PROBE_WARMUP")) {
+    HMODULE xrt = LoadLibraryW(L"xrt_coreutil.dll");
+    if (!xrt) {
+      xrt = LoadLibraryW(
+          L"C:\\Windows\\System32\\DriverStore\\FileRepository\\"
+          L"kipudrv.inf_amd64_b3e90d6455884a5f\\xrt_coreutil.dll");
+    }
+    if (xrt) {
+      using OpenFn = void*(__cdecl*)(unsigned);
+      auto open = reinterpret_cast<OpenFn>(GetProcAddress(xrt, "xrtDeviceOpen"));
+      if (open) {
+        void* d = open(0);
+        std::cout << "probe_warmup_device=" << d << "\n";
+      }
+    }
+  }
   Stage stage = Stage::all_bos;
   uint64_t size = 4096;
   std::string xclbin_path;
@@ -263,7 +336,7 @@ int wmain(int argc, wchar_t** argv) {
   }
 
   mcdm::Device device;
-  if (!mcdm::CreateDevice(api, adapter.handle, &device, &error)) {
+  if (!mcdm::CreateDevice(api, adapter, &device, &error)) {
     std::cerr << "CreateDevice failed: " << error << "\n";
     D3DKMT_CLOSEADAPTER close = {};
     close.hAdapter = adapter.handle;
@@ -279,12 +352,29 @@ int wmain(int argc, wchar_t** argv) {
     return 0;
   }
 
+  if (std::getenv("PROBE_CARVEOUT_ONLY")) {
+    // Isolate the 0x332c carveout allocation on a BARE device (no context) to
+    // distinguish "carveouts need a prerequisite" from "a prior context blocks".
+    mcdm::Buffer cv = {};
+    bool ok = mcdm::CreateBuffer(api, device, mcdm::BufferKind::carveout, 0x2000,
+                                 &cv, &error);
+    std::cout << "carveout_only.result=" << (ok ? "ok" : "fail");
+    if (ok)
+      std::cout << " gpu_va=0x" << std::hex << cv.gpu_va << std::dec;
+    else
+      std::cout << " error=" << error;
+    std::cout << "\n";
+    mcdm::DestroyDevice(api, &device);
+    return ok ? 0 : 1;
+  }
+
   if (stage == Stage::context || stage == Stage::aperture ||
-      stage == Stage::submit) {
+      stage == Stage::submit || stage == Stage::ctxcmd) {
     bool ok = RunContextProbe(api, device, xclbin_path,
                               stage == Stage::aperture ||
                                   stage == Stage::submit,
-                              stage == Stage::submit, allow_unsafe_submit);
+                              stage == Stage::submit, allow_unsafe_submit,
+                              stage == Stage::ctxcmd);
     mcdm::DestroyDevice(api, &device);
     return ok ? 0 : 1;
   }

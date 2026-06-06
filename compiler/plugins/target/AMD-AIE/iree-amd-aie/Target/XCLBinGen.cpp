@@ -2277,18 +2277,19 @@ LogicalResult aie2xclbin(
   }
 
   if (deviceHal == AMDAIEOptions::DeviceHAL::AMDXDNA) {
+    if (contextXclbinPath &&
+        failed(generateXCLBin(*contextXclbinPath, tempDirPath, xclBinKernelID,
+                              xclBinKernelName, xclBinInstanceName,
+                              amdAIEInstallDir, verbose, InputXCLBin,
+                              enableCtrlPkt))) {
+      llvm::errs() << "Failed to generate AMDXDNA context XCLBin\n";
+      return failure();
+    }
     std::error_code ec;
     if (!std::filesystem::copy_file(
             pdiPath, artifactPath,
             std::filesystem::copy_options::overwrite_existing, ec)) {
       llvm::errs() << "Failed to copy file because: " << ec.message() << "\n";
-      return failure();
-    }
-    if (contextXclbinPath &&
-        failed(generateAMDXDNAContextXCLBin(
-            *contextXclbinPath, pdiPath, xclBinKernelID, xclBinKernelName,
-            xclBinInstanceName))) {
-      llvm::errs() << "Failed to generate AMDXDNA context XCLBin\n";
       return failure();
     }
     return success();

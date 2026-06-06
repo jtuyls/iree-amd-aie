@@ -30,12 +30,18 @@ FetchContent_Declare(
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE
   URL_HASH MD5=84BC7C861606DC66BCFBEB660FCDDFD2)
 FetchContent_MakeAvailable(Boost)
+set(Boost_NO_BOOST_CMAKE ON CACHE BOOL "" FORCE)
+set(BOOST_ROOT "${Boost_SOURCE_DIR}" CACHE PATH "" FORCE)
+set(BOOST_INCLUDEDIR "${Boost_SOURCE_DIR}" CACHE PATH "" FORCE)
+set(Boost_INCLUDE_DIR "${Boost_SOURCE_DIR}" CACHE PATH "" FORCE)
+unset(Boost_DIR CACHE)
 set(IREE_AIE_BOOST_LIBS
     any
     algorithm
     asio
     format
     functional
+    interprocess
     lexical_cast
     process
     program_options
@@ -45,7 +51,11 @@ set(IREE_AIE_BOOST_LIBS
     uuid)
 list(TRANSFORM IREE_AIE_BOOST_LIBS PREPEND Boost::)
 
-set(IREE_XRT_SOURCE_DIR "${IREE_AMD_AIE_SOURCE_DIR}/third_party/XRT/src")
+set(IREE_XRT_SOURCE_DIR
+    "${IREE_AMD_AIE_SOURCE_DIR}/third_party/XRT/src"
+    CACHE PATH "Path to the XRT source tree used by the AMD-AIE XRT driver")
+set(XRT_SOURCE_DIR "${IREE_XRT_SOURCE_DIR}")
+set(XRT_BINARY_DIR "${PROJECT_BINARY_DIR}")
 
 # ##############################################################################
 # xclbinutil
@@ -54,9 +64,7 @@ set(IREE_XRT_SOURCE_DIR "${IREE_AMD_AIE_SOURCE_DIR}/third_party/XRT/src")
 set(_xclbinutil_source_dir ${IREE_XRT_SOURCE_DIR}/runtime_src/tools/xclbinutil)
 
 # transformcdo target
-if(NOT WIN32)
-  add_subdirectory(${_xclbinutil_source_dir}/aie-pdi-transform aie-pdi-transform)
-endif()
+add_subdirectory(${_xclbinutil_source_dir}/aie-pdi-transform aie-pdi-transform)
 
 # otherwise the various stois that read these will explode...
 # XRT/src/runtime_src/tools/xclbinutil/XclBinClass.cxx#L55
@@ -120,7 +128,7 @@ target_link_libraries(iree-aie-xclbinutil
                       PRIVATE
                       Threads::Threads
                       $<BUILD_LOCAL_INTERFACE:${IREE_AIE_BOOST_LIBS}>
-                      $<$<PLATFORM_ID:Linux>:$<BUILD_LOCAL_INTERFACE:transformcdo>>)
+                      $<BUILD_LOCAL_INTERFACE:transformcdo>)
 target_include_directories(iree-aie-xclbinutil
                            PRIVATE ${XRT_BINARY_DIR}/gen
                                    ${IREE_XRT_SOURCE_DIR}/runtime_src/core/include
@@ -146,6 +154,24 @@ install(
 
 message(STATUS "building XRT core libs")
 
+list(APPEND CMAKE_MODULE_PATH "${IREE_XRT_SOURCE_DIR}/CMake")
+include(${IREE_XRT_SOURCE_DIR}/CMake/utilities.cmake)
+
+set(XRT_BASE 1)
+set(XRT_NPU 1)
+set(XRT_UPSTREAM 1)
+set(XRT_EXCLUDE_SUB_DIRECTORY "src/runtime_src/core/common/aiebu")
+set(XRT_EXCLUDE_INCLUDE_FILE "")
+file(MAKE_DIRECTORY "${PROJECT_BINARY_DIR}/gen/xrt/detail")
+
+set(AIEBU_SOURCE_DIR "${IREE_XRT_SOURCE_DIR}/runtime_src/core/common/aiebu")
+set(AIEBU_INSTALL_LIB_DIR "lib")
+set(AIEBU_DEV_COMPONENT "aiebu_dev")
+add_subdirectory(${AIEBU_SOURCE_DIR}/src/cpp/dtrace iree-aie-xrt-dtrace)
+target_link_libraries(dtrace_library_objects
+                      PRIVATE
+                      $<BUILD_LOCAL_INTERFACE:${IREE_AIE_BOOST_LIBS}>)
+
 set(XRT_AIE_BUILD "yes")
 set(XRT_ENABLE_AIE "yes")
 set(XRT_NATIVE_BUILD "yes")
@@ -158,18 +184,31 @@ set(XRT_NAMELINK_SKIP EXCLUDE_FROM_ALL)
 set(XRT_NAMELINK_ONLY EXCLUDE_FROM_ALL)
 # remove unsupported -Wextra flag on windows
 set(GSL_TEST OFF CACHE BOOL "")
+include(${IREE_XRT_SOURCE_DIR}/CMake/components.cmake)
+include(${IREE_XRT_SOURCE_DIR}/CMake/xrtVariables.cmake)
+include(${IREE_XRT_SOURCE_DIR}/CMake/version.cmake)
 add_subdirectory(${IREE_XRT_SOURCE_DIR}/runtime_src/core/common iree-aie-xrt-coreutil)
+
+if(WIN32)
+  target_compile_definitions(core_common_library_objects
+                             PUBLIC XRT_WINDOWS_HAS_WDK)
+  target_link_libraries(xrt_coreutil PRIVATE gdi32)
+  target_link_libraries(xrt_coreutil_static INTERFACE gdi32)
+endif()
 
 # drill this into your head https://stackoverflow.com/a/24991498
 set(_core_libs
     core_common_objects
     core_common_library_objects
+    core_common_runner_objects
     core_common_api_library_objects
     core_common_xdp_profile_objects
+    core_common_smi_objects
     xrt_coreutil)
 
 foreach(_core_lib IN LISTS _core_libs)
   target_include_directories(${_core_lib} PUBLIC
+                             $<BUILD_INTERFACE:${XRT_BINARY_DIR}/gen>
                              ${IREE_XRT_SOURCE_DIR}/runtime_src/core/include
                              ${IREE_XRT_SOURCE_DIR}/runtime_src/core/common/gsl/include
                              ${IREE_XRT_SOURCE_DIR}/runtime_src)

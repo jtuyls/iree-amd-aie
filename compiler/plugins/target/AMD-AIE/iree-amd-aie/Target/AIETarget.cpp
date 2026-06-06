@@ -609,14 +609,10 @@ LogicalResult AIETargetBackend::serializeExecutable(
                                         ".ctrlpkt_seq.txt");
     llvm::sys::path::append(ctrlpktSeqPath, ctrlpktSeqFileName);
 
-    // Strix Windows MCDM contexts use DPU kernel ids in the 0x100 range.
-    // Keep the historic ordinal ids unless we are emitting the hidden context
-    // xclbin wrapper consumed by that driver path.
+    // Keep the xclbin DPU kernel id aligned with the normal XRT packaging path.
+    // The Windows MCDM shim consumes the same AXLF metadata XRT submits, while
+    // the runtime ERT packet still passes the NPU operation selector as arg0.
     uint64_t xclBinKernelId = ordinal;
-    if (options.deviceHal == AMDAIEOptions::DeviceHAL::AMDXDNA &&
-        options.emitAMDXDNAContextXclbin) {
-      xclBinKernelId += 0x100;
-    }
 
     // Convert kernel id to a hexadecimal string.
     std::stringstream ordinalHex;

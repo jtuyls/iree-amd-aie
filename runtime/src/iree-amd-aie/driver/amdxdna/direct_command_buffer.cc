@@ -542,7 +542,7 @@ iree_status_t iree_hal_amdxdna_make_npu_cmd(
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_set_cu_index(
       out_cmd->command.get(), cu_idx));
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_add_control_buffer(
-      out_cmd->command.get(), out_cmd->ctrl_code.get()));
+      out_cmd->command.get(), out_cmd->ctrl_code.get(), bytes));
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_add_arg_32(
       out_cmd->command.get(), kAie2ExecBufferKernelOpTxn));
   return iree_ok_status();
@@ -845,7 +845,7 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_normal_run(
   if (iree_hal_amdxdna_dispatch_uses_npu_payload()) {
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_native_command_add_control_buffer(
-                command.get(), ctrl_code_buffer.get()));
+                command.get(), ctrl_code_buffer.get(), ctrl_code_size));
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_native_command_add_arg_32(
                 command.get(), kAie2ExecBufferKernelOpTxn));
@@ -951,7 +951,7 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_reconfigure(
   if (iree_hal_amdxdna_dispatch_uses_npu_payload()) {
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_native_command_add_control_buffer(
-                command.get(), ctrlpkt_inst_buffer.get()));
+                command.get(), ctrlpkt_inst_buffer.get(), ctrlpkt_inst_size));
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_native_command_add_arg_32(
                 command.get(), kAie2ExecBufferKernelOpTxn));

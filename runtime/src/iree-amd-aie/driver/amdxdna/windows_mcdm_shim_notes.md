@@ -633,7 +633,7 @@ construction. Current confidence by call family:
 | Paging queue | `D3DKMTCreatePagingQueue`, `D3DKMTDestroyPagingQueue` | Residency/mapping synchronization | Captured in latency path |
 | Driver queries | `D3DKMTEscape` | `GET_INFO` / `SET_STATE`-like private commands | One 112-byte query decoded; more query opcodes unknown |
 | Context | `D3DKMTCreateContextVirtual`, `D3DKMTDestroyContext`, possibly `D3DKMTSetContextSchedulingPriority` | `CREATE_HWCTX` plus `CONFIG_HWCTX` | Captured; private context blob embeds AXLF |
-| Hardware queue | `D3DKMTCreateHwQueue`, `D3DKMTDestroyHwQueue` | UMQ/HW queue binding | Captured; no private data in latency path |
+| Hardware queue | `D3DKMTCreateHwQueue`, `D3DKMTDestroyHwQueue` | MCDM HW queue/context scheduling for Strix KMQ | Captured; no private data in latency path |
 | BO create/map | `D3DKMTCreateAllocation2`, `D3DKMTDestroyAllocation2`, `D3DKMTLock2`, `D3DKMTUnlock2`, `D3DKMTMapGpuVirtualAddress`, `D3DKMTFreeGpuVirtualAddress` | `CREATE_BO`, `GET_BO_INFO`, mmap, free | Captured for one command BO shape |
 | Residency | `D3DKMTMakeResident`, `D3DKMTEvict` | BO residency before submit | `MakeResident` captured; `Evict` not needed yet |
 | Cache sync | `D3DKMTInvalidateCache` | `SYNC_BO` | Surfaced by XRT; not captured in latency path |

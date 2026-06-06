@@ -14,11 +14,12 @@ namespace iree::hal::amdxdna::mcdm {
 namespace {
 
 constexpr size_t kAxlfBaseOffset = 0xE8;
-constexpr size_t kTailSizeOnePdi = 0x530;
+constexpr size_t kTailSizeOnePdi = 0x3C8;
 constexpr uint64_t kCommandApertureBase = 0x04000000;
 constexpr uint64_t kContextCommandBoSize = 0x1000;
 constexpr uint32_t kBuildMetadataSection = 14;
 constexpr uint32_t kAiePartitionSection = 32;
+constexpr uint32_t kIpLayoutSection = 8;
 
 struct AxlfSection {
   uint32_t kind = 0;
@@ -150,6 +151,16 @@ bool ExtractJsonStringAfter(const std::string& json, size_t start,
 
 std::string DeriveKernelName(const uint8_t* xclbin,
                              const std::vector<AxlfSection>& sections) {
+  const AxlfSection* ip_layout = FindFirstSection(sections, kIpLayoutSection);
+  if (ip_layout && ip_layout->size >= 88) {
+    std::string name = CString(xclbin + ip_layout->offset + 24, 64);
+    size_t instance_separator = name.find(':');
+    if (instance_separator != std::string::npos) {
+      name.resize(instance_separator);
+    }
+    if (!name.empty()) return name;
+  }
+
   const AxlfSection* section = FindFirstSection(sections, kBuildMetadataSection);
   if (!section) return "kernel";
   std::string json(reinterpret_cast<const char*>(xclbin + section->offset),
@@ -282,20 +293,12 @@ bool BuildContextPrivateDataFromXclbin(const uint8_t* xclbin,
     return false;
   }
   blob[tail + 0x3F] = '0';
-  WriteU64(&blob, tail + 0x40, kContextCommandBoSize);
-  WriteU64(&blob, tail + 0x48, info.column_width);
-
-  if (!WriteCString(&blob, tail + 0x1C0, 64, info.pdi_name, out_error)) {
-    return false;
-  }
-  blob[tail + 0x1FF] = '0';
-  WriteU64(&blob, tail + 0x200, info.dpu_kernel_id << 8);
-  WriteU64(&blob, tail + 0x208, 8);
-  WriteU64(&blob, tail + 0x218, info.dpu_kernel_id);
-
-  WriteU32(&blob, tail + 0x520, 0x4000);
-  WriteU32(&blob, tail + 0x524, info.start_column + 1);
-  WriteU32(&blob, tail + 0x528, info.column_width);
+  WriteU64(&blob, tail + 0x40, 0x10000);
+  WriteU64(&blob, tail + 0x48, 9);
+  WriteU32(&blob, tail + 0x3B8, 0x800);
+  WriteU32(&blob, tail + 0x3BC, 1);
+  WriteU32(&blob, tail + 0x3C0, info.column_width);
+  WriteU32(&blob, tail + 0x3C4, info.start_column);
 
   if (out_info) *out_info = info;
   *out_blob = std::move(blob);

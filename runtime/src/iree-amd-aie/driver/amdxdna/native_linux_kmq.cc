@@ -479,7 +479,9 @@ iree_status_t iree_hal_amdxdna_native_command_set_cu_index(
 
 iree_status_t iree_hal_amdxdna_native_command_add_control_buffer(
     iree_hal_amdxdna_native_command_t* command,
-    iree_hal_amdxdna_native_buffer_t* control_buffer) {
+    iree_hal_amdxdna_native_buffer_t* control_buffer,
+    iree_device_size_t control_buffer_size) {
+  (void)control_buffer_size;
   return iree_hal_amdxdna_status_from_errno(
       command->kernel->add_ctrl_bo(*control_buffer->bo),
       "amdxdna native command control-buffer argument failed");

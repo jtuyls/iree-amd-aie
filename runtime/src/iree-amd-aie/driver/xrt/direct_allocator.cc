@@ -187,11 +187,11 @@ static iree_status_t iree_hal_xrt_allocator_allocate_buffer(
   }
 
   iree_hal_buffer_t* buffer = nullptr;
-  const iree_hal_buffer_placement_t placement = {
-      .queue_affinity = params->queue_affinity ? params->queue_affinity
-                                               : IREE_HAL_QUEUE_AFFINITY_ANY,
-      .flags = IREE_HAL_BUFFER_PLACEMENT_FLAG_NONE,
-  };
+  iree_hal_buffer_placement_t placement = {};
+  placement.queue_affinity =
+      params->queue_affinity ? params->queue_affinity
+                             : IREE_HAL_QUEUE_AFFINITY_ANY;
+  placement.flags = IREE_HAL_BUFFER_PLACEMENT_FLAG_NONE;
   if (iree_status_is_ok(status)) {
     status = iree_hal_xrt_buffer_wrap(
         xrt_buffer.release(), placement, compat_params.type,

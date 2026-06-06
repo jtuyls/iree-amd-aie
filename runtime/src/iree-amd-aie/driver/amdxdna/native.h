@@ -149,7 +149,8 @@ iree_status_t iree_hal_amdxdna_native_command_set_cu_index(
 
 iree_status_t iree_hal_amdxdna_native_command_add_control_buffer(
     iree_hal_amdxdna_native_command_t* command,
-    iree_hal_amdxdna_native_buffer_t* control_buffer);
+    iree_hal_amdxdna_native_buffer_t* control_buffer,
+    iree_device_size_t control_buffer_size);
 
 iree_status_t iree_hal_amdxdna_native_command_add_arg_32(
     iree_hal_amdxdna_native_command_t* command, uint32_t value);

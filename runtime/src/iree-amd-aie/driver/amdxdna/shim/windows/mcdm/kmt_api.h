@@ -24,6 +24,11 @@ enum class BufferKind {
   host_only,
   cacheable,
   execbuf,
+  // Firmware heap/carveout (CreateAllocation2 private_type 0x332c, xcl_flags
+  // 0x02000000). RE'd from xrt_core arg_bo ctor FUN_1800256e0: the AIE4 context
+  // setup needs two of these (0x2000 + 0x1000) GPU-mapped + resident, whose VAs
+  // form the private payload of the carveout CreateContextVirtual.
+  carveout,
 };
 
 struct BufferKindInfo {
@@ -37,6 +42,7 @@ BufferKindInfo GetBufferKindInfo(BufferKind kind);
 struct KmtApi {
   PFND3DKMT_ENUMADAPTERS3 enum_adapters3 = nullptr;
   PFND3DKMT_QUERYADAPTERINFO query_adapter_info = nullptr;
+  PFND3DKMT_OPENADAPTERFROMLUID open_adapter_from_luid = nullptr;
   PFND3DKMT_CLOSEADAPTER close_adapter = nullptr;
   PFND3DKMT_CREATEDEVICE create_device = nullptr;
   PFND3DKMT_DESTROYDEVICE destroy_device = nullptr;
@@ -63,11 +69,14 @@ struct KmtApi {
 
 struct Adapter {
   D3DKMT_HANDLE handle = 0;
+  LUID luid = {};
   std::wstring description;
+  std::vector<D3DKMT_HANDLE> retained_handles;
 };
 
 struct Device {
   D3DKMT_HANDLE adapter = 0;
+  std::vector<D3DKMT_HANDLE> retained_adapter_handles;
   D3DKMT_HANDLE device = 0;
   D3DKMT_HANDLE paging_queue = 0;
   D3DKMT_HANDLE paging_sync_object = 0;
@@ -76,8 +85,13 @@ struct Device {
 
 struct Buffer {
   BufferKind kind = BufferKind::host_only;
+  // Logical BO size exposed to the HAL/runtime.
   uint64_t size = 0;
+  // Actual GPU VA reservation size. XRT often requests a non-page-sized BO
+  // and maps the page-rounded allocation returned by the driver.
+  uint64_t mapped_size = 0;
   D3DKMT_HANDLE allocation = 0;
+  D3DKMT_HANDLE resource = 0;
   D3DGPU_VIRTUAL_ADDRESS gpu_va = 0;
   void* cpu_ptr = nullptr;
   UINT64 paging_fence_value = 0;
@@ -98,6 +112,28 @@ struct Context {
   void* progress_fence_cpu = nullptr;
   D3DGPU_VIRTUAL_ADDRESS progress_fence_gpu = 0;
   uint64_t next_fence_id = 1;
+  // Driver writeback at the primary context private blob +0x40. XRT folds this
+  // cookie into the 64 MiB command-aperture allocation private flags.
+  uint32_t command_aperture_cookie = 0;
+  // Path B (hwqueue_aie4-style per-dispatch submit) state. The completion ring
+  // is the firmware "status_bo": a 0x332b allocation (NOT a plain host BO) of
+  // 8-byte slots that the firmware writes command completion state into. It is
+  // allocated lazily on first Path B submit. Mirrors xrt_core's ring at
+  // hwqueue+0xa0 (FUN_1800261f0: 0x332b status_bo, CreateResource|CreateShared,
+  // Lock2). The 0x268/0x68 command carries this ring's ALLOCATION HANDLE at
+  // +0x28 and the CPU slot address at +0x38.
+  Buffer completion_ring;
+  D3DKMT_HANDLE completion_ring_resource = 0;
+  bool completion_ring_ready = false;
+  uint32_t completion_ring_offset = 0;
+  uint64_t next_command_id = 1;
+
+  // Stale AIE4-heap experiment kept only for opt-in probes. The working XRT
+  // IREE matmul capture uses one xclbin context and one HW queue.
+  D3DKMT_HANDLE carveout_context = 0;
+  Buffer carveout_heap_large;  // 0x2000, private_type 0x332c
+  Buffer carveout_heap_small;  // 0x1000, private_type 0x332c
+  uint32_t aie4_firmware_handle = 0;  // driver writeback at payload+0x40
 };
 
 struct CommandAperture {
@@ -112,12 +148,23 @@ struct CommandAperture {
   D3DKMT_HANDLE gpu_resource = 0;
   D3DGPU_VIRTUAL_ADDRESS gpu_va = 0;
   void* cpu_ptr = nullptr;
+  void* gpu_cpu_ptr = nullptr;
+  uint64_t cpu_ptr_size = 0;
+  // Control-code view inside the 64 MiB aperture BO at gpu_va + 0x8000. The
+  // working XRT path does not create a separate code allocation; it copies the
+  // transaction binary into the aperture allocation at this offset.
+  D3DKMT_HANDLE code_allocation = 0;
+  D3DKMT_HANDLE code_resource = 0;
+  D3DGPU_VIRTUAL_ADDRESS code_gpu_va = 0;
+  void* code_cpu_ptr = nullptr;
+  uint64_t code_size = 0;
 };
 
 bool FindNpuAdapter(const KmtApi& api, Adapter* out_adapter,
                     std::string* out_error);
 
-bool CreateDevice(const KmtApi& api, D3DKMT_HANDLE adapter, Device* out_device,
+bool CreateDevice(const KmtApi& api, const Adapter& adapter,
+                  Device* out_device,
                   std::string* out_error);
 
 void DestroyDevice(const KmtApi& api, Device* device);
@@ -127,6 +174,9 @@ bool CreateBuffer(const KmtApi& api, const Device& device, BufferKind kind,
 
 bool SyncBuffer(const KmtApi& api, const Device& device, const Buffer& buffer,
                 uint64_t offset, uint64_t length, std::string* out_error);
+
+bool RefreshBufferCpuMapping(const KmtApi& api, const Device& device,
+                             Buffer* buffer, std::string* out_error);
 
 bool WaitForBufferResidency(const KmtApi& api, const Device& device,
                             const Context& context, const Buffer& buffer,
@@ -153,9 +203,19 @@ void DestroyCommandControlBuffer(const KmtApi& api, const Device& device,
                                  CommandControlBuffer* buffer);
 
 bool SubmitAndWaitCommandAperture(const KmtApi& api, const Device& device,
-                                  Context* context,
-                                  const CommandAperture& aperture,
+                                  Context* context, CommandAperture* aperture,
                                   std::string* out_error);
+
+bool SubmitAndWaitPathBSetup(const KmtApi& api, const Device& device,
+                              Context* context, CommandAperture* aperture,
+                              const void* aperture_payload,
+                              size_t aperture_payload_size,
+                              std::string* out_error);
+
+bool SubmitPathBApertureSync(const KmtApi& api, const Device& device,
+                             Context* context,
+                             const CommandAperture& aperture, uint64_t offset,
+                             bool wait_for_cpu, std::string* out_error);
 
 bool SubmitAndWaitQhdlCommand(const KmtApi& api, const Device& device,
                               Context* context,
@@ -168,6 +228,23 @@ bool SubmitAndWaitQhdlCommand(const KmtApi& api, const Device& device,
 bool SubmitAndWaitBuffer(const KmtApi& api, const Device& device,
                          Context* context, const Buffer& buffer,
                          std::string* out_error);
+
+// Path B: per-dispatch hwqueue_aie4-style submit. Reproduces the xrt_core
+// submission recovered from disassembly: reserve an 8-byte completion-ring
+// slot, build the 0x268 private packet (state, completion slot, ERT packet
+// copied inline at +0x68), and submit the exec BO via SubmitCommandToHwQueue.
+// `ert_packet`/`ert_bytes` are the command BO's ERT packet; `packet_header` is
+// updated with the firmware completion state read back from the ring slot.
+bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
+                        Context* context, const Buffer& exec_buffer,
+                        const void* ert_packet, uint32_t ert_bytes,
+                        uint32_t command_state, uint32_t* packet_header,
+                        std::string* out_error);
+
+// Stale probe path retained for diagnostics only. The working XRT IREE matmul
+// capture uses opcode 2/5/9 setup packets, not opcode 10.
+bool SubmitAndWaitCreateAie4Ctx(const KmtApi& api, const Device& device,
+                                Context* context, std::string* out_error);
 
 void DestroyCommandAperture(const KmtApi& api, const Device& device,
                             CommandAperture* aperture);

@@ -9,7 +9,10 @@
 # Enable with: -DIREE_EXTERNAL_HAL_DRIVERS=xrt
 #-------------------------------------------------------------------------------
 
-iree_add_all_subdirs()
+add_subdirectory(registration)
+if(IREE_BUILD_TESTS)
+  add_subdirectory(cts)
+endif()
 
 iree_register_external_hal_driver(
   NAME

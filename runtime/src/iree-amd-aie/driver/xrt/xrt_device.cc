@@ -387,10 +387,9 @@ static iree_status_t iree_hal_xrt_device_queue_read(
     iree_hal_file_t* source_file, uint64_t source_offset,
     iree_hal_buffer_t* target_buffer, iree_device_size_t target_offset,
     iree_device_size_t length, iree_hal_read_flags_t flags) {
-  iree_hal_file_transfer_options_t options = {
-      .chunk_count = IREE_HAL_FILE_TRANSFER_CHUNK_COUNT_DEFAULT,
-      .chunk_size = IREE_HAL_FILE_TRANSFER_CHUNK_SIZE_DEFAULT,
-  };
+  iree_hal_file_transfer_options_t options = {};
+  options.chunk_count = IREE_HAL_FILE_TRANSFER_CHUNK_COUNT_DEFAULT;
+  options.chunk_size = IREE_HAL_FILE_TRANSFER_CHUNK_SIZE_DEFAULT;
   return iree_hal_device_queue_read_streaming(
       base_device, queue_affinity, wait_semaphore_list, signal_semaphore_list,
       source_file, source_offset, target_buffer, target_offset, length, flags,
@@ -404,10 +403,9 @@ static iree_status_t iree_hal_xrt_device_queue_write(
     iree_hal_buffer_t* source_buffer, iree_device_size_t source_offset,
     iree_hal_file_t* target_file, uint64_t target_offset,
     iree_device_size_t length, iree_hal_write_flags_t flags) {
-  iree_hal_file_transfer_options_t options = {
-      .chunk_count = IREE_HAL_FILE_TRANSFER_CHUNK_COUNT_DEFAULT,
-      .chunk_size = IREE_HAL_FILE_TRANSFER_CHUNK_SIZE_DEFAULT,
-  };
+  iree_hal_file_transfer_options_t options = {};
+  options.chunk_count = IREE_HAL_FILE_TRANSFER_CHUNK_COUNT_DEFAULT;
+  options.chunk_size = IREE_HAL_FILE_TRANSFER_CHUNK_SIZE_DEFAULT;
   return iree_hal_device_queue_write_streaming(
       base_device, queue_affinity, wait_semaphore_list, signal_semaphore_list,
       source_buffer, source_offset, target_file, target_offset, length, flags,
@@ -479,40 +477,42 @@ static iree_status_t iree_hal_xrt_device_queue_flush(
 }
 
 namespace {
-const iree_hal_device_vtable_t iree_hal_xrt_device_vtable = {
-    .destroy = iree_hal_xrt_device_destroy,
-    .id = iree_hal_xrt_device_id,
-    .host_allocator = iree_hal_xrt_device_host_allocator,
-    .device_allocator = iree_hal_xrt_device_allocator,
-    .replace_device_allocator = iree_hal_xrt_replace_device_allocator,
-    .replace_channel_provider = iree_hal_xrt_replace_channel_provider,
-    .trim = iree_hal_xrt_device_trim,
-    .query_i64 = iree_hal_xrt_device_query_i64,
-    .query_capabilities = iree_hal_xrt_device_query_capabilities,
-    .topology_info = iree_hal_xrt_device_topology_info,
-    .refine_topology_edge = iree_hal_xrt_device_refine_topology_edge,
-    .assign_topology_info = iree_hal_xrt_device_assign_topology_info,
-    .create_channel = iree_hal_xrt_device_create_channel,
-    .create_command_buffer = iree_hal_xrt_device_create_command_buffer,
-    .create_event = iree_hal_xrt_device_create_event,
-    .create_executable_cache = iree_hal_xrt_device_create_executable_cache,
-    .import_file = iree_hal_xrt_device_import_file,
-    .create_semaphore = iree_hal_xrt_device_create_semaphore,
-    .query_semaphore_compatibility =
-        iree_hal_xrt_device_query_semaphore_compatibility,
-    .queue_alloca = iree_hal_xrt_device_queue_alloca,
-    .queue_dealloca = iree_hal_xrt_device_queue_dealloca,
-    .queue_fill = iree_hal_device_queue_emulated_fill,
-    .queue_update = iree_hal_device_queue_emulated_update,
-    .queue_copy = iree_hal_device_queue_emulated_copy,
-    .queue_read = iree_hal_xrt_device_queue_read,
-    .queue_write = iree_hal_xrt_device_queue_write,
-    .queue_host_call = iree_hal_xrt_device_queue_host_call,
-    .queue_dispatch = iree_hal_device_queue_emulated_dispatch,
-    .queue_execute = iree_hal_xrt_device_queue_execute,
-    .queue_flush = iree_hal_xrt_device_queue_flush,
-    .profiling_begin = iree_hal_xrt_device_profiling_ok,
-    .profiling_flush = iree_hal_xrt_device_profiling_flush_ok,
-    .profiling_end = iree_hal_xrt_device_profiling_end_ok,
-};
+const iree_hal_device_vtable_t iree_hal_xrt_device_vtable = [] {
+  iree_hal_device_vtable_t vtable = {};
+  vtable.destroy = iree_hal_xrt_device_destroy;
+  vtable.id = iree_hal_xrt_device_id;
+  vtable.host_allocator = iree_hal_xrt_device_host_allocator;
+  vtable.device_allocator = iree_hal_xrt_device_allocator;
+  vtable.replace_device_allocator = iree_hal_xrt_replace_device_allocator;
+  vtable.replace_channel_provider = iree_hal_xrt_replace_channel_provider;
+  vtable.trim = iree_hal_xrt_device_trim;
+  vtable.query_i64 = iree_hal_xrt_device_query_i64;
+  vtable.query_capabilities = iree_hal_xrt_device_query_capabilities;
+  vtable.topology_info = iree_hal_xrt_device_topology_info;
+  vtable.refine_topology_edge = iree_hal_xrt_device_refine_topology_edge;
+  vtable.assign_topology_info = iree_hal_xrt_device_assign_topology_info;
+  vtable.create_channel = iree_hal_xrt_device_create_channel;
+  vtable.create_command_buffer = iree_hal_xrt_device_create_command_buffer;
+  vtable.create_event = iree_hal_xrt_device_create_event;
+  vtable.create_executable_cache = iree_hal_xrt_device_create_executable_cache;
+  vtable.import_file = iree_hal_xrt_device_import_file;
+  vtable.create_semaphore = iree_hal_xrt_device_create_semaphore;
+  vtable.query_semaphore_compatibility =
+      iree_hal_xrt_device_query_semaphore_compatibility;
+  vtable.queue_alloca = iree_hal_xrt_device_queue_alloca;
+  vtable.queue_dealloca = iree_hal_xrt_device_queue_dealloca;
+  vtable.queue_fill = iree_hal_device_queue_emulated_fill;
+  vtable.queue_update = iree_hal_device_queue_emulated_update;
+  vtable.queue_copy = iree_hal_device_queue_emulated_copy;
+  vtable.queue_read = iree_hal_xrt_device_queue_read;
+  vtable.queue_write = iree_hal_xrt_device_queue_write;
+  vtable.queue_host_call = iree_hal_xrt_device_queue_host_call;
+  vtable.queue_dispatch = iree_hal_device_queue_emulated_dispatch;
+  vtable.queue_execute = iree_hal_xrt_device_queue_execute;
+  vtable.queue_flush = iree_hal_xrt_device_queue_flush;
+  vtable.profiling_begin = iree_hal_xrt_device_profiling_ok;
+  vtable.profiling_flush = iree_hal_xrt_device_profiling_flush_ok;
+  vtable.profiling_end = iree_hal_xrt_device_profiling_end_ok;
+  return vtable;
+}();
 }  // namespace
