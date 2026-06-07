@@ -91,6 +91,10 @@ bool XrtMinimalResidencyEnabled() {
   return EnvFlagEnabled("IREE_AMDXDNA_MCDM_XRT_MINIMAL_RESIDENCY");
 }
 
+bool PathBCompletionPollFallbackEnabled() {
+  return EnvFlagEnabled("IREE_AMDXDNA_MCDM_PATHB_COMPLETION_POLL_FALLBACK");
+}
+
 void InitializeCompletionSlot(uint8_t* slot_cpu) {
   if (EnvFlagEnabled("IREE_AMDXDNA_MCDM_CCCC_COMPLETION_SLOT")) {
     std::memset(slot_cpu, 0xCC, kQhdlCompletionSlotSize);
@@ -461,7 +465,6 @@ void DestroyDevice(const KmtApi& api, Device* device) {
 bool WaitForPagingFenceCpu(const KmtApi& api, const Device& device,
                            UINT64 fence_value) {
   if (fence_value == 0) return true;
-  HANDLE wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   D3DKMT_HANDLE objects[1] = {device.paging_sync_object};
   UINT64 values[1] = {fence_value};
   D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait = {};
@@ -469,13 +472,8 @@ bool WaitForPagingFenceCpu(const KmtApi& api, const Device& device,
   wait.ObjectCount = 1;
   wait.ObjectHandleArray = objects;
   wait.FenceValueArray = values;
-  wait.hAsyncEvent = wait_event;
+  wait.hAsyncEvent = nullptr;
   NTSTATUS status = api.wait_from_cpu(&wait);
-  if (status == kStatusPending && wait_event) {
-    WaitForSingleObject(wait_event, 5000);
-    status = 0;
-  }
-  if (wait_event) CloseHandle(wait_event);
   return status == 0;
 }
 
@@ -1254,7 +1252,6 @@ bool SubmitAndWaitCommandAperture(const KmtApi& api, const Device& device,
 bool WaitForHwQueueFenceCpu(const KmtApi& api, const Device& device,
                             const Context& context, uint64_t fence_id,
                             const char* label, std::string* out_error) {
-  HANDLE wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   D3DKMT_HANDLE wait_objects[1] = {context.progress_fence};
   UINT64 wait_values[1] = {fence_id};
   if (TraceQhdlEnabled()) {
@@ -1269,14 +1266,11 @@ bool WaitForHwQueueFenceCpu(const KmtApi& api, const Device& device,
   wait.ObjectCount = 1;
   wait.ObjectHandleArray = wait_objects;
   wait.FenceValueArray = wait_values;
-  wait.hAsyncEvent = wait_event;
+  // XRT's qhdl wait path calls D3DKMTWaitForSynchronizationObjectFromCpu with
+  // hAsyncEvent=0 and blocks in KMT. Match that call shape instead of using an
+  // asynchronous event plus a host-side wait wrapper.
+  wait.hAsyncEvent = nullptr;
   NTSTATUS status = api.wait_from_cpu(&wait);
-  if (status == kStatusPending && wait_event) {
-    DWORD wait_result = WaitForSingleObject(wait_event, 5000);
-    status = (wait_result == WAIT_OBJECT_0) ? 0
-                                            : static_cast<NTSTATUS>(WAIT_TIMEOUT);
-  }
-  if (wait_event) CloseHandle(wait_event);
   return CheckStatus(label, status, out_error);
 }
 
@@ -1609,35 +1603,9 @@ bool SubmitAndWaitBuffer(const KmtApi& api, const Device& device,
     return false;
   }
 
-  HANDLE wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-  D3DKMT_HANDLE wait_objects[1] = {context->progress_fence};
-  UINT64 wait_values[1] = {fence_id};
-  if (TraceQhdlEnabled()) {
-    std::fprintf(stderr,
-                 "[amdxdna:mcdm] pathb wait: label=workload fence=%llu "
-                 "target=%llu\n",
-                 static_cast<unsigned long long>(fence_id),
-                 static_cast<unsigned long long>(wait_values[0]));
-    std::fflush(stderr);
-  }
-  D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait = {};
-  wait.hDevice = device.device;
-  wait.ObjectCount = 1;
-  wait.ObjectHandleArray = wait_objects;
-  wait.FenceValueArray = wait_values;
-  wait.hAsyncEvent = wait_event;
-  status = api.wait_from_cpu(&wait);
-  if (status == kStatusPending && wait_event) {
-    DWORD wait_result = WaitForSingleObject(wait_event, 5000);
-    if (wait_result != WAIT_OBJECT_0) {
-      status = static_cast<NTSTATUS>(WAIT_TIMEOUT);
-    } else {
-      status = 0;
-    }
-  }
-  if (wait_event) CloseHandle(wait_event);
-  return CheckStatus("D3DKMTWaitForSynchronizationObjectFromCpu(buffer)",
-                     status, out_error);
+  return WaitForHwQueueFenceCpu(
+      api, device, *context, fence_id,
+      "D3DKMTWaitForSynchronizationObjectFromCpu(buffer)", out_error);
 }
 
 // Allocate the firmware completion ring as a 0x332b status_bo (NOT a plain host
@@ -1795,32 +1763,10 @@ bool SubmitAndWaitCreateAie4Ctx(const KmtApi& api, const Device& device,
     return false;
   }
 
-  HANDLE wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-  D3DKMT_HANDLE wait_objects[1] = {context->progress_fence};
-  UINT64 wait_values[1] = {fence_id};
-  if (TraceQhdlEnabled()) {
-    std::fprintf(stderr,
-                 "[amdxdna:mcdm] pathb wait: label=create-aie4-ctx fence=%llu "
-                 "target=%llu\n",
-                 static_cast<unsigned long long>(fence_id),
-                 static_cast<unsigned long long>(wait_values[0]));
-    std::fflush(stderr);
-  }
-  D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait = {};
-  wait.hDevice = device.device;
-  wait.ObjectCount = 1;
-  wait.ObjectHandleArray = wait_objects;
-  wait.FenceValueArray = wait_values;
-  wait.hAsyncEvent = wait_event;
-  status = api.wait_from_cpu(&wait);
-  if (status == kStatusPending && wait_event) {
-    DWORD wait_result = WaitForSingleObject(wait_event, 5000);
-    status = (wait_result == WAIT_OBJECT_0) ? 0
-                                            : static_cast<NTSTATUS>(WAIT_TIMEOUT);
-  }
-  if (wait_event) CloseHandle(wait_event);
-  if (!CheckStatus("D3DKMTWaitForSynchronizationObjectFromCpu(create_aie4_ctx)",
-                   status, out_error)) {
+  if (!WaitForHwQueueFenceCpu(
+          api, device, *context, fence_id,
+          "D3DKMTWaitForSynchronizationObjectFromCpu(create_aie4_ctx)",
+          out_error)) {
     return false;
   }
   {
@@ -1954,43 +1900,19 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
     return false;
   }
 
-  HANDLE wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-  D3DKMT_HANDLE wait_objects[1] = {context->progress_fence};
-  UINT64 wait_values[1] = {fence_id};
-  if (TraceQhdlEnabled()) {
-    std::fprintf(stderr,
-                 "[amdxdna:mcdm] pathb wait: label=opcode3 fence=%llu "
-                 "target=%llu\n",
-                 static_cast<unsigned long long>(fence_id),
-                 static_cast<unsigned long long>(wait_values[0]));
-    std::fflush(stderr);
-  }
-  D3DKMT_WAITFORSYNCHRONIZATIONOBJECTFROMCPU wait = {};
-  wait.hDevice = device.device;
-  wait.ObjectCount = 1;
-  wait.ObjectHandleArray = wait_objects;
-  wait.FenceValueArray = wait_values;
-  wait.hAsyncEvent = wait_event;
-  status = api.wait_from_cpu(&wait);
-  if (status == kStatusPending && wait_event) {
-    DWORD wait_result = WaitForSingleObject(wait_event, 5000);
-    status = (wait_result == WAIT_OBJECT_0) ? 0
-                                            : static_cast<NTSTATUS>(WAIT_TIMEOUT);
-  }
-  if (wait_event) CloseHandle(wait_event);
-  if (!CheckStatus("D3DKMTWaitForSynchronizationObjectFromCpu(pathb)", status,
-                   out_error)) {
+  if (!WaitForHwQueueFenceCpu(api, device, *context, fence_id,
+                              "D3DKMTWaitForSynchronizationObjectFromCpu(pathb)",
+                              out_error)) {
     return false;
   }
 
-  // The progress fence means the KMT submit has reached the HW queue, but the
-  // firmware completion is reported through the command packet/status slot. Poll
-  // those explicit protocol locations with cache invalidation; do not use host
-  // sleeps as a correctness mechanism.
+  // XRT's qhdl wait path blocks in KMT and then mirrors the low ERT state nibble
+  // from the completion slot into the packet header. Do one cache-visible read
+  // from the explicit protocol locations here. A bounded poll remains available
+  // only as an opt-in bring-up diagnostic.
   uint32_t slot_state = 0;
   uint32_t packet_state = packet_header ? *packet_header : 0;
-  const uint64_t deadline = GetTickCount64() + 5000;
-  while ((packet_state & 0xFu) < 4 && (slot_state & 0xFu) < 4) {
+  auto read_completion_once = [&]() -> bool {
     std::string command_sync_err;
     if (!SyncBuffer(api, device, exec_buffer, 0, exec_buffer.size,
                     &command_sync_err)) {
@@ -2002,7 +1924,6 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     packet_state = packet_header ? *packet_header : 0;
-    if ((packet_state & 0xFu) >= 4) break;
 
     std::string ring_sync_err;
     if (!SyncBuffer(api, device, ring, 0, ring.size, &ring_sync_err)) {
@@ -2013,9 +1934,17 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     std::memcpy(&slot_state, slot_cpu, sizeof(slot_state));
-    if ((slot_state & 0xFu) >= 4) break;
-    if (GetTickCount64() >= deadline) break;
-    YieldProcessor();
+    return true;
+  };
+  if (!read_completion_once()) return false;
+
+  if (PathBCompletionPollFallbackEnabled()) {
+    const uint64_t deadline = GetTickCount64() + 5000;
+    while ((packet_state & 0xFu) < 4 && (slot_state & 0xFu) < 4 &&
+           GetTickCount64() < deadline) {
+      YieldProcessor();
+      if (!read_completion_once()) return false;
+    }
   }
   if (packet_header) {
     const uint32_t completion_state =
