@@ -15,6 +15,11 @@ if(NOT PEANO_INSTALL_DIR)
 endif()
 set(TARGET_DEVICE "npu1_4col" CACHE STRING "")
 
+set(AMDXDNA_AIE_TEST_AMD_AIE_INSTALL_DIR_FLAG "")
+if(IREE_HOST_BIN_DIR)
+  set(AMDXDNA_AIE_TEST_AMD_AIE_INSTALL_DIR_FLAG "--iree-amd-aie-install-dir=${IREE_HOST_BIN_DIR}")
+endif()
+
 iree_bytecode_module(
   NAME
     amdxdna_executable_cache_test_module
@@ -112,7 +117,9 @@ iree_bytecode_module(
     --iree-amdaie-lower-to-aie-pipeline=objectFifo
     --iree-amdaie-target-device=npu4
     --iree-amd-aie-peano-install-dir=${PEANO_INSTALL_DIR}
+    ${AMDXDNA_AIE_TEST_AMD_AIE_INSTALL_DIR_FLAG}
     --iree-amdaie-device-hal=amdxdna
+    --iree-amdaie-amdxdna-emit-context-xclbin=true
     --iree-amdaie-enable-control-packet=true
     --iree-amdaie-packet-flow-strategy=auto
     --iree-amdaie-num-rows=1

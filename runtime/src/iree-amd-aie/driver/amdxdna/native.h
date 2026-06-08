@@ -46,6 +46,7 @@ enum class iree_hal_amdxdna_native_sync_direction_t : uint8_t {
 enum class iree_hal_amdxdna_native_command_opcode_t : uint8_t {
   start_cu = 0,
   start_npu,
+  start_npu_partial_elf,
   command_chain,
 };
 
@@ -118,6 +119,9 @@ iree_status_t iree_hal_amdxdna_native_buffer_sync(
 iree_status_t iree_hal_amdxdna_native_buffer_sync_all(
     iree_hal_amdxdna_native_buffer_t* buffer,
     iree_hal_amdxdna_native_sync_direction_t direction);
+
+iree_status_t iree_hal_amdxdna_native_buffer_ensure_allocated(
+    iree_hal_amdxdna_native_buffer_t* buffer);
 
 uint64_t iree_hal_amdxdna_native_buffer_device_address(
     iree_hal_amdxdna_native_buffer_t* buffer);

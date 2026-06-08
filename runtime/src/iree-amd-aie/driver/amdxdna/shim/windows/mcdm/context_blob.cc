@@ -9,17 +9,23 @@
 #include <algorithm>
 #include <cstring>
 #include <sstream>
+#include <utility>
 
 namespace iree::hal::amdxdna::mcdm {
 namespace {
 
 constexpr size_t kAxlfBaseOffset = 0xE8;
-constexpr size_t kTailSizeOnePdi = 0x3C8;
+constexpr size_t kContextTailSize = 0x3C8;
 constexpr uint64_t kCommandApertureBase = 0x04000000;
 constexpr uint64_t kContextCommandBoSize = 0x1000;
 constexpr uint32_t kBuildMetadataSection = 14;
 constexpr uint32_t kAiePartitionSection = 32;
 constexpr uint32_t kIpLayoutSection = 8;
+constexpr size_t kIpLayoutAieHeaderSize = 8;
+constexpr size_t kIpLayoutLegacyHeaderSize = 4;
+constexpr size_t kIpDataRecordSize = 80;
+constexpr size_t kIpDataNameOffset = 16;
+constexpr size_t kIpDataNameSize = 64;
 
 struct AxlfSection {
   uint32_t kind = 0;
@@ -149,18 +155,16 @@ bool ExtractJsonStringAfter(const std::string& json, size_t start,
   return false;
 }
 
-std::string DeriveKernelName(const uint8_t* xclbin,
-                             const std::vector<AxlfSection>& sections) {
-  const AxlfSection* ip_layout = FindFirstSection(sections, kIpLayoutSection);
-  if (ip_layout && ip_layout->size >= 88) {
-    std::string name = CString(xclbin + ip_layout->offset + 24, 64);
-    size_t instance_separator = name.find(':');
-    if (instance_separator != std::string::npos) {
-      name.resize(instance_separator);
-    }
-    if (!name.empty()) return name;
+std::string NormalizeIpName(std::string name) {
+  size_t instance_separator = name.find(':');
+  if (instance_separator != std::string::npos) {
+    name.resize(instance_separator);
   }
+  return name;
+}
 
+std::string DeriveKernelNameFromMetadata(
+    const uint8_t* xclbin, const std::vector<AxlfSection>& sections) {
   const AxlfSection* section = FindFirstSection(sections, kBuildMetadataSection);
   if (!section) return "kernel";
   std::string json(reinterpret_cast<const char*>(xclbin + section->offset),
@@ -186,6 +190,42 @@ std::string DeriveKernelName(const uint8_t* xclbin,
   }
 
   return "kernel";
+}
+
+bool ParseIpLayout(const uint8_t* xclbin, size_t xclbin_size,
+                   const std::vector<AxlfSection>& sections,
+                   ContextBlobInfo* info, std::string* out_error) {
+  const AxlfSection* section = FindFirstSection(sections, kIpLayoutSection);
+  if (!section) return true;
+  if (!CheckRange(xclbin_size, section->offset, section->size,
+                  "IP_LAYOUT section", out_error)) {
+    return false;
+  }
+  const uint8_t* data = xclbin + section->offset;
+  size_t size = static_cast<size_t>(section->size);
+  if (size < kIpLayoutLegacyHeaderSize) {
+    return Fail("IP_LAYOUT section is too small", out_error);
+  }
+
+  uint32_t count = ReadU32(data, 0);
+  size_t records_offset = kIpLayoutAieHeaderSize;
+  if (size < records_offset + uint64_t{kIpDataRecordSize} * count) {
+    records_offset = kIpLayoutLegacyHeaderSize;
+  }
+  if (size < records_offset + uint64_t{kIpDataRecordSize} * count) {
+    return Fail("IP_LAYOUT record table is out of bounds", out_error);
+  }
+
+  info->kernel_names.clear();
+  info->kernel_names.reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    size_t record = records_offset + size_t{i} * kIpDataRecordSize;
+    std::string name =
+        NormalizeIpName(CString(data + record + kIpDataNameOffset,
+                                kIpDataNameSize));
+    if (!name.empty()) info->kernel_names.push_back(std::move(name));
+  }
+  return true;
 }
 
 bool ParseAiePartition(const uint8_t* xclbin, size_t xclbin_size,
@@ -218,39 +258,50 @@ bool ParseAiePartition(const uint8_t* xclbin, size_t xclbin_size,
 
   uint32_t pdi_count = ReadU32(data, 120);
   uint32_t pdi_offset = ReadU32(data, 124);
-  if (pdi_count != 1) {
-    std::ostringstream os;
-    os << "prototype context builder only supports one-PDI xclbins; got "
-       << pdi_count;
-    return Fail(os.str(), out_error);
+  if (pdi_count == 0) {
+    return Fail("AIE_PARTITION contains no PDI records", out_error);
   }
-  if (!CheckRange(size, pdi_offset, 0x60, "AIE_PARTITION PDI table",
-                  out_error)) {
+  if (!CheckRange(size, pdi_offset, uint64_t{0x60} * pdi_count,
+                  "AIE_PARTITION PDI table", out_error)) {
     return false;
   }
 
-  uint32_t cdo_count = ReadU32(data, pdi_offset + 24);
-  uint32_t cdo_offset = ReadU32(data, pdi_offset + 28);
-  if (cdo_count == 0 ||
-      !CheckRange(size, cdo_offset, 0x70, "AIE_PARTITION CDO table",
-                  out_error)) {
-    return Fail("AIE_PARTITION CDO table is missing", out_error);
-  }
-  uint32_t pdi_name_offset = ReadU32(data, cdo_offset);
-  if (!CheckRange(size, pdi_name_offset, 64, "AIE_PARTITION CDO name",
-                  out_error)) {
-    return false;
-  }
-  info->pdi_name = CString(data + pdi_name_offset, 64);
+  info->pdi_count = pdi_count;
+  info->pdi_names.clear();
+  info->dpu_kernel_ids.clear();
+  info->pdi_names.reserve(pdi_count);
+  info->dpu_kernel_ids.reserve(pdi_count);
+  for (uint32_t i = 0; i < pdi_count; ++i) {
+    size_t pdi_record = pdi_offset + size_t{i} * 0x60;
+    uint32_t cdo_count = ReadU32(data, pdi_record + 24);
+    uint32_t cdo_offset = ReadU32(data, pdi_record + 28);
+    if (cdo_count == 0 ||
+        !CheckRange(size, cdo_offset, uint64_t{0x70} * cdo_count,
+                    "AIE_PARTITION CDO table", out_error)) {
+      return Fail("AIE_PARTITION CDO table is missing", out_error);
+    }
 
-  uint32_t kernel_count = ReadU32(data, cdo_offset + 16);
-  uint32_t kernel_offset = ReadU32(data, cdo_offset + 20);
-  if (kernel_count == 0 ||
-      !CheckRange(size, kernel_offset, 8, "AIE_PARTITION kernel id table",
-                  out_error)) {
-    return Fail("AIE_PARTITION kernel id table is missing", out_error);
+    uint32_t pdi_name_offset = ReadU32(data, cdo_offset);
+    if (!CheckRange(size, pdi_name_offset, 64, "AIE_PARTITION CDO name",
+                    out_error)) {
+      return false;
+    }
+    std::string pdi_name = CString(data + pdi_name_offset, 64);
+
+    uint32_t kernel_count = ReadU32(data, cdo_offset + 16);
+    uint32_t kernel_offset = ReadU32(data, cdo_offset + 20);
+    if (kernel_count == 0 ||
+        !CheckRange(size, kernel_offset, uint64_t{8} * kernel_count,
+                    "AIE_PARTITION kernel id table", out_error)) {
+      return Fail("AIE_PARTITION kernel id table is missing", out_error);
+    }
+    uint64_t kernel_id = ReadU64(data, kernel_offset);
+    info->pdi_names.push_back(std::move(pdi_name));
+    info->dpu_kernel_ids.push_back(kernel_id);
   }
-  info->dpu_kernel_id = ReadU64(data, kernel_offset);
+
+  info->pdi_name = info->pdi_names.front();
+  info->dpu_kernel_id = info->dpu_kernel_ids.front();
   return true;
 }
 
@@ -268,12 +319,17 @@ bool BuildContextPrivateDataFromXclbin(const uint8_t* xclbin,
   if (!ParseSections(xclbin, xclbin_size, &sections, out_error)) return false;
 
   ContextBlobInfo info;
-  info.kernel_name = DeriveKernelName(xclbin, sections);
+  if (!ParseIpLayout(xclbin, xclbin_size, sections, &info, out_error)) {
+    return false;
+  }
+  info.kernel_name =
+      info.kernel_names.empty() ? DeriveKernelNameFromMetadata(xclbin, sections)
+                                : info.kernel_names.front();
   if (!ParseAiePartition(xclbin, xclbin_size, sections, &info, out_error)) {
     return false;
   }
 
-  size_t total_size = kAxlfBaseOffset + xclbin_size + kTailSizeOnePdi;
+  size_t total_size = kAxlfBaseOffset + xclbin_size + kContextTailSize;
   std::vector<uint8_t> blob(total_size, 0);
 
   std::memcpy(blob.data(), xclbin + 0x1A0, 16);

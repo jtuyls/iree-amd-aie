@@ -6,6 +6,8 @@
 
 #include "iree-amd-aie/driver/amdxdna/async_queue.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "iree/async/frontier_tracker.h"
@@ -299,6 +301,13 @@ int iree_hal_amdxdna_async_queue_worker_main(void* arg) {
                                             queue->frontier_axis, epoch);
       }
       if (!iree_status_is_ok(status)) {
+        const char* trace_failures =
+            getenv("IREE_AMDXDNA_ASYNC_QUEUE_TRACE_FAILURES");
+        if (trace_failures && trace_failures[0] != '\0' &&
+            trace_failures[0] != '0') {
+          fprintf(stderr, "amdxdna async queue op failed: ");
+          iree_status_fprint(stderr, status);
+        }
         iree_hal_semaphore_list_fail(op->signal_list, status);
       }
       iree_hal_amdxdna_async_queue_release_op(queue, op);

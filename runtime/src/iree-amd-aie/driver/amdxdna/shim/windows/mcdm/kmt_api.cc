@@ -8,9 +8,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -36,7 +38,82 @@ constexpr char kApertureGpuHandleDeltaEnv[] =
     "IREE_AMDXDNA_MCDM_APERTURE_GPU_HANDLE_DELTA";
 constexpr char kApertureCleanupHandleDeltaEnv[] =
     "IREE_AMDXDNA_MCDM_APERTURE_CLEANUP_HANDLE_DELTA";
+constexpr char kCommandApertureXclFlagsEnv[] =
+    "IREE_AMDXDNA_MCDM_COMMAND_APERTURE_XCL_FLAGS";
 constexpr char kTraceQhdlEnv[] = "IREE_AMDXDNA_MCDM_TRACE_QHDL";
+constexpr char kPathBPhaseTimingEnv[] =
+    "IREE_AMDXDNA_MCDM_PATHB_PHASE_TIMING";
+
+struct PhaseStat {
+  const char* name = "";
+  std::atomic<uint64_t> count{0};
+  std::atomic<uint64_t> total_ns{0};
+  std::atomic<uint64_t> min_ns{std::numeric_limits<uint64_t>::max()};
+  std::atomic<uint64_t> max_ns{0};
+};
+
+void RecordPhase(PhaseStat& stat, uint64_t ns) {
+  stat.count.fetch_add(1, std::memory_order_relaxed);
+  stat.total_ns.fetch_add(ns, std::memory_order_relaxed);
+  uint64_t min_ns = stat.min_ns.load(std::memory_order_relaxed);
+  while (ns < min_ns &&
+         !stat.min_ns.compare_exchange_weak(min_ns, ns,
+                                            std::memory_order_relaxed)) {
+  }
+  uint64_t max_ns = stat.max_ns.load(std::memory_order_relaxed);
+  while (ns > max_ns &&
+         !stat.max_ns.compare_exchange_weak(max_ns, ns,
+                                            std::memory_order_relaxed)) {
+  }
+}
+
+struct PathBPhaseStats {
+  PhaseStat total{"total"};
+  PhaseStat ensure_ring{"ensure_ring"};
+  PhaseStat build_private{"build_private"};
+  PhaseStat residency{"residency"};
+  PhaseStat submit{"submit"};
+  PhaseStat wait{"wait"};
+  PhaseStat sync_exec{"sync_exec"};
+  PhaseStat sync_ring{"sync_ring"};
+};
+
+PathBPhaseStats& pathb_phase_stats() {
+  static PathBPhaseStats stats;
+  return stats;
+}
+
+struct PathBPhaseReporter {
+  ~PathBPhaseReporter() {
+    PathBPhaseStats& stats = pathb_phase_stats();
+    PhaseStat* phases[] = {&stats.total,     &stats.ensure_ring,
+                           &stats.build_private, &stats.residency,
+                           &stats.submit,    &stats.wait,
+                           &stats.sync_exec, &stats.sync_ring};
+    for (PhaseStat* phase : phases) {
+      uint64_t count = phase->count.load(std::memory_order_relaxed);
+      if (!count) continue;
+      uint64_t total_ns = phase->total_ns.load(std::memory_order_relaxed);
+      uint64_t min_ns = phase->min_ns.load(std::memory_order_relaxed);
+      uint64_t max_ns = phase->max_ns.load(std::memory_order_relaxed);
+      std::fprintf(stderr,
+                   "[amdxdna:mcdm-pathb-phase] phase=%s count=%llu "
+                   "mean_us=%.3f min_us=%.3f max_us=%.3f total_us=%.3f\n",
+                   phase->name, static_cast<unsigned long long>(count),
+                   static_cast<double>(total_ns) / count / 1000.0,
+                   static_cast<double>(min_ns) / 1000.0,
+                   static_cast<double>(max_ns) / 1000.0,
+                   static_cast<double>(total_ns) / 1000.0);
+    }
+  }
+};
+
+uint64_t NowNs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
 
 template <typename Fn>
 Fn ResolveKmtProc(const char* name) {
@@ -87,12 +164,25 @@ bool EnvFlagEnabled(const char* name) {
   return value && value[0] && value[0] != '0';
 }
 
+bool PathBPhaseTimingEnabled() {
+  static bool enabled = EnvFlagEnabled(kPathBPhaseTimingEnv);
+  if (enabled) {
+    static PathBPhaseReporter reporter;
+    (void)reporter;
+  }
+  return enabled;
+}
+
 bool XrtMinimalResidencyEnabled() {
   return EnvFlagEnabled("IREE_AMDXDNA_MCDM_XRT_MINIMAL_RESIDENCY");
 }
 
 bool PathBCompletionPollFallbackEnabled() {
   return EnvFlagEnabled("IREE_AMDXDNA_MCDM_PATHB_COMPLETION_POLL_FALLBACK");
+}
+
+bool TrustFenceCompletionEnabled() {
+  return EnvFlagEnabled("IREE_AMDXDNA_MCDM_TRUST_FENCE_COMPLETION");
 }
 
 void InitializeCompletionSlot(uint8_t* slot_cpu) {
@@ -955,6 +1045,15 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
   gpu_private.policy = 2;
   gpu_private.xcl_flags =
       0x01000001u | (context.command_aperture_cookie << 16);
+  if (const char* flags = std::getenv(kCommandApertureXclFlagsEnv)) {
+    if (flags[0]) {
+      char* end = nullptr;
+      unsigned long value = std::strtoul(flags, &end, 0);
+      if (end && *end == '\0') {
+        gpu_private.xcl_flags = static_cast<uint32_t>(value);
+      }
+    }
+  }
 
   D3DDDI_ALLOCATIONINFO2 gpu_info = {};
   gpu_info.pPrivateDriverData = &gpu_private;
@@ -1785,12 +1884,16 @@ bool SubmitAndWaitCreateAie4Ctx(const KmtApi& api, const Device& device,
   return true;
 }
 
-bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
-                        Context* context, const Buffer& exec_buffer,
-                        const void* ert_packet, uint32_t ert_bytes,
-                        uint32_t command_state, uint32_t* packet_header,
-                        std::string* out_error) {
+bool SubmitAndWaitPathBImpl(const KmtApi& api, const Device& device,
+                            Context* context, const Buffer& exec_buffer,
+                            const void* ert_packet, uint32_t ert_bytes,
+                            uint32_t command_state,
+                            const PathBChainSubmitInfo* chain_info,
+                            uint32_t* packet_header, std::string* out_error) {
   constexpr uint32_t kCompletionRingSize = 4096;
+  const bool phase_timing = PathBPhaseTimingEnabled();
+  PathBPhaseStats* phases = phase_timing ? &pathb_phase_stats() : nullptr;
+  const uint64_t total_t0 = phase_timing ? NowNs() : 0;
   if (!context || !context->hw_queue) {
     if (out_error) *out_error = "SubmitAndWaitPathB called without an HW queue";
     return false;
@@ -1809,14 +1912,29 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
     }
     return false;
   }
+  if (chain_info) {
+    if (!chain_info->descriptor_gpu_va || !chain_info->descriptor_bytes ||
+        !chain_info->command_count) {
+      if (out_error) {
+        *out_error =
+            "SubmitAndWaitPathBChain called with incomplete chain metadata";
+      }
+      return false;
+    }
+  }
 
   // Lazily allocate the completion ring (device-visible, 8-byte slots). The
   // firmware writes per-command completion state here; slot 0 is reserved.
+  uint64_t phase_t0 = phase_timing ? NowNs() : 0;
   if (!EnsureStatusRing(api, device, context, out_error)) {
     return false;
   }
+  if (phase_timing) {
+    RecordPhase(phases->ensure_ring, NowNs() - phase_t0);
+  }
   Buffer& ring = context->completion_ring;
 
+  phase_t0 = phase_timing ? NowNs() : 0;
   // Reserve an 8-byte completion slot (mirrors hwqueue_aie4 reserve).
   uint32_t slot_offset = context->completion_ring_offset;
   if (slot_offset + kQhdlCompletionSlotSize > ring.size) {
@@ -1834,8 +1952,10 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
 
   // Build the 0x268 private packet (layout recovered from xrt_core
   // hwqueue_aie4::submit_command / FUN_1800304c0).
+  const uint32_t effective_command_state =
+      chain_info ? 6u : (command_state ? command_state : 3u);
   std::vector<uint8_t> priv(kQhdlSubmitPrivateSize, 0);
-  WriteU32(&priv, 0x00, command_state ? command_state : 3u);
+  WriteU32(&priv, 0x00, effective_command_state);
   WriteU64(&priv, 0x08, exec_buffer.allocation);
   WriteU64(&priv, 0x10, ert_bytes);
   WriteU64(&priv, 0x28, ring.allocation);  // status_bo allocation handle
@@ -1844,8 +1964,18 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
   // +0x38 is the slot CPU pointer (XRT reads completion via *(uint*)slot); the
   // firmware locates the slot from the ring device VA (+0x28) + offset (+0x30).
   WriteU64(&priv, 0x38, reinterpret_cast<uint64_t>(slot_cpu));
+  if (chain_info) {
+    WriteU64(&priv, 0x48, chain_info->descriptor_gpu_va);
+    WriteU32(&priv, 0x50, chain_info->descriptor_bytes);
+    WriteU32(&priv, 0x54, chain_info->command_count);
+    WriteU32(&priv, 0x58, chain_info->first_child_opcode);
+  }
   std::memcpy(priv.data() + kQhdlSubmitPacketOffset, ert_packet, ert_bytes);
+  if (phase_timing) {
+    RecordPhase(phases->build_private, NowNs() - phase_t0);
+  }
 
+  phase_t0 = phase_timing ? NowNs() : 0;
   if (!WaitForBufferResidency(api, device, *context, exec_buffer, "pathb-exec",
                               out_error)) {
     return false;
@@ -1853,6 +1983,9 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
   if (!WaitForBufferResidency(api, device, *context, ring, "pathb-ring",
                               out_error)) {
     return false;
+  }
+  if (phase_timing) {
+    RecordPhase(phases->residency, NowNs() - phase_t0);
   }
 
   const char* lock_touch = std::getenv("IREE_AMDXDNA_MCDM_XRT_LOCK_TOUCH");
@@ -1878,19 +2011,33 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
                  "[amdxdna:mcdm] pathb submit: hwq=0x%08x fence=%llu "
                  "cmd_va=0x%llx len=%u ert_bytes=%u state=%u "
                  "cmd_alloc=0x%08x "
-                 "slot_off=0x%x ring_gpu=0x%llx slot_gpu=0x%llx\n",
+                 "slot_off=0x%x ring_gpu=0x%llx slot_gpu=0x%llx",
                  static_cast<unsigned>(context->hw_queue),
                  static_cast<unsigned long long>(fence_id),
                  static_cast<unsigned long long>(exec_buffer.gpu_va),
                  static_cast<unsigned>(submit.CommandLength), ert_bytes,
-                 command_state ? command_state : 3u,
+                 effective_command_state,
                  static_cast<unsigned>(exec_buffer.allocation),
                  static_cast<unsigned>(slot_offset),
                  static_cast<unsigned long long>(ring.gpu_va),
                  static_cast<unsigned long long>(ring.gpu_va + slot_offset));
+    if (chain_info) {
+      std::fprintf(stderr,
+                   " chain_desc_va=0x%llx chain_desc_bytes=0x%x "
+                   "chain_count=%u first_child_opcode=%u",
+                   static_cast<unsigned long long>(
+                       chain_info->descriptor_gpu_va),
+                   chain_info->descriptor_bytes, chain_info->command_count,
+                   chain_info->first_child_opcode);
+    }
+    std::fprintf(stderr, "\n");
     std::fflush(stderr);
   }
+  phase_t0 = phase_timing ? NowNs() : 0;
   NTSTATUS status = api.submit_command_to_hw_queue(&submit);
+  if (phase_timing) {
+    RecordPhase(phases->submit, NowNs() - phase_t0);
+  }
   if (!CheckStatus("D3DKMTSubmitCommandToHwQueue(pathb)", status, out_error)) {
     return false;
   }
@@ -1900,10 +2047,14 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
     return false;
   }
 
+  phase_t0 = phase_timing ? NowNs() : 0;
   if (!WaitForHwQueueFenceCpu(api, device, *context, fence_id,
                               "D3DKMTWaitForSynchronizationObjectFromCpu(pathb)",
                               out_error)) {
     return false;
+  }
+  if (phase_timing) {
+    RecordPhase(phases->wait, NowNs() - phase_t0);
   }
 
   // XRT's qhdl wait path blocks in KMT and then mirrors the low ERT state nibble
@@ -1912,8 +2063,16 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
   // only as an opt-in bring-up diagnostic.
   uint32_t slot_state = 0;
   uint32_t packet_state = packet_header ? *packet_header : 0;
+  const bool trust_fence_completion = TrustFenceCompletionEnabled();
   auto read_completion_once = [&]() -> bool {
+    if (trust_fence_completion) {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      packet_state = packet_header ? *packet_header : 0;
+      std::memcpy(&slot_state, slot_cpu, sizeof(slot_state));
+      return true;
+    }
     std::string command_sync_err;
+    uint64_t sync_t0 = phase_timing ? NowNs() : 0;
     if (!SyncBuffer(api, device, exec_buffer, 0, exec_buffer.size,
                     &command_sync_err)) {
       if (out_error) {
@@ -1922,15 +2081,22 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
       }
       return false;
     }
+    if (phase_timing) {
+      RecordPhase(phases->sync_exec, NowNs() - sync_t0);
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     packet_state = packet_header ? *packet_header : 0;
 
     std::string ring_sync_err;
+    sync_t0 = phase_timing ? NowNs() : 0;
     if (!SyncBuffer(api, device, ring, 0, ring.size, &ring_sync_err)) {
       if (out_error) {
         *out_error = "pathb completion ring invalidate failed: " + ring_sync_err;
       }
       return false;
+    }
+    if (phase_timing) {
+      RecordPhase(phases->sync_ring, NowNs() - sync_t0);
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     std::memcpy(&slot_state, slot_cpu, sizeof(slot_state));
@@ -1970,7 +2136,30 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
     }
     return false;
   }
+  if (phase_timing) {
+    RecordPhase(phases->total, NowNs() - total_t0);
+  }
   return true;
+}
+
+bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
+                        Context* context, const Buffer& exec_buffer,
+                        const void* ert_packet, uint32_t ert_bytes,
+                        uint32_t command_state, uint32_t* packet_header,
+                        std::string* out_error) {
+  return SubmitAndWaitPathBImpl(api, device, context, exec_buffer, ert_packet,
+                                ert_bytes, command_state, nullptr,
+                                packet_header, out_error);
+}
+
+bool SubmitAndWaitPathBChain(const KmtApi& api, const Device& device,
+                             Context* context, const Buffer& exec_buffer,
+                             const void* ert_packet, uint32_t ert_bytes,
+                             const PathBChainSubmitInfo& chain_info,
+                             uint32_t* packet_header, std::string* out_error) {
+  return SubmitAndWaitPathBImpl(api, device, context, exec_buffer, ert_packet,
+                                ert_bytes, 6, &chain_info, packet_header,
+                                out_error);
 }
 
 void DestroyCommandAperture(const KmtApi& api, const Device& device,

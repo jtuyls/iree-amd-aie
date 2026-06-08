@@ -19,6 +19,7 @@ namespace mcdm = iree::hal::amdxdna::mcdm;
 namespace {
 
 enum class Stage {
+  blob,
   discover,
   device,
   host_bo,
@@ -40,7 +41,9 @@ std::string NarrowArg(const wchar_t* arg) {
 }
 
 bool ParseStage(const std::string& text, Stage* out_stage) {
-  if (text == "discover") {
+  if (text == "blob") {
+    *out_stage = Stage::blob;
+  } else if (text == "discover") {
     *out_stage = Stage::discover;
   } else if (text == "device") {
     *out_stage = Stage::device;
@@ -87,6 +90,74 @@ bool ReadFileBytes(const std::string& path, std::vector<uint8_t>* out_bytes) {
   return file.good();
 }
 
+void PrintContextBlobInfo(size_t private_data_size, size_t xclbin_size,
+                          const mcdm::ContextBlobInfo& info) {
+  std::cout << "context.private_size=" << private_data_size
+            << " xclbin_size=" << xclbin_size
+            << " kernel=\"" << info.kernel_name << "\""
+            << " pdi=\"" << info.pdi_name << "\""
+            << " column_width=" << info.column_width
+            << " start_column=" << info.start_column
+            << " dpu_kernel_id=0x" << std::hex << info.dpu_kernel_id
+            << std::dec << "\n";
+  if (!info.kernel_names.empty()) {
+    std::cout << "context.kernels=[";
+    for (size_t i = 0; i < info.kernel_names.size(); ++i) {
+      if (i) std::cout << ", ";
+      std::cout << info.kernel_names[i];
+    }
+    std::cout << "]\n";
+  }
+  if (!info.pdi_names.empty()) {
+    std::cout << "context.pdis=[";
+    for (size_t i = 0; i < info.pdi_names.size(); ++i) {
+      if (i) std::cout << ", ";
+      std::cout << info.pdi_names[i] << ":0x" << std::hex
+                << (i < info.dpu_kernel_ids.size() ? info.dpu_kernel_ids[i]
+                                                    : 0)
+                << std::dec;
+    }
+    std::cout << "]\n";
+  }
+}
+
+bool BuildContextBlobFromXclbinPath(const std::string& xclbin_path,
+                                    std::vector<uint8_t>* out_xclbin,
+                                    std::vector<uint8_t>* out_private_data,
+                                    mcdm::ContextBlobInfo* out_info) {
+  if (xclbin_path.empty()) {
+    std::cerr << "--xclbin=PATH is required for blob, context, aperture, and "
+                 "submit stages\n";
+    return false;
+  }
+
+  if (!ReadFileBytes(xclbin_path, out_xclbin)) {
+    std::cerr << "failed to read xclbin: " << xclbin_path << "\n";
+    return false;
+  }
+
+  std::string error;
+  if (!mcdm::BuildContextPrivateDataFromXclbin(
+          out_xclbin->data(), out_xclbin->size(), GetCurrentProcessId(),
+          out_private_data, out_info, &error)) {
+    std::cerr << "BuildContextPrivateDataFromXclbin failed: " << error << "\n";
+    return false;
+  }
+  return true;
+}
+
+bool RunBlobProbe(const std::string& xclbin_path) {
+  std::vector<uint8_t> xclbin;
+  std::vector<uint8_t> private_data;
+  mcdm::ContextBlobInfo info;
+  if (!BuildContextBlobFromXclbinPath(xclbin_path, &xclbin, &private_data,
+                                      &info)) {
+    return false;
+  }
+  PrintContextBlobInfo(private_data.size(), xclbin.size(), info);
+  return true;
+}
+
 bool RunBufferProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
                     mcdm::BufferKind kind, uint64_t size) {
   mcdm::BufferKindInfo kind_info = mcdm::GetBufferKindInfo(kind);
@@ -120,25 +191,11 @@ bool RunBufferProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
 bool RunContextProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
                      const std::string& xclbin_path, bool create_aperture,
                      bool submit, bool allow_unsafe_submit, bool run_ctxcmd) {
-  if (xclbin_path.empty()) {
-    std::cerr << "--xclbin=PATH is required for context, aperture, and submit "
-                 "stages\n";
-    return false;
-  }
-
   std::vector<uint8_t> xclbin;
-  if (!ReadFileBytes(xclbin_path, &xclbin)) {
-    std::cerr << "failed to read xclbin: " << xclbin_path << "\n";
-    return false;
-  }
-
-  std::string error;
   std::vector<uint8_t> private_data;
   mcdm::ContextBlobInfo info;
-  if (!mcdm::BuildContextPrivateDataFromXclbin(
-          xclbin.data(), xclbin.size(), GetCurrentProcessId(), &private_data,
-          &info, &error)) {
-    std::cerr << "BuildContextPrivateDataFromXclbin failed: " << error << "\n";
+  if (!BuildContextBlobFromXclbinPath(xclbin_path, &xclbin, &private_data,
+                                      &info)) {
     return false;
   }
 
@@ -152,15 +209,9 @@ bool RunContextProbe(const mcdm::KmtApi& api, const mcdm::Device& device,
                 << "\n";
     }
   }
-  std::cout << "context.private_size=" << private_data.size()
-            << " xclbin_size=" << xclbin.size()
-            << " kernel=\"" << info.kernel_name << "\""
-            << " pdi=\"" << info.pdi_name << "\""
-            << " column_width=" << info.column_width
-            << " start_column=" << info.start_column
-            << " dpu_kernel_id=0x" << std::hex << info.dpu_kernel_id
-            << std::dec << "\n";
+  PrintContextBlobInfo(private_data.size(), xclbin.size(), info);
 
+  std::string error;
   mcdm::Context context;
   if (!mcdm::CreateContext(api, device, private_data, &context, &error)) {
     std::cerr << "CreateContext failed: " << error << "\n";
@@ -306,11 +357,16 @@ int wmain(int argc, wchar_t** argv) {
       allow_unsafe_submit = true;
     } else {
       std::cerr << "usage: mcdm_probe.exe "
-                   "[--stage=discover|device|host-bo|cacheable-bo|execbuf-bo|"
-                   "all-bos|context|aperture|submit] [--size=N] "
+                   "[--stage=blob|discover|device|host-bo|cacheable-bo|"
+                   "execbuf-bo|all-bos|context|aperture|submit|ctxcmd] "
+                   "[--size=N] "
                    "[--xclbin=PATH] [--allow-unsafe-submit]\n";
       return 2;
     }
+  }
+
+  if (stage == Stage::blob) {
+    return RunBlobProbe(xclbin_path) ? 0 : 1;
   }
 
   std::string error;

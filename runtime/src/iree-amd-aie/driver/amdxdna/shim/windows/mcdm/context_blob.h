@@ -18,8 +18,14 @@ struct ContextBlobInfo {
   std::string kernel_name;
   uint32_t column_width = 0;
   uint32_t start_column = 0;
+  uint32_t pdi_count = 0;
   std::string pdi_name;
   uint64_t dpu_kernel_id = 0;
+  // Base CU/kernel names from IP_LAYOUT, in CU-mask bit order. Names are
+  // normalized by dropping the xclbin instance suffix after ':'.
+  std::vector<std::string> kernel_names;
+  std::vector<std::string> pdi_names;
+  std::vector<uint64_t> dpu_kernel_ids;
 };
 
 bool BuildContextPrivateDataFromXclbin(const uint8_t* xclbin,

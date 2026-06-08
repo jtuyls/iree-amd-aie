@@ -160,6 +160,13 @@ struct CommandAperture {
   uint64_t code_size = 0;
 };
 
+struct PathBChainSubmitInfo {
+  D3DGPU_VIRTUAL_ADDRESS descriptor_gpu_va = 0;
+  uint32_t descriptor_bytes = 0;
+  uint32_t command_count = 0;
+  uint32_t first_child_opcode = 0;
+};
+
 bool FindNpuAdapter(const KmtApi& api, Adapter* out_adapter,
                     std::string* out_error);
 
@@ -248,6 +255,16 @@ bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
                         const void* ert_packet, uint32_t ert_bytes,
                         uint32_t command_state, uint32_t* packet_header,
                         std::string* out_error);
+
+// Path B parent ERT_CMD_CHAIN submit. This is the same completion protocol as
+// SubmitAndWaitPathB, but uses the recovered xrt_core opcode-6 private envelope:
+// +0x48 points at the aperture-resident child descriptor block, +0x50 carries
+// descriptor byte count, +0x54 child count, and +0x58 the first child ERT opcode.
+bool SubmitAndWaitPathBChain(const KmtApi& api, const Device& device,
+                             Context* context, const Buffer& exec_buffer,
+                             const void* ert_packet, uint32_t ert_bytes,
+                             const PathBChainSubmitInfo& chain_info,
+                             uint32_t* packet_header, std::string* out_error);
 
 // Stale probe path retained for diagnostics only. The working XRT IREE matmul
 // capture uses opcode 2/5/9 setup packets, not opcode 10.

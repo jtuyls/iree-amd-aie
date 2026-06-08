@@ -27,3 +27,14 @@ iree_cc_binary(
   DEPS
     ::kmt_api
 )
+
+iree_cc_test(
+  NAME
+    context_blob_test
+  SRCS
+    context_blob_test.cc
+  DEPS
+    ::kmt_api
+    iree::testing::gtest
+    iree::testing::gtest_main
+)

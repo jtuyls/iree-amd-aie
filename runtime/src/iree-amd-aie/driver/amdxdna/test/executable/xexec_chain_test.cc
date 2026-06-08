@@ -4,13 +4,13 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
-// Cross-executable ERT_CMD_CHAIN tests (NPU).
+// Cross-executable cmd_chain tests (NPU).
 //
 // Proves that TWO DISTINCT hal.executable objects shipping a byte-identical
 // control-packet bootstrap PDI and CU/export name are (a) resolved to ONE
-// shared hw context by the device context cache and (b) batched into
-// ERT_CMD_CHAIN(s) on that shared queue when recorded into a single command
-// buffer with cmd_chain enabled.
+// shared hw context by the device context cache and (b) batched on that shared
+// queue when recorded into a single command buffer with cmd_chain enabled.
+// Linux and Windows MCDM both use true ERT_CMD_CHAIN submits.
 //
 // This case can't be produced from MLIR via the full iree-compile pipeline
 // (the AIE backend co-locates a function's dispatches into one executable with
@@ -19,8 +19,7 @@
 // The PDI is compiled at build time from xexec_chain_test.mlir and embedded.
 //
 // The fixture runs the same 2-dispatch scenario; individual tests vary
-// `forced_max_slots` to exercise the default (one fused chain) and chunking
-// (the same dispatches split across multiple chains) paths.
+// `forced_max_slots` to exercise default/chunked ERT chain paths.
 
 #include <vector>
 
@@ -71,6 +70,7 @@ static uint64_t RunCrossExecChainScenario(uint32_t forced_max_slots) {
   device_params.n_core_rows = 4;
   device_params.n_core_cols = 1;
   device_params.cmd_chain = 1;
+  device_params.mcdm_submit_mode = IREE_SV("pathb");
   iree_hal_driver_t* driver = nullptr;
   IREE_EXPECT_OK(iree_hal_amdxdna_driver_create(IREE_SV("amdxdna"),
                                                 &driver_options, &device_params,
@@ -220,7 +220,8 @@ static uint64_t RunCrossExecChainScenario(uint32_t forced_max_slots) {
 }
 
 // Default chain_max_slots (lazy-computed, ~506 on a 4KB exec BO) easily fits
-// the 4 accumulated slots (two dispatches x [reconfig, exec]) into one chain.
+// the 4 accumulated slots (two dispatches x [reconfig, exec]) into one
+// ERT_CMD_CHAIN submit.
 TEST(AmdxdnaCrossExecChain, TwoExecutablesOneCmdChain) {
   uint64_t exec_cmd_count = RunCrossExecChainScenario(/*forced_max_slots=*/0);
   EXPECT_EQ(exec_cmd_count, 1u);

@@ -10,6 +10,12 @@
 #include "iree-amd-aie/driver/xrt/xrt_buffer.h"
 #include "iree/hal/utils/resource_set.h"
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <limits>
+
 // The max number of bindings per descriptor set allowed in the XRT HAL
 // implementation.
 #define IREE_HAL_XRT_MAX_DESCRIPTOR_SET_BINDING_COUNT 16
@@ -18,6 +24,78 @@
 // This depends on the general descriptor set planning in IREE and should adjust
 // with it.
 #define IREE_HAL_XRT_MAX_DESCRIPTOR_SET_COUNT 4
+
+namespace {
+
+struct iree_hal_xrt_submit_timing_stats_t {
+  std::atomic<uint64_t> count{0};
+  std::atomic<uint64_t> total_ns{0};
+  std::atomic<uint64_t> min_ns{std::numeric_limits<uint64_t>::max()};
+  std::atomic<uint64_t> max_ns{0};
+};
+
+iree_hal_xrt_submit_timing_stats_t& iree_hal_xrt_submit_timing_stats() {
+  static iree_hal_xrt_submit_timing_stats_t stats;
+  return stats;
+}
+
+void iree_hal_xrt_record_submit_timing(uint64_t ns) {
+  auto& stats = iree_hal_xrt_submit_timing_stats();
+  stats.count.fetch_add(1, std::memory_order_relaxed);
+  stats.total_ns.fetch_add(ns, std::memory_order_relaxed);
+  uint64_t min_ns = stats.min_ns.load(std::memory_order_relaxed);
+  while (ns < min_ns &&
+         !stats.min_ns.compare_exchange_weak(min_ns, ns,
+                                             std::memory_order_relaxed)) {
+  }
+  uint64_t max_ns = stats.max_ns.load(std::memory_order_relaxed);
+  while (ns > max_ns &&
+         !stats.max_ns.compare_exchange_weak(max_ns, ns,
+                                             std::memory_order_relaxed)) {
+  }
+}
+
+struct iree_hal_xrt_submit_timing_reporter_t {
+  ~iree_hal_xrt_submit_timing_reporter_t() {
+    auto& stats = iree_hal_xrt_submit_timing_stats();
+    uint64_t count = stats.count.load(std::memory_order_relaxed);
+    if (!count) return;
+    uint64_t total_ns = stats.total_ns.load(std::memory_order_relaxed);
+    uint64_t min_ns = stats.min_ns.load(std::memory_order_relaxed);
+    uint64_t max_ns = stats.max_ns.load(std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "[xrt:submit-timing] section=run_start_wait count=%llu "
+                 "mean_us=%.3f min_us=%.3f max_us=%.3f total_us=%.3f\n",
+                 static_cast<unsigned long long>(count),
+                 static_cast<double>(total_ns) / count / 1000.0,
+                 static_cast<double>(min_ns) / 1000.0,
+                 static_cast<double>(max_ns) / 1000.0,
+                 static_cast<double>(total_ns) / 1000.0);
+  }
+};
+
+bool iree_hal_xrt_submit_timing_enabled() {
+  static bool enabled = std::getenv("IREE_XRT_BENCH_SUBMIT_TIMING") != nullptr;
+  if (enabled) {
+    static iree_hal_xrt_submit_timing_reporter_t reporter;
+    (void)reporter;
+  }
+  return enabled;
+}
+
+bool iree_hal_xrt_zero_instruction_size_enabled() {
+  const char* value = std::getenv("IREE_XRT_BENCH_ZERO_INSTR_SIZE");
+  return value && value[0] && value[0] != '0';
+}
+
+uint64_t iree_hal_xrt_now_ns() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+}  // namespace
 
 typedef struct iree_hal_xrt_direct_command_buffer_t {
   iree_hal_command_buffer_t base;
@@ -335,7 +413,9 @@ static iree_status_t iree_hal_xrt_direct_command_buffer_normal_run(
   // Second argument is the LX6 instructions.
   run.set_arg(arg_index++, bo_ctrl_code);
   // Third argument is the number of LX6 instructions.
-  run.set_arg(arg_index++, asm_inst.size());
+  run.set_arg(arg_index++, iree_hal_xrt_zero_instruction_size_enabled()
+                               ? 0u
+                               : static_cast<uint32_t>(asm_inst.size()));
 
   // Copy descriptors from all sets to the end of the current segment for later
   // access.
@@ -356,12 +436,18 @@ static iree_status_t iree_hal_xrt_direct_command_buffer_normal_run(
     run.set_arg(arg_index + j, arg_buffer);
   }
 
+  uint64_t submit_t0 = 0;
+  const bool measure_submit = iree_hal_xrt_submit_timing_enabled();
+  if (measure_submit) submit_t0 = iree_hal_xrt_now_ns();
   run.start();
   try {
     run.wait2();
   } catch (const std::exception& e) {
     IREE_TRACE_ZONE_END(z0);
     return iree_make_status(IREE_STATUS_UNKNOWN, e.what());
+  }
+  if (measure_submit) {
+    iree_hal_xrt_record_submit_timing(iree_hal_xrt_now_ns() - submit_t0);
   }
 
   for (xrt::bo& bo : bos) bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
@@ -404,7 +490,9 @@ static iree_status_t iree_hal_xrt_direct_command_buffer_reconfigure(
   // Second argument is the LX6 instructions.
   run.set_arg(arg_index++, bo_ctrlpkt_inst);
   // Third argument is the number of LX6 instructions.
-  run.set_arg(arg_index++, ctrlpkt_inst.size());
+  run.set_arg(arg_index++, iree_hal_xrt_zero_instruction_size_enabled()
+                               ? 0u
+                               : static_cast<uint32_t>(ctrlpkt_inst.size()));
   // Fourth argument is the control packet sequence (content).
   run.set_arg(arg_index++, bo_ctrlpkt_seq);
 

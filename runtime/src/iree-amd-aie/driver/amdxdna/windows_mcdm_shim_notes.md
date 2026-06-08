@@ -1516,14 +1516,20 @@ runtime/src/iree-amd-aie/driver/amdxdna/native.h
   native create_context now receives PDI + optional xclbin
 
 runtime/src/iree-amd-aie/driver/amdxdna/device.cc
-  context cache key includes PDI, optional xclbin, and kernel name
+  context cache key includes PDI plus optional xclbin. PDI-only contexts still
+  include the kernel name; xclbin-backed Windows contexts are keyed by the
+  complete xclbin image so one multi-PDI context can expose multiple CUs.
 
 runtime/src/iree-amd-aie/driver/amdxdna/direct_command_buffer.cc
   dispatch passes both spans through one unified context path
 ```
 
+The runtime context builder now parses multi-PDI `AIE_PARTITION` records and
+AIE `IP_LAYOUT` CU names. Windows `open_cu` resolves the requested entry point
+from that metadata instead of unconditionally returning CU 0.
+
 The compiler still needs to fill the optional xclbin fields. The likely
 compiler change is to extend the AMDXDNA packaging mode so it keeps generating
 the raw PDI/runlists/patch tables and also continues through `generateXCLBin`
 to produce an AXLF wrapper. For multi-PDI command-chain workloads, that wrapper
-should be shared by the entry points that must chain in one Windows context.
+should be shared by the entry points that must run in one Windows context.

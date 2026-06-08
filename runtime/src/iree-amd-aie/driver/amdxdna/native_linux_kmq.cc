@@ -143,6 +143,7 @@ uint32_t to_ert_opcode(iree_hal_amdxdna_native_command_opcode_t opcode) {
     case iree_hal_amdxdna_native_command_opcode_t::start_cu:
       return ERT_START_CU;
     case iree_hal_amdxdna_native_command_opcode_t::start_npu:
+    case iree_hal_amdxdna_native_command_opcode_t::start_npu_partial_elf:
       return ERT_START_NPU;
     case iree_hal_amdxdna_native_command_opcode_t::command_chain:
       return ERT_CMD_CHAIN;
@@ -405,6 +406,15 @@ iree_status_t iree_hal_amdxdna_native_buffer_sync_all(
   return iree_hal_amdxdna_status_from_errno(
       buffer->bo->sync(to_shim_sync_direction(direction)),
       "amdxdna native buffer sync failed");
+}
+
+iree_status_t iree_hal_amdxdna_native_buffer_ensure_allocated(
+    iree_hal_amdxdna_native_buffer_t* buffer) {
+  if (IREE_UNLIKELY(!buffer || !buffer->bo)) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "amdxdna native buffer is not allocated");
+  }
+  return iree_ok_status();
 }
 
 uint64_t iree_hal_amdxdna_native_buffer_device_address(

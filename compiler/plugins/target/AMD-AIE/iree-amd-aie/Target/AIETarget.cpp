@@ -322,10 +322,6 @@ void serializePDIToFb(FlatbufferBuilder &builder,
       builder.createInt32Vec(pdiIndices);
   iree_amd_aie_hal_amdxdna_ExecutableDef_pdi_indices_add(builder,
                                                          pdiIndicesRef);
-  flatbuffers_int32_vec_ref_t xclbinIndicesRef =
-      builder.createInt32Vec(xclbinIndices);
-  iree_amd_aie_hal_amdxdna_ExecutableDef_xclbin_indices_add(
-      builder, xclbinIndicesRef);
   flatbuffers_int32_vec_ref_t reconfDataIndicesRef =
       builder.createInt32Vec(reconfDataIndices);
   iree_amd_aie_hal_amdxdna_ExecutableDef_reconf_data_runlist_indices_add(
@@ -334,9 +330,18 @@ void serializePDIToFb(FlatbufferBuilder &builder,
   flatbuffers_vec_ref_t pdisRef = builder.createOffsetVecDestructive(pdiRefs);
   iree_amd_aie_hal_amdxdna_ExecutableDef_pdis_add(builder, pdisRef);
   // Add the optional AXLF/xclbin context wrappers to the flatbuffer.
-  flatbuffers_vec_ref_t xclbinsRef =
-      builder.createOffsetVecDestructive(xclbinRefs);
-  iree_amd_aie_hal_amdxdna_ExecutableDef_xclbins_add(builder, xclbinsRef);
+  // Keep the index vector and payload vector as an all-or-nothing pair so
+  // legacy Linux-style PDI-only executables do not carry a dangling optional
+  // field.
+  if (!xclbinRefs.empty()) {
+    flatbuffers_int32_vec_ref_t xclbinIndicesRef =
+        builder.createInt32Vec(xclbinIndices);
+    iree_amd_aie_hal_amdxdna_ExecutableDef_xclbin_indices_add(
+        builder, xclbinIndicesRef);
+    flatbuffers_vec_ref_t xclbinsRef =
+        builder.createOffsetVecDestructive(xclbinRefs);
+    iree_amd_aie_hal_amdxdna_ExecutableDef_xclbins_add(builder, xclbinsRef);
+  }
   // Add the npu instructions to the flatbuffer.
   flatbuffers_vec_ref_t asmInstrsRef =
       builder.createOffsetVecDestructive(asmInstrRefs);
