@@ -188,7 +188,50 @@ bool env_flag_enabled(const char* name) {
 }
 
 bool zero_instruction_size_enabled() {
-  return env_flag_enabled("IREE_AMDXDNA_BENCH_ZERO_INSTR_SIZE");
+  static bool enabled = env_flag_enabled("IREE_AMDXDNA_BENCH_ZERO_INSTR_SIZE");
+  return enabled;
+}
+
+bool xrt_host_sfence_enabled() {
+  static bool enabled = env_flag_enabled(kXrtHostSfenceEnv);
+  return enabled;
+}
+
+bool xrt_code_stage_readback_enabled() {
+  static bool enabled = env_flag_enabled(kXrtCodeStageReadbackEnv);
+  return enabled;
+}
+
+bool xrt_bound_readback_enabled() {
+  static bool enabled = env_flag_enabled(kXrtBoundReadbackEnv);
+  return enabled;
+}
+
+bool xrt_bound_readback_include_outputs_enabled() {
+  static bool enabled = env_flag_enabled(kXrtBoundReadbackIncludeOutputsEnv);
+  return enabled;
+}
+
+bool xrt_output_readback_enabled() {
+  static bool enabled = env_flag_enabled(kXrtOutputReadbackEnv);
+  return enabled;
+}
+
+bool trace_qhdl_enabled() {
+  static bool enabled = env_flag_enabled("IREE_AMDXDNA_MCDM_TRACE_QHDL");
+  return enabled;
+}
+
+bool skip_pathb_bound_sync_enabled() {
+  static bool enabled =
+      env_flag_enabled("IREE_AMDXDNA_MCDM_SKIP_PATHB_BOUND_SYNC");
+  return enabled;
+}
+
+bool skip_pathb_exec_sync_enabled() {
+  static bool enabled =
+      env_flag_enabled("IREE_AMDXDNA_MCDM_SKIP_PATHB_EXEC_SYNC");
+  return enabled;
 }
 
 uint32_t env_u32(const char* name, uint32_t default_value = 0) {
@@ -204,7 +247,7 @@ uint32_t env_u32(const char* name, uint32_t default_value = 0) {
 
 void flush_host_writes_to_mcdm() {
 #if defined(_MSC_VER)
-  if (env_flag_enabled(kXrtHostSfenceEnv)) {
+  if (xrt_host_sfence_enabled()) {
     _mm_sfence();
   }
 #endif
@@ -904,7 +947,7 @@ iree_status_t stage_windows_dpu_code_buffer(
   std::memcpy(aperture.code_cpu_ptr, command->control_buffer->buffer.cpu_ptr,
               static_cast<size_t>(command->control_buffer_size));
   flush_host_writes_to_mcdm();
-  if (env_flag_enabled(kXrtCodeStageReadbackEnv)) {
+  if (xrt_code_stage_readback_enabled()) {
     volatile const uint32_t* code_words =
         reinterpret_cast<volatile const uint32_t*>(aperture.code_cpu_ptr);
     volatile uint32_t checksum = 0;
@@ -913,7 +956,7 @@ iree_status_t stage_windows_dpu_code_buffer(
     for (size_t i = 0; i < readback_words; ++i) {
       checksum ^= code_words[i];
     }
-    if (env_flag_enabled("IREE_AMDXDNA_MCDM_TRACE_QHDL")) {
+    if (trace_qhdl_enabled()) {
       std::fprintf(stderr,
                    "[amdxdna:mcdm] pathb code-readback: words=%zu "
                    "checksum=0x%08x\n",
@@ -1007,8 +1050,8 @@ bool is_pathb_partial_elf_control_binding(
 
 void readback_pathb_bound_buffers(iree_hal_amdxdna_native_command_t* command,
                                   const char* phase, bool outputs_only) {
-  if (!env_flag_enabled(outputs_only ? kXrtOutputReadbackEnv
-                                     : kXrtBoundReadbackEnv)) {
+  if (!(outputs_only ? xrt_output_readback_enabled()
+                     : xrt_bound_readback_enabled())) {
     return;
   }
   for (size_t i = 0; i < command->bound_buffers.size(); ++i) {
@@ -1022,7 +1065,7 @@ void readback_pathb_bound_buffers(iree_hal_amdxdna_native_command_t* command,
     if (outputs_only) {
       if (!output_like_bound) continue;
     } else if (output_like_bound &&
-               !env_flag_enabled(kXrtBoundReadbackIncludeOutputsEnv)) {
+               !xrt_bound_readback_include_outputs_enabled()) {
       continue;
     }
     const uint64_t buffer_size = bound.buffer->buffer.size;
@@ -1042,7 +1085,7 @@ void readback_pathb_bound_buffers(iree_hal_amdxdna_native_command_t* command,
       checksum ^= word;
       if (word) ++nonzero_words;
     }
-    if (env_flag_enabled("IREE_AMDXDNA_MCDM_TRACE_QHDL")) {
+    if (trace_qhdl_enabled()) {
       std::fprintf(stderr,
                    "[amdxdna:mcdm] pathb %s-readback[%zu]: alloc=0x%08x "
                    "pos=%zu words=%zu nonzero=%zu checksum=0x%08x\n",
@@ -2496,8 +2539,7 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
         !is_pathb_chain && uses_partial_elf_npu_packet(command);
     const uint32_t command_bytes = (packet->count + 1) * sizeof(uint32_t);
     const bool skip_bound_sync =
-        !is_pathb_chain &&
-        env_flag_enabled("IREE_AMDXDNA_MCDM_SKIP_PATHB_BOUND_SYNC");
+        !is_pathb_chain && skip_pathb_bound_sync_enabled();
     // The NPU is not cache-coherent: flush every bound buffer (instruction
     // control code + input args) host->device BEFORE the dispatch so the
     // firmware reads real data, not stale device memory. (Output is synced
@@ -2512,7 +2554,7 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
       }
     }
     readback_pathb_bound_buffers(command, "input", /*outputs_only=*/false);
-    if (env_flag_enabled("IREE_AMDXDNA_MCDM_TRACE_QHDL") &&
+    if (trace_qhdl_enabled() &&
         command->control_buffer && command->control_buffer->buffer.cpu_ptr) {
       const uint32_t* c =
           static_cast<const uint32_t*>(command->control_buffer->buffer.cpu_ptr);
@@ -2560,9 +2602,14 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
         command->exec_buffer->buffer.cpu_ptr);
     packet = command_packet(command);
     IREE_RETURN_IF_ERROR(maybe_write_partial_elf_bo_table(command));
+    // XRT's module path writes the state-3 command BO through its CPU mapping
+    // and submits it directly; there is no per-dispatch D3DKMTInvalidateCache
+    // for the command BO in the captured path. For partial-ELF path-B commands
+    // mirror that by using a CPU fence instead of the generic host->device
+    // sync. Keep the env knob for non-partial probes.
     const bool skip_exec_sync =
         !is_pathb_chain &&
-        env_flag_enabled("IREE_AMDXDNA_MCDM_SKIP_PATHB_EXEC_SYNC");
+        (is_pathb_partial_elf || skip_pathb_exec_sync_enabled());
     if (!skip_exec_sync) {
       IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
           command->exec_buffer.get(),

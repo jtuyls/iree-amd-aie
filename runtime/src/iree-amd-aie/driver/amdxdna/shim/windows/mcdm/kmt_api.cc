@@ -7,6 +7,7 @@
 #include "kmt_api.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -154,14 +155,14 @@ uint32_t Flags32(const D3DKMT_CREATEALLOCATIONFLAGS& flags) {
   return value;
 }
 
-bool TraceQhdlEnabled() {
-  const char* value = std::getenv(kTraceQhdlEnv);
-  return value && value[0] && value[0] != '0';
-}
-
 bool EnvFlagEnabled(const char* name) {
   const char* value = std::getenv(name);
   return value && value[0] && value[0] != '0';
+}
+
+bool TraceQhdlEnabled() {
+  static bool enabled = EnvFlagEnabled(kTraceQhdlEnv);
+  return enabled;
 }
 
 bool PathBPhaseTimingEnabled() {
@@ -174,19 +175,35 @@ bool PathBPhaseTimingEnabled() {
 }
 
 bool XrtMinimalResidencyEnabled() {
-  return EnvFlagEnabled("IREE_AMDXDNA_MCDM_XRT_MINIMAL_RESIDENCY");
+  static bool enabled =
+      EnvFlagEnabled("IREE_AMDXDNA_MCDM_XRT_MINIMAL_RESIDENCY");
+  return enabled;
 }
 
 bool PathBCompletionPollFallbackEnabled() {
-  return EnvFlagEnabled("IREE_AMDXDNA_MCDM_PATHB_COMPLETION_POLL_FALLBACK");
+  static bool enabled =
+      EnvFlagEnabled("IREE_AMDXDNA_MCDM_PATHB_COMPLETION_POLL_FALLBACK");
+  return enabled;
 }
 
 bool TrustFenceCompletionEnabled() {
-  return EnvFlagEnabled("IREE_AMDXDNA_MCDM_TRUST_FENCE_COMPLETION");
+  static bool enabled =
+      EnvFlagEnabled("IREE_AMDXDNA_MCDM_TRUST_FENCE_COMPLETION");
+  return enabled;
+}
+
+bool CcccCompletionSlotEnabled() {
+  static bool enabled = EnvFlagEnabled("IREE_AMDXDNA_MCDM_CCCC_COMPLETION_SLOT");
+  return enabled;
+}
+
+bool XrtLockTouchEnabled() {
+  static bool enabled = EnvFlagEnabled("IREE_AMDXDNA_MCDM_XRT_LOCK_TOUCH");
+  return enabled;
 }
 
 void InitializeCompletionSlot(uint8_t* slot_cpu) {
-  if (EnvFlagEnabled("IREE_AMDXDNA_MCDM_CCCC_COMPLETION_SLOT")) {
+  if (CcccCompletionSlotEnabled()) {
     std::memset(slot_cpu, 0xCC, kQhdlCompletionSlotSize);
     return;
   }
@@ -199,6 +216,14 @@ void WriteU32(std::vector<uint8_t>* data, size_t offset, uint32_t value) {
 
 void WriteU64(std::vector<uint8_t>* data, size_t offset, uint64_t value) {
   std::memcpy(data->data() + offset, &value, sizeof(value));
+}
+
+void WriteU32(uint8_t* data, size_t offset, uint32_t value) {
+  std::memcpy(data + offset, &value, sizeof(value));
+}
+
+void WriteU64(uint8_t* data, size_t offset, uint64_t value) {
+  std::memcpy(data + offset, &value, sizeof(value));
 }
 
 struct AllocPrivate {
@@ -1954,21 +1979,21 @@ bool SubmitAndWaitPathBImpl(const KmtApi& api, const Device& device,
   // hwqueue_aie4::submit_command / FUN_1800304c0).
   const uint32_t effective_command_state =
       chain_info ? 6u : (command_state ? command_state : 3u);
-  std::vector<uint8_t> priv(kQhdlSubmitPrivateSize, 0);
-  WriteU32(&priv, 0x00, effective_command_state);
-  WriteU64(&priv, 0x08, exec_buffer.allocation);
-  WriteU64(&priv, 0x10, ert_bytes);
-  WriteU64(&priv, 0x28, ring.allocation);  // status_bo allocation handle
-  WriteU32(&priv, 0x30, slot_offset);
-  WriteU32(&priv, 0x34, kQhdlCompletionSlotSize);
+  std::array<uint8_t, kQhdlSubmitPrivateSize> priv = {};
+  WriteU32(priv.data(), 0x00, effective_command_state);
+  WriteU64(priv.data(), 0x08, exec_buffer.allocation);
+  WriteU64(priv.data(), 0x10, ert_bytes);
+  WriteU64(priv.data(), 0x28, ring.allocation);  // status_bo allocation handle
+  WriteU32(priv.data(), 0x30, slot_offset);
+  WriteU32(priv.data(), 0x34, kQhdlCompletionSlotSize);
   // +0x38 is the slot CPU pointer (XRT reads completion via *(uint*)slot); the
   // firmware locates the slot from the ring device VA (+0x28) + offset (+0x30).
-  WriteU64(&priv, 0x38, reinterpret_cast<uint64_t>(slot_cpu));
+  WriteU64(priv.data(), 0x38, reinterpret_cast<uint64_t>(slot_cpu));
   if (chain_info) {
-    WriteU64(&priv, 0x48, chain_info->descriptor_gpu_va);
-    WriteU32(&priv, 0x50, chain_info->descriptor_bytes);
-    WriteU32(&priv, 0x54, chain_info->command_count);
-    WriteU32(&priv, 0x58, chain_info->first_child_opcode);
+    WriteU64(priv.data(), 0x48, chain_info->descriptor_gpu_va);
+    WriteU32(priv.data(), 0x50, chain_info->descriptor_bytes);
+    WriteU32(priv.data(), 0x54, chain_info->command_count);
+    WriteU32(priv.data(), 0x58, chain_info->first_child_opcode);
   }
   std::memcpy(priv.data() + kQhdlSubmitPacketOffset, ert_packet, ert_bytes);
   if (phase_timing) {
@@ -1988,9 +2013,7 @@ bool SubmitAndWaitPathBImpl(const KmtApi& api, const Device& device,
     RecordPhase(phases->residency, NowNs() - phase_t0);
   }
 
-  const char* lock_touch = std::getenv("IREE_AMDXDNA_MCDM_XRT_LOCK_TOUCH");
-  const bool xrt_lock_touch =
-      lock_touch && lock_touch[0] && lock_touch[0] != '0';
+  const bool xrt_lock_touch = XrtLockTouchEnabled();
   if (xrt_lock_touch &&
       !TouchBufferCpuMapping(api, device, exec_buffer, "pre-submit",
                              out_error)) {
