@@ -102,8 +102,13 @@ struct iree_hal_amdxdna_chain_cmd {
 #if defined(_WIN32)
   std::vector<uint32_t> ctrl_words;
   std::vector<iree_hal_amdxdna_native_buffer_t*> binding_buffers;
+  std::vector<uint64_t> binding_device_addrs;
   std::vector<iree_device_size_t> binding_offsets;
   std::vector<iree_device_size_t> binding_lengths;
+  // False when metadata was refreshed for a device-visible hit but the native
+  // child command still holds older bound-buffer pointers. Safe until the next
+  // packet rewrite, which must rebind before BO-table generation dereferences.
+  bool native_bindings_current = true;
 #endif  // defined(_WIN32)
 };
 
@@ -188,9 +193,13 @@ struct iree_hal_amdxdna_chain_command_cache_entry {
 
 struct iree_hal_amdxdna_chain_command_cache_stats_t {
   uint64_t hits = 0;
+  uint64_t device_hits = 0;
   uint64_t updates = 0;
   uint64_t misses = 0;
   uint64_t evictions = 0;
+  uint64_t code_updates = 0;
+  uint64_t device_binding_updates = 0;
+  uint64_t native_rebinds = 0;
 };
 
 size_t iree_hal_amdxdna_chain_command_cache_capacity() {
@@ -214,14 +223,24 @@ struct iree_hal_amdxdna_device_chain_command_cache_t {
         !std::getenv("IREE_AMDXDNA_MCDM_CHAIN_CACHE_STATS")) {
       return;
     }
-    if (!stats.hits && !stats.updates && !stats.misses) return;
+    if (!stats.hits && !stats.device_hits && !stats.updates &&
+        !stats.misses) {
+      return;
+    }
     std::fprintf(stderr,
                  "[amdxdna:mcdm-chain-cache] hits=%llu updates=%llu "
-                 "misses=%llu evictions=%llu entries=%zu capacity=%zu\n",
+                 "device_hits=%llu misses=%llu evictions=%llu "
+                 "code_updates=%llu device_binding_updates=%llu "
+                 "native_rebinds=%llu entries=%zu capacity=%zu\n",
                  static_cast<unsigned long long>(stats.hits),
                  static_cast<unsigned long long>(stats.updates),
+                 static_cast<unsigned long long>(stats.device_hits),
                  static_cast<unsigned long long>(stats.misses),
                  static_cast<unsigned long long>(stats.evictions),
+                 static_cast<unsigned long long>(stats.code_updates),
+                 static_cast<unsigned long long>(
+                     stats.device_binding_updates),
+                 static_cast<unsigned long long>(stats.native_rebinds),
                  entries.size(),
                  iree_hal_amdxdna_chain_command_cache_capacity());
     std::fflush(stderr);
@@ -267,6 +286,16 @@ bool iree_hal_amdxdna_chain_cmd_signature_matches(
     const iree_hal_amdxdna_chain_cmd& rhs) {
   return lhs.ctrl_words == rhs.ctrl_words &&
          lhs.binding_buffers == rhs.binding_buffers &&
+         lhs.binding_device_addrs == rhs.binding_device_addrs &&
+         lhs.binding_offsets == rhs.binding_offsets &&
+         lhs.binding_lengths == rhs.binding_lengths;
+}
+
+bool iree_hal_amdxdna_chain_cmd_device_signature_matches(
+    const iree_hal_amdxdna_chain_cmd& lhs,
+    const iree_hal_amdxdna_chain_cmd& rhs) {
+  return lhs.ctrl_words == rhs.ctrl_words &&
+         lhs.binding_device_addrs == rhs.binding_device_addrs &&
          lhs.binding_offsets == rhs.binding_offsets &&
          lhs.binding_lengths == rhs.binding_lengths;
 }
@@ -301,6 +330,27 @@ bool iree_hal_amdxdna_chain_command_cache_matches(
   return true;
 }
 
+bool iree_hal_amdxdna_chain_command_cache_device_matches(
+    const iree_hal_amdxdna_chain_command_cache_entry& cache,
+    const iree_hal_amdxdna_chain_group& group, uint32_t max_slots) {
+  if (cache.chains.empty() || cache.max_slots != max_slots ||
+      cache.group.queue != group.queue ||
+#if defined(_WIN32)
+      cache.group.windows_partial_elf != group.windows_partial_elf ||
+#endif  // defined(_WIN32)
+      cache.group.cmds.size() != group.cmds.size() ||
+      !cache.group.reconf_buffers.empty() || !group.reconf_buffers.empty()) {
+    return false;
+  }
+  for (size_t i = 0; i < group.cmds.size(); ++i) {
+    if (!iree_hal_amdxdna_chain_cmd_device_signature_matches(
+            cache.group.cmds[i], group.cmds[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool iree_hal_amdxdna_chain_command_cache_shape_matches(
     const iree_hal_amdxdna_chain_command_cache_entry& cache,
     const iree_hal_amdxdna_chain_group& group, uint32_t max_slots) {
@@ -324,8 +374,13 @@ bool iree_hal_amdxdna_chain_command_cache_shape_matches(
 
 iree_status_t iree_hal_amdxdna_update_cached_chain_cmd(
     iree_hal_amdxdna_chain_cmd& cached,
-    const iree_hal_amdxdna_chain_cmd& fresh, bool* out_code_changed) {
+    const iree_hal_amdxdna_chain_cmd& fresh, bool* out_packet_changed,
+    bool* out_code_changed, bool* out_device_bindings_changed,
+    bool* out_rebound) {
+  if (out_packet_changed) *out_packet_changed = false;
   if (out_code_changed) *out_code_changed = false;
+  if (out_device_bindings_changed) *out_device_bindings_changed = false;
+  if (out_rebound) *out_rebound = false;
   if (!iree_hal_amdxdna_chain_cmd_shape_matches(cached, fresh)) {
     return iree_make_status(
         IREE_STATUS_FAILED_PRECONDITION,
@@ -335,6 +390,13 @@ iree_status_t iree_hal_amdxdna_update_cached_chain_cmd(
       iree_hal_amdxdna_direct_command_buffer_control_words_changed(
           cached.ctrl_words.data(), cached.ctrl_words.size(),
           fresh.ctrl_words.data(), fresh.ctrl_words.size());
+  const bool device_bindings_changed =
+      cached.binding_device_addrs != fresh.binding_device_addrs ||
+      cached.binding_offsets != fresh.binding_offsets ||
+      cached.binding_lengths != fresh.binding_lengths;
+  const bool native_bindings_changed =
+      cached.binding_buffers != fresh.binding_buffers ||
+      device_bindings_changed || !cached.native_bindings_current;
   if (code_changed) {
     void* ctrl_ptr = nullptr;
     IREE_RETURN_IF_ERROR(
@@ -343,17 +405,28 @@ iree_status_t iree_hal_amdxdna_update_cached_chain_cmd(
                 fresh.ctrl_words.size() * sizeof(uint32_t));
     cached.ctrl_words = fresh.ctrl_words;
   }
-  IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_reset_bound_buffers(
-      cached.command.get()));
-  for (size_t i = 0; i < fresh.binding_buffers.size(); ++i) {
-    IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_bind_buffer(
-        cached.command.get(), /*position=*/i + 1, fresh.binding_buffers[i],
-        fresh.binding_offsets[i], fresh.binding_lengths[i]));
+  if (native_bindings_changed && (code_changed || device_bindings_changed)) {
+    IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_reset_bound_buffers(
+        cached.command.get()));
+    for (size_t i = 0; i < fresh.binding_buffers.size(); ++i) {
+      IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_bind_buffer(
+          cached.command.get(), /*position=*/i + 1, fresh.binding_buffers[i],
+          fresh.binding_offsets[i], fresh.binding_lengths[i]));
+    }
+    cached.native_bindings_current = true;
+    if (out_rebound) *out_rebound = true;
   }
   cached.binding_buffers = fresh.binding_buffers;
+  cached.binding_device_addrs = fresh.binding_device_addrs;
   cached.binding_offsets = fresh.binding_offsets;
   cached.binding_lengths = fresh.binding_lengths;
+  if (out_packet_changed) {
+    *out_packet_changed = code_changed || device_bindings_changed;
+  }
   if (out_code_changed) *out_code_changed = code_changed;
+  if (out_device_bindings_changed) {
+    *out_device_bindings_changed = device_bindings_changed;
+  }
   return iree_ok_status();
 }
 #endif  // defined(_WIN32)
@@ -850,6 +923,12 @@ iree_status_t iree_hal_amdxdna_make_npu_cmd(
   out_cmd->ctrl_words.assign(dst, dst + txn.size());
   if (arg_count) {
     out_cmd->binding_buffers.assign(arg_buffers, arg_buffers + arg_count);
+    out_cmd->binding_device_addrs.resize(arg_count);
+    for (size_t i = 0; i < arg_count; ++i) {
+      out_cmd->binding_device_addrs[i] =
+          iree_hal_amdxdna_native_buffer_device_address(arg_buffers[i]) +
+          arg_offsets[i];
+    }
     out_cmd->binding_offsets.assign(arg_offsets, arg_offsets + arg_count);
     out_cmd->binding_lengths.assign(arg_lengths, arg_lengths + arg_count);
   }
@@ -1252,6 +1331,7 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_flush_chains(
           chain_cache->last_use = ++device_chain_cache->use_clock;
         };
         bool exact_cache_hit = false;
+        bool device_cache_hit = false;
         for (iree_hal_amdxdna_chain_command_cache_entry& entry :
              device_chain_cache->entries) {
           if (iree_hal_amdxdna_chain_command_cache_matches(entry, group,
@@ -1264,8 +1344,35 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_flush_chains(
         if (chain_cache) {
           chain_cache_stats->hits++;
           touch_chain_cache_entry();
-        } else if (device_chain_cache->entries.size() >=
-                   iree_hal_amdxdna_chain_command_cache_capacity()) {
+        } else {
+          for (iree_hal_amdxdna_chain_command_cache_entry& entry :
+               device_chain_cache->entries) {
+            if (iree_hal_amdxdna_chain_command_cache_device_matches(
+                    entry, group, max_slots)) {
+              chain_cache = &entry;
+              break;
+            }
+          }
+          if (chain_cache) {
+            chain_cache_stats->device_hits++;
+            device_cache_hit = true;
+            touch_chain_cache_entry();
+            for (size_t i = 0; i < group.cmds.size(); ++i) {
+              chain_cache->group.cmds[i].binding_buffers =
+                  group.cmds[i].binding_buffers;
+              chain_cache->group.cmds[i].binding_device_addrs =
+                  group.cmds[i].binding_device_addrs;
+              chain_cache->group.cmds[i].binding_offsets =
+                  group.cmds[i].binding_offsets;
+              chain_cache->group.cmds[i].binding_lengths =
+                  group.cmds[i].binding_lengths;
+              chain_cache->group.cmds[i].native_bindings_current = false;
+            }
+          }
+        }
+        if (!chain_cache &&
+            device_chain_cache->entries.size() >=
+                iree_hal_amdxdna_chain_command_cache_capacity()) {
           for (iree_hal_amdxdna_chain_command_cache_entry& entry :
                device_chain_cache->entries) {
             if (iree_hal_amdxdna_chain_command_cache_shape_matches(
@@ -1275,19 +1382,31 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_flush_chains(
             }
           }
         }
-        if (chain_cache && !exact_cache_hit) {
+        if (chain_cache && !exact_cache_hit && !device_cache_hit) {
           chain_cache_stats->updates++;
           touch_chain_cache_entry();
-          bool code_changed = false;
+          bool packet_changed = false;
           for (size_t i = 0; i < group.cmds.size() &&
                              iree_status_is_ok(status);
                ++i) {
+            bool cmd_packet_changed = false;
             bool cmd_code_changed = false;
+            bool cmd_device_bindings_changed = false;
+            bool cmd_rebound = false;
             status = iree_hal_amdxdna_update_cached_chain_cmd(
-                chain_cache->group.cmds[i], group.cmds[i], &cmd_code_changed);
-            code_changed |= cmd_code_changed;
+                chain_cache->group.cmds[i], group.cmds[i],
+                &cmd_packet_changed, &cmd_code_changed,
+                &cmd_device_bindings_changed, &cmd_rebound);
+            if (cmd_packet_changed) {
+              packet_changed = true;
+              if (cmd_code_changed) chain_cache_stats->code_updates++;
+              if (cmd_device_bindings_changed) {
+                chain_cache_stats->device_binding_updates++;
+              }
+            }
+            if (cmd_rebound) chain_cache_stats->native_rebinds++;
           }
-          if (code_changed) {
+          if (packet_changed) {
             for (iree_hal_amdxdna_native_command_ptr& chain :
                  chain_cache->chains) {
               if (!iree_status_is_ok(status)) break;
