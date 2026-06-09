@@ -12,6 +12,7 @@
 
 #include "iree-amd-aie/driver/amdxdna/api.h"
 #include "iree-amd-aie/driver/amdxdna/async_queue.h"
+#include "iree-amd-aie/driver/amdxdna/native.h"
 #include "iree/base/internal/arena.h"
 #include "iree/hal/api.h"
 
@@ -19,8 +20,7 @@ struct iree_async_proactor_pool_t;
 struct iree_async_proactor_t;
 struct iree_hal_amdxdna_device_chain_command_cache_t;
 struct iree_hal_amdxdna_device_context_cache_t;
-struct iree_hal_amdxdna_native_device_t;
-
+struct iree_hal_amdxdna_device_single_command_cache_t;
 struct iree_hal_amdxdna_device {
   iree_hal_resource_t resource;
   iree_allocator_t host_allocator;
@@ -59,6 +59,7 @@ struct iree_hal_amdxdna_device {
   iree_async_axis_t frontier_axis;
 
   iree_hal_amdxdna_native_device_t* native_device;
+  iree_hal_amdxdna_native_device_caps_t native_caps;
   // When true, dispatches are submitted as a single ERT_CMD_CHAIN instead of
   // per-command issue/wait (see iree_hal_amdxdna_device_params::cmd_chain).
   bool cmd_chain;
@@ -70,6 +71,10 @@ struct iree_hal_amdxdna_device {
   // Implementation-private and device-owned so cached command BOs cannot outlive
   // the native device/context they belong to.
   iree_hal_amdxdna_device_chain_command_cache_t* mcdm_chain_command_cache;
+  // Native single-dispatch cache for Windows MCDM module-style commands.
+  // This owns prepared command/control BOs keyed by the device-visible dispatch
+  // signature and is destroyed before the native device.
+  iree_hal_amdxdna_device_single_command_cache_t* mcdm_single_command_cache;
 #endif  // defined(_WIN32)
   // Maximum slots that fit in one ERT_CMD_CHAIN exec BO (constant per device).
   // Lazily computed on first flush; the chain flush splits into this many

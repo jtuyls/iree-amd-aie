@@ -6,8 +6,6 @@
 
 #include "iree-amd-aie/driver/amdxdna/allocator.h"
 
-#include <cstdlib>
-#include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -39,37 +37,19 @@ struct iree_hal_amdxdna_allocator {
   }
 };
 
-static bool iree_hal_amdxdna_allocator_cache_enabled() {
-  const char* value = std::getenv("IREE_AMDXDNA_ALLOCATOR_CACHE");
-  return value &&
-         (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
-          std::strcmp(value, "TRUE") == 0 || std::strcmp(value, "yes") == 0 ||
-          std::strcmp(value, "YES") == 0);
-}
-
-static size_t iree_hal_amdxdna_allocator_cache_capacity() {
-  const char* value = std::getenv("IREE_AMDXDNA_ALLOCATOR_CACHE_CAPACITY");
-  if (!value || !*value) return 64;
-  char* end = nullptr;
-  unsigned long parsed = std::strtoul(value, &end, 0);
-  if (!end || *end != '\0') return 64;
-  return static_cast<size_t>(parsed);
-}
+static constexpr size_t kAmdxdnaAllocatorCacheCapacity = 64;
 
 static void iree_hal_amdxdna_allocator_release_cached_buffer(
     void* user_data, iree_hal_buffer_t* base_buffer) {
   auto* allocator = static_cast<iree_hal_amdxdna_allocator*>(user_data);
   if (!allocator) return;
-  if (iree_hal_amdxdna_allocator_cache_enabled()) {
-    iree_hal_amdxdna_native_buffer_t* native_buffer =
-        iree_hal_amdxdna_buffer_steal_native_buffer(base_buffer);
-    if (native_buffer) {
-      iree_hal_amdxdna_native_buffer_ptr cached(native_buffer);
-      std::lock_guard<std::mutex> lock(allocator->cache_mutex);
-      const size_t capacity = iree_hal_amdxdna_allocator_cache_capacity();
-      if (capacity != 0 && allocator->cached_buffers.size() < capacity) {
-        allocator->cached_buffers.push_back(std::move(cached));
-      }
+  iree_hal_amdxdna_native_buffer_t* native_buffer =
+      iree_hal_amdxdna_buffer_steal_native_buffer(base_buffer);
+  if (native_buffer) {
+    iree_hal_amdxdna_native_buffer_ptr cached(native_buffer);
+    std::lock_guard<std::mutex> lock(allocator->cache_mutex);
+    if (allocator->cached_buffers.size() < kAmdxdnaAllocatorCacheCapacity) {
+      allocator->cached_buffers.push_back(std::move(cached));
     }
   }
   iree_hal_allocator_release(
@@ -79,9 +59,6 @@ static void iree_hal_amdxdna_allocator_release_cached_buffer(
 static iree_hal_buffer_release_callback_t
 iree_hal_amdxdna_allocator_make_release_callback(
     iree_hal_amdxdna_allocator* allocator) {
-  if (!iree_hal_amdxdna_allocator_cache_enabled()) {
-    return iree_hal_buffer_release_callback_null();
-  }
   iree_hal_allocator_retain(reinterpret_cast<iree_hal_allocator_t*>(allocator));
   return iree_hal_buffer_release_callback_t{
       .fn = iree_hal_amdxdna_allocator_release_cached_buffer,
@@ -106,7 +83,6 @@ static void iree_hal_amdxdna_allocator_trim_cache(
 static iree_status_t iree_hal_amdxdna_allocator_take_cached_buffer(
     iree_hal_amdxdna_allocator* allocator, iree_device_size_t allocation_size,
     iree_hal_amdxdna_native_buffer_ptr* out_buffer) {
-  if (!iree_hal_amdxdna_allocator_cache_enabled()) return iree_ok_status();
   std::lock_guard<std::mutex> lock(allocator->cache_mutex);
   for (size_t i = 0; i < allocator->cached_buffers.size(); ++i) {
     iree_hal_amdxdna_native_buffer_t* candidate =

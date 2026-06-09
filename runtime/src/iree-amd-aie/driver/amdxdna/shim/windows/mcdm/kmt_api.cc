@@ -11,7 +11,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -33,17 +32,6 @@ constexpr uint32_t kQhdlSubmitPacketOffset = 0x68;
 constexpr uint32_t kQhdlCompletionSlotSize = 8;
 constexpr uint32_t kSubmitPrivateQwords = 13;  // 104 bytes on current driver.
 constexpr size_t kContextCommandApertureCookieOffset = 0x40;
-constexpr char kApertureLockHandleDeltaEnv[] =
-    "IREE_AMDXDNA_MCDM_APERTURE_LOCK_HANDLE_DELTA";
-constexpr char kApertureGpuHandleDeltaEnv[] =
-    "IREE_AMDXDNA_MCDM_APERTURE_GPU_HANDLE_DELTA";
-constexpr char kApertureCleanupHandleDeltaEnv[] =
-    "IREE_AMDXDNA_MCDM_APERTURE_CLEANUP_HANDLE_DELTA";
-constexpr char kCommandApertureXclFlagsEnv[] =
-    "IREE_AMDXDNA_MCDM_COMMAND_APERTURE_XCL_FLAGS";
-constexpr char kTraceQhdlEnv[] = "IREE_AMDXDNA_MCDM_TRACE_QHDL";
-constexpr char kPathBPhaseTimingEnv[] =
-    "IREE_AMDXDNA_MCDM_PATHB_PHASE_TIMING";
 
 struct PhaseStat {
   const char* name = "";
@@ -155,56 +143,32 @@ uint32_t Flags32(const D3DKMT_CREATEALLOCATIONFLAGS& flags) {
   return value;
 }
 
-bool EnvFlagEnabled(const char* name) {
-  const char* value = std::getenv(name);
-  return value && value[0] && value[0] != '0';
-}
-
-bool EnvFlagEnabledByDefault(const char* name) {
-  const char* value = std::getenv(name);
-  return !value || !value[0] || value[0] != '0';
-}
-
 bool TraceQhdlEnabled() {
-  static bool enabled = EnvFlagEnabled(kTraceQhdlEnv);
-  return enabled;
+  return false;
 }
 
 bool PathBPhaseTimingEnabled() {
-  static bool enabled = EnvFlagEnabled(kPathBPhaseTimingEnv);
-  if (enabled) {
-    static PathBPhaseReporter reporter;
-    (void)reporter;
-  }
-  return enabled;
+  return false;
 }
 
 bool XrtMinimalResidencyEnabled() {
-  static bool enabled =
-      EnvFlagEnabled("IREE_AMDXDNA_MCDM_XRT_MINIMAL_RESIDENCY");
-  return enabled;
+  return false;
 }
 
 bool PathBCompletionPollFallbackEnabled() {
-  static bool enabled =
-      EnvFlagEnabled("IREE_AMDXDNA_MCDM_PATHB_COMPLETION_POLL_FALLBACK");
-  return enabled;
+  return false;
 }
 
 bool TrustFenceCompletionEnabled() {
-  static bool enabled =
-      EnvFlagEnabledByDefault("IREE_AMDXDNA_MCDM_TRUST_FENCE_COMPLETION");
-  return enabled;
+  return true;
 }
 
 bool CcccCompletionSlotEnabled() {
-  static bool enabled = EnvFlagEnabled("IREE_AMDXDNA_MCDM_CCCC_COMPLETION_SLOT");
-  return enabled;
+  return false;
 }
 
 bool XrtLockTouchEnabled() {
-  static bool enabled = EnvFlagEnabled("IREE_AMDXDNA_MCDM_XRT_LOCK_TOUCH");
-  return enabled;
+  return false;
 }
 
 void InitializeCompletionSlot(uint8_t* slot_cpu) {
@@ -249,15 +213,6 @@ static_assert(sizeof(AllocPrivate) == 56,
 
 uint64_t AlignUpToPage(uint64_t value) {
   return (value + 4095u) & ~uint64_t{4095u};
-}
-
-uint32_t ReadHandleDeltaEnv(const char* name, uint32_t default_value) {
-  const char* text = std::getenv(name);
-  if (!text || !*text) return default_value;
-  char* end = nullptr;
-  unsigned long value = std::strtoul(text, &end, 0);
-  if (!end || *end != '\0') return default_value;
-  return static_cast<uint32_t>(value);
 }
 
 void CloseAdapterHandles(const KmtApi& api,
@@ -379,12 +334,6 @@ BufferKindInfo GetBufferKindInfo(BufferKind kind) {
       return {"cacheable", 0x3323, 0x01000000};
     case BufferKind::execbuf:
       return {"execbuf", 0x3328, 0x80000000};
-    case BufferKind::carveout:
-      // xrt_core arg_bo flag 0x02000001 -> private_type 0x332c (FUN_1800256e0).
-      // The full flag (incl. low bit) goes in xcl_flags; CreateBuffer also
-      // mirrors its low 16 bits into reserved1 (local_110), which is what the
-      // other kinds leave 0.
-      return {"carveout", 0x332c, 0x02000001};
   }
   return {"host_only", 0x3329, 0x20000000};
 }
@@ -614,19 +563,10 @@ bool CreateBuffer(const KmtApi& api, const Device& device, BufferKind kind,
   AllocPrivate alloc_private = {};
   alloc_private.requested_size = requested_size;
   alloc_private.aligned_size = aligned_size;
-  if (kind == BufferKind::carveout) {
-    // Firmware heap BO for the AIE4 context setup (0x332c). Mirror XRT's
-    // FUN_1800256e0 private exactly: full flag in xcl_flags (+0x28) and its low
-    // 16 bits in reserved1 (+0x18 = local_110). GPU-mapped + resident, no Lock2.
-    alloc_private.private_type = kind_info.private_type;        // 0x332c
-    alloc_private.xcl_flags = kind_info.xcl_flags;              // 0x02000001
-    alloc_private.reserved1 = kind_info.xcl_flags & 0xffff;     // 0x0001
-  } else {
-    // The working XRT matmul capture uses normal XRT BO private types for
-    // dispatch buffers: 0x3329 host-only data BOs and 0x3328 exec BOs.
-    alloc_private.private_type = kind_info.private_type;
-    alloc_private.xcl_flags = kind_info.xcl_flags;
-  }
+  // The working XRT matmul capture uses normal XRT BO private types for
+  // dispatch buffers: 0x3329 host-only data BOs and 0x3328 exec BOs.
+  alloc_private.private_type = kind_info.private_type;
+  alloc_private.xcl_flags = kind_info.xcl_flags;
 
   D3DDDI_ALLOCATIONINFO2 alloc_info = {};
   alloc_info.pPrivateDriverData = &alloc_private;
@@ -680,13 +620,6 @@ bool CreateBuffer(const KmtApi& api, const Device& device, BufferKind kind,
     // fence is now complete. Avoid enqueueing the same residency wait on every
     // later submit that references this BO.
     buffer.paging_fence_value = 0;
-  }
-
-  // Carveout/heap BOs are device-local firmware heaps: XRT never Lock2s them
-  // (no CPU access). Skip the lock + CPU sentinel write for them.
-  if (kind == BufferKind::carveout) {
-    *out_buffer = buffer;
-    return true;
   }
 
   D3DKMT_LOCK2 lock = {};
@@ -914,56 +847,8 @@ bool CreateContext(const KmtApi& api, const Device& device,
                 sizeof(context.command_aperture_cookie));
   }
 
-  // AIE4 firmware-context setup (opt-in: IREE_AMDXDNA_MCDM_AIE4_HEAP). RE'd from
-  // xrt_core hwcontext_aie4 (FUN_18002ee60 -> FUN_18002e670): before the HW
-  // queue, XRT allocates two carveout/heap BOs (0x332c) and creates a SECOND
-  // context over them (Flags=HwQueueSupported|DisableGpuTimeout = 0x14) whose
-  // 0x80-byte private payload carries the heaps' GPU VAs + sizes. The HW queue
-  // then attaches to THAT context (D3DKMTCreateHwQueue.hHwContext = carveout
-  // context, per FUN_180007130). The blob context above stays as the registered
-  // xclbin/PDI context. Without this the firmware never builds the AIE context
-  // and never consumes the queue (CREATE_AIE4_CTX fences with slot==0).
-  D3DKMT_HANDLE queue_context = context.context;
-  if (std::getenv("IREE_AMDXDNA_MCDM_AIE4_HEAP")) {
-    if (!CreateBuffer(api, device, BufferKind::carveout, 0x2000,
-                      &context.carveout_heap_large, out_error) ||
-        !CreateBuffer(api, device, BufferKind::carveout, 0x1000,
-                      &context.carveout_heap_small, out_error)) {
-      DestroyContext(api, &context);
-      return false;
-    }
-    uint8_t payload[0x80] = {};
-    std::memcpy(payload + 0x68, &context.carveout_heap_large.gpu_va, 8);
-    std::memcpy(payload + 0x70, &context.carveout_heap_small.gpu_va, 8);
-    uint32_t large_size =
-        static_cast<uint32_t>(context.carveout_heap_large.size);
-    uint32_t small_size =
-        static_cast<uint32_t>(context.carveout_heap_small.size);
-    std::memcpy(payload + 0x78, &large_size, 4);
-    std::memcpy(payload + 0x7c, &small_size, 4);
-
-    D3DKMT_CREATECONTEXTVIRTUAL carveout = {};
-    carveout.hDevice = device.device;
-    carveout.NodeOrdinal = 0;
-    carveout.EngineAffinity = 1;
-    carveout.Flags.HwQueueSupported = 1;
-    carveout.Flags.DisableGpuTimeout = 1;  // 0x10 | 0x4 = 0x14
-    carveout.pPrivateDriverData = payload;
-    carveout.PrivateDriverDataSize = sizeof(payload);
-    carveout.ClientHint = D3DKMT_CLIENTHINT_VITIS;
-    status = api.create_context_virtual(&carveout);
-    if (!CheckStatus("D3DKMTCreateContextVirtual(carveout)", status,
-                     out_error)) {
-      DestroyContext(api, &context);
-      return false;
-    }
-    context.carveout_context = carveout.hContext;
-    std::memcpy(&context.aie4_firmware_handle, payload + 0x40, 4);
-    queue_context = context.carveout_context;
-  }
-
   D3DKMT_CREATEHWQUEUE create_queue = {};
-  create_queue.hHwContext = queue_context;
+  create_queue.hHwContext = context.context;
   status = api.create_hw_queue(&create_queue);
   if (!CheckStatus("D3DKMTCreateHwQueue", status, out_error)) {
     DestroyContext(api, &context);
@@ -988,23 +873,12 @@ void DestroyContext(const KmtApi& api, Context* context) {
     api.destroy_hw_queue(&destroy_queue);
     context->hw_queue = 0;
   }
-  // The queue lives on the carveout context (AIE4-heap path); destroy it before
-  // the blob context, then free the heap BOs it was built over.
-  if (context->carveout_context) {
-    D3DKMT_DESTROYCONTEXT destroy_carveout = {};
-    destroy_carveout.hContext = context->carveout_context;
-    api.destroy_context(&destroy_carveout);
-    context->carveout_context = 0;
-  }
   if (context->context) {
     D3DKMT_DESTROYCONTEXT destroy_context = {};
     destroy_context.hContext = context->context;
     api.destroy_context(&destroy_context);
     context->context = 0;
   }
-  // Carveout heap BOs are intentionally leaked here (DestroyContext has no
-  // Device handle to call DestroyBuffer); they are reclaimed at DestroyDevice /
-  // process exit. The AIE4-heap path is a single-context test path.
   context->progress_fence = 0;
   context->progress_fence_cpu = nullptr;
   context->progress_fence_gpu = 0;
@@ -1079,15 +953,6 @@ bool CreateCommandAperture(const KmtApi& api, const Device& device,
   gpu_private.policy = 2;
   gpu_private.xcl_flags =
       0x01000001u | (context.command_aperture_cookie << 16);
-  if (const char* flags = std::getenv(kCommandApertureXclFlagsEnv)) {
-    if (flags[0]) {
-      char* end = nullptr;
-      unsigned long value = std::strtoul(flags, &end, 0);
-      if (end && *end == '\0') {
-        gpu_private.xcl_flags = static_cast<uint32_t>(value);
-      }
-    }
-  }
 
   D3DDDI_ALLOCATIONINFO2 gpu_info = {};
   gpu_info.pPrivateDriverData = &gpu_private;

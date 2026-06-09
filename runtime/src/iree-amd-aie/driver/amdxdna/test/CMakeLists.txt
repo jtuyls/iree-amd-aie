@@ -82,8 +82,22 @@ iree_cc_test(
     "nop_executable_cache_test.cc"
   DEPS
     iree-amd-aie::driver::amdxdna::amdxdna
+    iree-amd-aie::schemas::amdxdna_xclbin_executable_def_c_fbs
     iree::base
+    iree::base::internal::flatcc::building
     iree::hal
+    iree::testing::gtest
+    iree::testing::gtest_main
+)
+
+iree_cc_test(
+  NAME
+    xclbin_util_test
+  SRCS
+    "xclbin_util_test.cc"
+  DEPS
+    iree-amd-aie::driver::amdxdna::amdxdna
+    iree::base
     iree::testing::gtest
     iree::testing::gtest_main
 )

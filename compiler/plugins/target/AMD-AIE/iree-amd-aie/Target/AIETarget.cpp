@@ -20,6 +20,7 @@
 #include "iree-amd-aie/IR/AMDAIEDialect.h"
 #include "iree-amd-aie/Transforms/Passes.h"
 #include "iree-amd-aie/Transforms/Utils/AMDAIETransactionBuilder.h"
+#include "iree-amd-aie/schemas/amdxdna_xclbin_executable_def_builder.h"
 #include "iree-amd-aie/schemas/pdi_executable_def_builder.h"
 #include "iree-amd-aie/schemas/xrt_executable_def_builder.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
@@ -51,6 +52,15 @@
 #define DEBUG_TYPE "aie-target"
 
 namespace mlir::iree_compiler::AMDAIE {
+static constexpr StringLiteral kAMDXDNAPDIExecutableFormat = "amdaie-pdi-fb";
+static constexpr StringLiteral kAMDXDNAXclbinExecutableFormat =
+    "amdaie-amdxdna-xclbin-fb";
+
+static bool usesAMDXDNAXclbinExecutable(const AMDAIEOptions &options) {
+  return options.deviceHal == AMDAIEOptions::DeviceHAL::AMDXDNA &&
+         options.emitAMDXDNAContextXclbin;
+}
+
 static xilinx::AIE::DeviceOp getDeviceOpWithName(ModuleOp moduleOp,
                                                  StringRef targetName) {
   xilinx::AIE::DeviceOp deviceOp;
@@ -199,7 +209,10 @@ class AIETargetBackend final : public IREE::HAL::TargetBackend {
       case AMDAIEOptions::DeviceHAL::AMDXDNA:
         return IREE::HAL::ExecutableTargetAttr::get(
             context, b.getStringAttr("amd-aie"),
-            b.getStringAttr("amdaie-pdi-fb"), configAttr);
+            b.getStringAttr(options.emitAMDXDNAContextXclbin
+                                ? kAMDXDNAXclbinExecutableFormat
+                                : kAMDXDNAPDIExecutableFormat),
+            configAttr);
       default:;
         llvm::report_fatal_error("unsupported default HAL\n");
     };
@@ -303,10 +316,8 @@ void serializePDIToFb(FlatbufferBuilder &builder,
                       flatbuffers_string_vec_ref_t entryPointsRef,
                       SmallVector<int32_t> &asmInstrIndices,
                       SmallVector<int32_t> &pdiIndices,
-                      SmallVector<int32_t> &xclbinIndices,
                       SmallVector<int32_t> &reconfDataIndices,
                       SmallVector<flatbuffers_ref_t> pdiRefs,
-                      SmallVector<flatbuffers_ref_t> xclbinRefs,
                       SmallVector<flatbuffers_ref_t> asmInstrRefs,
                       SmallVector<flatbuffers_ref_t> reconfDataRefs,
                       SmallVector<flatbuffers_ref_t> patchRefs) {
@@ -329,19 +340,6 @@ void serializePDIToFb(FlatbufferBuilder &builder,
   // Add the PDI strings to the flatbuffer.
   flatbuffers_vec_ref_t pdisRef = builder.createOffsetVecDestructive(pdiRefs);
   iree_amd_aie_hal_amdxdna_ExecutableDef_pdis_add(builder, pdisRef);
-  // Add the optional AXLF/xclbin context wrappers to the flatbuffer.
-  // Keep the index vector and payload vector as an all-or-nothing pair so
-  // legacy Linux-style PDI-only executables do not carry a dangling optional
-  // field.
-  if (!xclbinRefs.empty()) {
-    flatbuffers_int32_vec_ref_t xclbinIndicesRef =
-        builder.createInt32Vec(xclbinIndices);
-    iree_amd_aie_hal_amdxdna_ExecutableDef_xclbin_indices_add(
-        builder, xclbinIndicesRef);
-    flatbuffers_vec_ref_t xclbinsRef =
-        builder.createOffsetVecDestructive(xclbinRefs);
-    iree_amd_aie_hal_amdxdna_ExecutableDef_xclbins_add(builder, xclbinsRef);
-  }
   // Add the npu instructions to the flatbuffer.
   flatbuffers_vec_ref_t asmInstrsRef =
       builder.createOffsetVecDestructive(asmInstrRefs);
@@ -455,6 +453,101 @@ struct Flatbuffer3dUInt32ArrayConverter {
   }
 };
 
+void serializeAMDXDNAXclbinToFb(
+    FlatbufferBuilder &builder,
+    Flatbuffer1dStringArrayConverter &entryPointNameConvertor,
+    Flatbuffer1dStringArrayConverter &xclbinConvertor,
+    Flatbuffer3dUInt32ArrayConverter &asmInstrConverter,
+    Flatbuffer3dUInt32ArrayConverter &reconfDataConverter,
+    Flatbuffer3dUInt32ArrayConverter &patchConverter) {
+  SmallVector<flatbuffers_ref_t> xclbinRefs =
+      xclbinConvertor.getFlatbufferRefs(
+          builder, iree_amd_aie_hal_amdxdna_xclbin_XclbinDef_create);
+  flatbuffers_vec_ref_t xclbinsRef =
+      builder.createOffsetVecDestructive(xclbinRefs);
+
+  SmallVector<iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_ref_t>
+      entryPointRefs;
+  entryPointRefs.reserve(entryPointNameConvertor.indices.size());
+  for (size_t ordinal = 0; ordinal < entryPointNameConvertor.indices.size();
+       ++ordinal) {
+    int32_t nameIndex = entryPointNameConvertor.indices[ordinal];
+    flatbuffers_string_ref_t nameRef =
+        builder.createString(entryPointNameConvertor.data[nameIndex]);
+
+    int32_t asmIndex = asmInstrConverter.indices[ordinal];
+    const SmallVector<std::vector<uint32_t>> &asmRuns =
+        asmInstrConverter.data[asmIndex];
+    int32_t reconfIndex = reconfDataConverter.indices[ordinal];
+    int32_t patchIndex = patchConverter.indices[ordinal];
+    const SmallVector<std::vector<uint32_t>> *patchRuns =
+        patchIndex >= 0 ? &patchConverter.data[patchIndex] : nullptr;
+    const std::vector<uint32_t> emptyPatch;
+    auto getPatch = [&](size_t runIndex) -> const std::vector<uint32_t> & {
+      if (patchRuns && runIndex < patchRuns->size()) {
+        return (*patchRuns)[runIndex];
+      }
+      return emptyPatch;
+    };
+
+    SmallVector<iree_amd_aie_hal_amdxdna_xclbin_RunDef_ref_t> runRefs;
+    auto addRun = [&](const std::vector<uint32_t> &controlCode,
+                      const std::vector<uint32_t> *dataPayload,
+                      const std::vector<uint32_t> &patchTable) {
+      flatbuffers_uint32_vec_ref_t controlCodeRef =
+          builder.createInt32Vec(controlCode);
+      flatbuffers_uint32_vec_ref_t dataPayloadRef = 0;
+      if (dataPayload) dataPayloadRef = builder.createInt32Vec(*dataPayload);
+      flatbuffers_uint32_vec_ref_t patchTableRef = 0;
+      if (!patchTable.empty())
+        patchTableRef = builder.createInt32Vec(patchTable);
+      iree_amd_aie_hal_amdxdna_xclbin_RunDef_start(builder);
+      iree_amd_aie_hal_amdxdna_xclbin_RunDef_control_code_add(
+          builder, controlCodeRef);
+      if (dataPayloadRef) {
+        iree_amd_aie_hal_amdxdna_xclbin_RunDef_data_payload_add(
+            builder, dataPayloadRef);
+      }
+      if (patchTableRef) {
+        iree_amd_aie_hal_amdxdna_xclbin_RunDef_patch_table_add(
+            builder, patchTableRef);
+      }
+      runRefs.push_back(iree_amd_aie_hal_amdxdna_xclbin_RunDef_end(builder));
+    };
+
+    if (reconfIndex >= 0) {
+      const SmallVector<std::vector<uint32_t>> &reconfRuns =
+          reconfDataConverter.data[reconfIndex];
+      for (size_t i = 0; i < reconfRuns.size(); ++i) {
+        addRun(asmRuns[2 * i], &reconfRuns[i], getPatch(2 * i));
+        addRun(asmRuns[2 * i + 1], nullptr, getPatch(2 * i + 1));
+      }
+    } else {
+      for (size_t i = 0; i < asmRuns.size(); ++i) {
+        addRun(asmRuns[i], nullptr, getPatch(i));
+      }
+    }
+
+    flatbuffers_vec_ref_t runsRef =
+        builder.createOffsetVecDestructive(runRefs);
+    iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_start(builder);
+    iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_name_add(builder, nameRef);
+    int32_t xclbinIndex = xclbinConvertor.indices[ordinal];
+    iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_pdi_index_add(
+        builder, xclbinIndex >= 0 ? 0 : -1);
+    iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_xclbin_index_add(
+        builder, xclbinIndex);
+    iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_runs_add(builder, runsRef);
+    entryPointRefs.push_back(
+        iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_end(builder));
+  }
+
+  flatbuffers_vec_ref_t entryPointsRef =
+      builder.createOffsetVecDestructive(entryPointRefs);
+  iree_amd_aie_hal_amdxdna_xclbin_ExecutableDef_create_as_root(
+      builder, xclbinsRef, entryPointsRef);
+}
+
 LogicalResult AIETargetBackend::serializeExecutable(
     const SerializationOptions &serOptions,
     IREE::HAL::ExecutableVariantOp variantOp, OpBuilder &executableBuilder) {
@@ -542,7 +635,12 @@ LogicalResult AIETargetBackend::serializeExecutable(
       iree_amd_aie_hal_xrt_ExecutableDef_start_as_root(builder);
       break;
     case AMDAIEOptions::DeviceHAL::AMDXDNA:
-      iree_amd_aie_hal_amdxdna_ExecutableDef_start_as_root(builder);
+      if (usesAMDXDNAXclbinExecutable(options)) {
+        // The xclbin-backed schema is nested. It is serialized bottom-up and
+        // then rooted with ExecutableDef_create_as_root.
+      } else {
+        iree_amd_aie_hal_amdxdna_ExecutableDef_start_as_root(builder);
+      }
       break;
     default:
       llvm::errs() << "Unsupported device HAL\n";
@@ -718,11 +816,13 @@ LogicalResult AIETargetBackend::serializeExecutable(
       patch2d.push_back(deriveHostPatchTableFromTransaction(txn));
     patchConverter.addEntry(ordinal, patch2d);
 
-    // Get the artifact (XCLBIN or PDI) only if control packet reconfiguration
-    // is disabled or this is the first entry point. Otherwise, leave it as an
-    // empty string.
+    const bool entryOwnsContext = !options.enableCtrlPkt || i == 0;
+
+    // Get the artifact (XRT xclbin or legacy amdxdna PDI) only if control
+    // packet reconfiguration is disabled or this is the first entry point.
+    // Otherwise, leave it as an empty string.
     std::string artifactString;
-    if (!options.enableCtrlPkt || i == 0) {
+    if (entryOwnsContext && !usesAMDXDNAXclbinExecutable(options)) {
       // Load the artifact from file.
       std::unique_ptr<llvm::MemoryBuffer> artifactInput =
           openInputFile(artifactPath, &errorMessage);
@@ -735,7 +835,8 @@ LogicalResult AIETargetBackend::serializeExecutable(
     // Add the artifact to the converter.
     artifactConvertor.addEntry(ordinal, artifactString);
     std::string contextXclbinString;
-    if (!artifactString.empty() && maybeContextXclbinPath) {
+    if (entryOwnsContext && usesAMDXDNAXclbinExecutable(options) &&
+        maybeContextXclbinPath) {
       std::unique_ptr<llvm::MemoryBuffer> contextXclbinInput =
           openInputFile(*maybeContextXclbinPath, &errorMessage);
       if (!contextXclbinInput) {
@@ -769,6 +870,12 @@ LogicalResult AIETargetBackend::serializeExecutable(
       break;
     }
     case AMDAIEOptions::DeviceHAL::AMDXDNA: {
+      if (usesAMDXDNAXclbinExecutable(options)) {
+        serializeAMDXDNAXclbinToFb(
+            builder, entryPointNameConvertor, contextXclbinConvertor,
+            asmInstrConverter, reconfDataConverter, patchConverter);
+        break;
+      }
       auto get3dUInt32ArrayRefs = [&](Flatbuffer3dUInt32ArrayConverter
                                           &converter) {
         return converter
@@ -779,13 +886,9 @@ LogicalResult AIETargetBackend::serializeExecutable(
       serializePDIToFb(builder,
                        entryPointNameConvertor.getFlatbufferVecRef(builder),
                        asmInstrConverter.indices, artifactConvertor.indices,
-                       contextXclbinConvertor.indices,
                        reconfDataConverter.indices,
                        artifactConvertor.getFlatbufferRefs(
                            builder, iree_amd_aie_hal_amdxdna_PdiDef_create),
-                       contextXclbinConvertor.getFlatbufferRefs(
-                           builder,
-                           iree_amd_aie_hal_amdxdna_XclbinDef_create),
                        get3dUInt32ArrayRefs(asmInstrConverter),
                        get3dUInt32ArrayRefs(reconfDataConverter),
                        get3dUInt32ArrayRefs(patchConverter));

@@ -25,3 +25,16 @@ flatbuffer_c_library(
     "--json"
   PUBLIC
 )
+
+flatbuffer_c_library(
+  NAME
+    amdxdna_xclbin_executable_def_c_fbs
+  SRCS
+    "amdxdna_xclbin_executable_def.fbs"
+  FLATCC_ARGS
+    "--reader"
+    "--builder"
+    "--verifier"
+    "--json"
+  PUBLIC
+)

@@ -25,6 +25,7 @@ iree_cc_library(
     iree::target::amd-aie::air::AIRPasses
     iree::base::core_headers
     iree::base::internal::flatcc::building
+    iree-amd-aie::schemas::amdxdna_xclbin_executable_def_c_fbs
     iree-amd-aie::schemas::xrt_executable_def_c_fbs
     iree-amd-aie::schemas::pdi_executable_def_c_fbs
   PUBLIC

@@ -290,24 +290,10 @@ int iree_hal_amdxdna_async_queue_worker_main(void* arg) {
         status = iree_hal_semaphore_list_signal(op->signal_list,
                                                 /*frontier=*/nullptr);
       }
-      if (iree_status_is_ok(status) && queue->frontier_tracker) {
-        // Advance the queue's epoch so pool waiters can observe progress.
-        // Plain reads of frontier_tracker/frontier_axis are safe because
-        // set_frontier's lifecycle contract guarantees no concurrent access.
-        uint64_t epoch = (uint64_t)iree_atomic_fetch_add(
-                             &queue->epoch, 1, iree_memory_order_acq_rel) +
-                         1;
-        iree_async_frontier_tracker_advance(queue->frontier_tracker,
-                                            queue->frontier_axis, epoch);
+      if (iree_status_is_ok(status)) {
+        iree_hal_amdxdna_async_queue_advance_frontier(queue);
       }
       if (!iree_status_is_ok(status)) {
-        const char* trace_failures =
-            getenv("IREE_AMDXDNA_ASYNC_QUEUE_TRACE_FAILURES");
-        if (trace_failures && trace_failures[0] != '\0' &&
-            trace_failures[0] != '0') {
-          fprintf(stderr, "amdxdna async queue op failed: ");
-          iree_status_fprint(stderr, status);
-        }
         iree_hal_semaphore_list_fail(op->signal_list, status);
       }
       iree_hal_amdxdna_async_queue_release_op(queue, op);
@@ -385,6 +371,19 @@ void iree_hal_amdxdna_async_queue_set_frontier(
               "single null-clear at teardown");
   queue->frontier_tracker = tracker;
   queue->frontier_axis = axis;
+}
+
+void iree_hal_amdxdna_async_queue_advance_frontier(
+    iree_hal_amdxdna_async_queue_t* queue) {
+  if (!queue || !queue->frontier_tracker) return;
+  // Advance the queue's epoch so pool waiters can observe progress. Plain
+  // reads of frontier_tracker/frontier_axis are safe because set_frontier's
+  // lifecycle contract guarantees no concurrent access.
+  uint64_t epoch = (uint64_t)iree_atomic_fetch_add(
+                       &queue->epoch, 1, iree_memory_order_acq_rel) +
+                   1;
+  iree_async_frontier_tracker_advance(queue->frontier_tracker,
+                                      queue->frontier_axis, epoch);
 }
 
 // Cancels all timepoints on all in-flight ops, forcing them onto the ready

@@ -35,6 +35,7 @@ iree_bytecode_module(
     --iree-amdaie-target-device=${TARGET_DEVICE}
     --iree-amd-aie-peano-install-dir=${PEANO_INSTALL_DIR}
     --iree-amdaie-device-hal=amdxdna
+    --iree-amdaie-amdxdna-emit-context-xclbin=true
     --iree-hal-memoization=false
     --iree-hal-indirect-command-buffers=false
   PUBLIC
@@ -102,8 +103,8 @@ target_include_directories(iree-amd-aie_driver_amdxdna_test_executable_amdxdna_d
 
 # Cross-executable ERT_CMD_CHAIN test. Compiles a small control-packet matmul at
 # build time (npu4-only, since ERT_CMD_CHAIN is firmware-gated to npu4) and
-# embeds the resulting amdaie-pdi-fb so the test can load it twice as two
-# distinct hal.executable objects.
+# embeds the resulting amdaie-amdxdna-xclbin-fb so the test can load it twice
+# as two distinct hal.executable objects.
 iree_bytecode_module(
   NAME
     xexec_chain_test_module

@@ -19,9 +19,11 @@
 #include "iree/base/tracing.h"
 
 struct iree_hal_amdxdna_kernel_params {
+  // Raw PDI context image from amdaie-pdi-fb or extracted from an XADX
+  // xclbin's AIE_PARTITION section for native drivers that consume PDI.
   std::vector<uint8_t> pdi;
-  // Optional AXLF/xclbin wrapper for the PDI(s), used by Windows MCDM context
-  // creation. Linux KMQ ignores this and keeps using `pdi`.
+  // AXLF/xclbin context wrapper from amdaie-amdxdna-xclbin-fb for native
+  // drivers that consume an xclbin-shaped context blob.
   std::vector<uint8_t> xclbin;
   std::vector<std::vector<uint32_t>> asm_inst_runlist;
   std::vector<std::vector<uint32_t>> reconf_data_runlist;

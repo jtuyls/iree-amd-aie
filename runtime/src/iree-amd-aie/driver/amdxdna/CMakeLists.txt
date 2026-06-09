@@ -67,6 +67,8 @@ iree_cc_library(
     nop_semaphore.cc
     nop_semaphore.h
     util.h
+    xclbin_util.cc
+    xclbin_util.h
   DEPS
     iree::async
     iree::async::util::proactor_pool
@@ -81,6 +83,7 @@ iree_cc_library(
     iree::hal::utils::queue_host_call_emulation
     iree::hal::utils::resource_set
     iree::base::internal::flatcc::parsing
+    iree-amd-aie::schemas::amdxdna_xclbin_executable_def_c_fbs
     iree-amd-aie::schemas::pdi_executable_def_c_fbs
     ${IREE_HAL_AMDXDNA_NATIVE_DEPS}
   COPTS

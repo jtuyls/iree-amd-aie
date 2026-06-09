@@ -180,9 +180,18 @@ TEST(DriverTest, CreateDeviceByPathReturnsStatusForMissingDevice) {
       IREE_SV("/dev/accel/iree-amdxdna-test-missing"), /*param_count=*/0,
       /*params=*/nullptr, &create_params, iree_allocator_system(), &device);
 
+#if defined(_WIN32)
+  // Windows MCDM discovers the NPU adapter through KMT and does not currently
+  // implement pathful device opens. The path is accepted as a selector hint,
+  // but native adapter discovery still resolves the default device.
+  IREE_EXPECT_OK(status);
+  EXPECT_NE(device, nullptr);
+  iree_hal_device_release(device);
+#else
   EXPECT_EQ(iree_status_code(status), IREE_STATUS_NOT_FOUND);
   iree_status_free(status);
   EXPECT_EQ(device, nullptr);
+#endif  // defined(_WIN32)
 
   iree_async_proactor_pool_release(proactor_pool);
   iree_hal_driver_release(driver);

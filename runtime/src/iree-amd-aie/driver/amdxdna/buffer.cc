@@ -147,7 +147,7 @@ static iree_status_t iree_hal_amdxdna_buffer_map_range(
   return status;
 }
 
-static iree_status_t iree_hal_amdxdna_buffer_flush_range(
+iree_status_t iree_hal_amdxdna_buffer_flush_range(
     iree_hal_buffer_t* base_buffer, iree_device_size_t local_byte_offset,
     iree_device_size_t local_byte_length) {
   IREE_TRACE_ZONE_BEGIN(z0);

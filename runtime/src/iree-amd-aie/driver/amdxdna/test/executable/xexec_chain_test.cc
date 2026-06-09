@@ -16,7 +16,8 @@
 // (the AIE backend co-locates a function's dispatches into one executable with
 // N entry points, only entry 0 carrying the PDI), so the test loads the same
 // control-packet matmul PDI twice as two distinct hal.executable structs.
-// The PDI is compiled at build time from xexec_chain_test.mlir and embedded.
+// The executable is compiled at build time from xexec_chain_test.mlir and
+// embedded in amdaie-amdxdna-xclbin-fb form.
 //
 // The fixture runs the same 2-dispatch scenario; individual tests vary
 // `forced_max_slots` to exercise default/chunked ERT chain paths.
@@ -103,7 +104,7 @@ static uint64_t RunCrossExecChainScenario(uint32_t forced_max_slots) {
       iree_hal_executable_cache_create(device, IREE_SV("xexec"), &cache));
   iree_hal_executable_params_t params;
   iree_hal_executable_params_initialize(&params);
-  params.executable_format = IREE_SV("amdaie-pdi-fb");
+  params.executable_format = IREE_SV("amdaie-amdxdna-xclbin-fb");
   params.executable_data = GetTestExecutableData();
   params.caching_mode = 0;
   iree_hal_executable_t* exe0 = nullptr;

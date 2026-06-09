@@ -88,9 +88,9 @@ struct AMDAIEOptions {
   std::string enableAMDAIEUkernels{"none"};
   PacketFlowStrategy packetFlowStrategy{PacketFlowStrategy::None};
   bool enableCtrlPkt{false};
-  // Emit an AXLF/xclbin wrapper alongside AMDXDNA PDI artifacts and embed it
-  // in the amdaie-pdi-fb executable. Windows MCDM consumes this wrapper for
-  // context creation; Linux KMQ ignores it.
+  // Emit an AXLF/xclbin context wrapper and package it in the
+  // amdaie-amdxdna-xclbin-fb executable format. Native backends either consume
+  // the wrapper directly or extract the selected PDI from it.
   bool emitAMDXDNAContextXclbin{false};
 
   enum class DeviceHAL { XRT, AMDXDNA };
@@ -344,8 +344,8 @@ struct AMDAIEOptions {
         "iree-amdaie-amdxdna-emit-context-xclbin",
         emitAMDXDNAContextXclbin, llvm::cl::cat(category),
         llvm::cl::desc(
-            "For the amdxdna HAL, embed a hidden single-PDI AXLF/xclbin "
-            "wrapper in amdaie-pdi-fb for Windows MCDM context creation."));
+            "For the amdxdna HAL, emit amdaie-amdxdna-xclbin-fb with a "
+            "hidden single-PDI AXLF/xclbin context wrapper."));
 
     binder.opt<unsigned>(
         "iree-amdaie-stack-size", coreStackSize, llvm::cl::cat(category),

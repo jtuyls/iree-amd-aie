@@ -29,6 +29,10 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
 // details.
 void iree_hal_amdxdna_device_destroy_chain_command_cache(
     iree_hal_amdxdna_device* device);
+
+// Releases the device-owned Windows MCDM single-dispatch command cache.
+void iree_hal_amdxdna_device_destroy_single_command_cache(
+    iree_hal_amdxdna_device* device);
 #endif  // defined(_WIN32)
 
 #endif  // IREE_AMD_AIE_DRIVER_AMDXDNA_DEVICE_INTERNAL_H_

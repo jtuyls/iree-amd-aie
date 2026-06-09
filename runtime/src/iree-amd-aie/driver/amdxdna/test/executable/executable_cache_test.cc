@@ -16,7 +16,9 @@
 
 namespace iree::hal::amdxdna {
 
-static const char* get_test_executable_format() { return "amdaie-pdi-fb"; }
+static const char* get_test_executable_format() {
+  return "amdaie-amdxdna-xclbin-fb";
+}
 
 static iree_const_byte_span_t get_test_executable_data(
     iree_string_view_t /*file_name*/) {

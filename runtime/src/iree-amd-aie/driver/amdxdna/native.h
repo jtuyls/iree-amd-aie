@@ -50,6 +50,68 @@ enum class iree_hal_amdxdna_native_command_opcode_t : uint8_t {
   command_chain,
 };
 
+enum iree_hal_amdxdna_native_context_image_model_bits_t : uint32_t {
+  IREE_HAL_AMDXDNA_NATIVE_CONTEXT_IMAGE_MODEL_PDI = 1u << 0,
+  IREE_HAL_AMDXDNA_NATIVE_CONTEXT_IMAGE_MODEL_XCLBIN = 1u << 1,
+  IREE_HAL_AMDXDNA_NATIVE_CONTEXT_IMAGE_MODEL_XADX = 1u << 2,
+};
+
+enum iree_hal_amdxdna_native_dispatch_model_bits_t : uint32_t {
+  IREE_HAL_AMDXDNA_NATIVE_DISPATCH_MODEL_START_CU = 1u << 0,
+  IREE_HAL_AMDXDNA_NATIVE_DISPATCH_MODEL_START_NPU = 1u << 1,
+  IREE_HAL_AMDXDNA_NATIVE_DISPATCH_MODEL_PARTIAL_ELF = 1u << 2,
+  IREE_HAL_AMDXDNA_NATIVE_DISPATCH_MODEL_COMMAND_CHAIN = 1u << 3,
+};
+
+enum iree_hal_amdxdna_native_completion_model_bits_t : uint32_t {
+  IREE_HAL_AMDXDNA_NATIVE_COMPLETION_MODEL_SYNCHRONOUS_WAIT = 1u << 0,
+  IREE_HAL_AMDXDNA_NATIVE_COMPLETION_MODEL_NATIVE_FENCE = 1u << 1,
+  IREE_HAL_AMDXDNA_NATIVE_COMPLETION_MODEL_PROGRESS_FENCE = 1u << 2,
+  IREE_HAL_AMDXDNA_NATIVE_COMPLETION_MODEL_COMPLETION_SLOT = 1u << 3,
+};
+
+enum class iree_hal_amdxdna_native_buffer_sync_model_t : uint8_t {
+  caller_syncs_bindings = 0,
+  submit_syncs_bindings,
+};
+
+struct iree_hal_amdxdna_native_device_caps_t {
+  uint32_t ddi_version = 1;
+  uint32_t max_effective_queues = 1;
+  uint32_t max_command_chain_slots = 0;
+  uint32_t context_image_models = 0;
+  uint32_t dispatch_models = 0;
+  iree_hal_amdxdna_native_buffer_sync_model_t buffer_sync_model =
+      iree_hal_amdxdna_native_buffer_sync_model_t::caller_syncs_bindings;
+  uint32_t completion_models = 0;
+  bool supports_command_chain = false;
+  bool supports_submit_many = false;
+  bool supports_async_submit = false;
+  bool supports_external_buffer_import = false;
+  bool supports_external_buffer_export = false;
+  bool supports_real_multi_queue = false;
+  iree_hal_amdxdna_native_command_opcode_t default_dispatch_opcode =
+      iree_hal_amdxdna_native_command_opcode_t::start_cu;
+};
+
+enum class iree_hal_amdxdna_native_context_image_type_t : uint8_t {
+  pdi = 0,
+  xclbin,
+  xadx,
+};
+
+struct iree_hal_amdxdna_native_context_image_t {
+  iree_hal_amdxdna_native_context_image_type_t type =
+      iree_hal_amdxdna_native_context_image_type_t::pdi;
+  iree_const_byte_span_t pdi = {nullptr, 0};
+  iree_const_byte_span_t xclbin = {nullptr, 0};
+  iree_string_view_t kernel_name = {nullptr, 0};
+  uint32_t pdi_index = 0;
+  uint32_t xclbin_index = 0;
+  const void* platform_metadata = nullptr;
+  iree_host_size_t platform_metadata_length = 0;
+};
+
 struct iree_hal_amdxdna_native_cu_index_t {
   uint32_t index = 0;
 };
@@ -87,10 +149,32 @@ iree_status_t iree_hal_amdxdna_native_device_set_power_mode(
     iree_hal_amdxdna_native_device_t* device,
     iree_hal_amdxdna_native_power_mode_t power_mode);
 
+iree_status_t iree_hal_amdxdna_native_device_query_caps(
+    iree_hal_amdxdna_native_device_t* device,
+    iree_hal_amdxdna_native_device_caps_t* out_caps);
+
+bool iree_hal_amdxdna_native_device_supports_partial_elf_dispatch(
+    iree_hal_amdxdna_native_device_t* device);
+
+bool iree_hal_amdxdna_native_device_uses_npu_payload_dispatch(
+    iree_hal_amdxdna_native_device_t* device);
+
+bool iree_hal_amdxdna_native_device_syncs_bindings_on_submit(
+    iree_hal_amdxdna_native_device_t* device);
+
+iree_hal_amdxdna_native_command_opcode_t
+iree_hal_amdxdna_native_device_dispatch_opcode(
+    iree_hal_amdxdna_native_device_t* device);
+
 iree_status_t iree_hal_amdxdna_native_device_alloc_buffer(
     iree_hal_amdxdna_native_device_t* device, iree_device_size_t size,
     iree_hal_amdxdna_native_buffer_type_t type,
     iree_hal_amdxdna_native_buffer_ptr* out_buffer);
+
+iree_status_t iree_hal_amdxdna_native_device_create_context(
+    iree_hal_amdxdna_native_device_t* device,
+    const iree_hal_amdxdna_native_context_image_t* image,
+    iree_hal_amdxdna_native_context_t** out_context);
 
 iree_status_t iree_hal_amdxdna_native_device_create_context(
     iree_hal_amdxdna_native_device_t* device, iree_const_byte_span_t pdi,

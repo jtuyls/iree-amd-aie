@@ -408,22 +408,6 @@ int wmain(int argc, wchar_t** argv) {
     return 0;
   }
 
-  if (std::getenv("PROBE_CARVEOUT_ONLY")) {
-    // Isolate the 0x332c carveout allocation on a BARE device (no context) to
-    // distinguish "carveouts need a prerequisite" from "a prior context blocks".
-    mcdm::Buffer cv = {};
-    bool ok = mcdm::CreateBuffer(api, device, mcdm::BufferKind::carveout, 0x2000,
-                                 &cv, &error);
-    std::cout << "carveout_only.result=" << (ok ? "ok" : "fail");
-    if (ok)
-      std::cout << " gpu_va=0x" << std::hex << cv.gpu_va << std::dec;
-    else
-      std::cout << " error=" << error;
-    std::cout << "\n";
-    mcdm::DestroyDevice(api, &device);
-    return ok ? 0 : 1;
-  }
-
   if (stage == Stage::context || stage == Stage::aperture ||
       stage == Stage::submit || stage == Stage::ctxcmd) {
     bool ok = RunContextProbe(api, device, xclbin_path,

@@ -95,6 +95,7 @@ iree_cc_library(
   DEPS
     ::AIETargets
     ::AMDAIERT
+    iree-amd-aie::schemas::amdxdna_xclbin_executable_def_c_fbs
     iree-amd-aie::schemas::xrt_executable_def_c_fbs
     iree-amd-aie::schemas::pdi_executable_def_c_fbs
     iree::base::internal::flatcc::building

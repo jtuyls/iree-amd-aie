@@ -19,10 +19,16 @@ static iree_string_view_t iree_hal_amdxdna_executable_format() {
   return iree_make_cstring_view("amdaie-pdi-fb");
 }
 
+static iree_string_view_t iree_hal_amdxdna_xclbin_executable_format() {
+  return iree_make_cstring_view("amdaie-amdxdna-xclbin-fb");
+}
+
 static bool iree_hal_amdxdna_executable_format_supported(
     iree_string_view_t executable_format) {
   return iree_string_view_equal(executable_format,
-                                iree_hal_amdxdna_executable_format());
+                                iree_hal_amdxdna_executable_format()) ||
+         iree_string_view_equal(
+             executable_format, iree_hal_amdxdna_xclbin_executable_format());
 }
 }  // namespace
 

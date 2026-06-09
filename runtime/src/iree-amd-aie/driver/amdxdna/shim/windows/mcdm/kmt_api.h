@@ -24,11 +24,6 @@ enum class BufferKind {
   host_only,
   cacheable,
   execbuf,
-  // Firmware heap/carveout (CreateAllocation2 private_type 0x332c, xcl_flags
-  // 0x02000000). RE'd from xrt_core arg_bo ctor FUN_1800256e0: the AIE4 context
-  // setup needs two of these (0x2000 + 0x1000) GPU-mapped + resident, whose VAs
-  // form the private payload of the carveout CreateContextVirtual.
-  carveout,
 };
 
 struct BufferKindInfo {
@@ -128,12 +123,6 @@ struct Context {
   uint32_t completion_ring_offset = 0;
   uint64_t next_command_id = 1;
 
-  // Stale AIE4-heap experiment kept only for opt-in probes. The working XRT
-  // IREE matmul capture uses one xclbin context and one HW queue.
-  D3DKMT_HANDLE carveout_context = 0;
-  Buffer carveout_heap_large;  // 0x2000, private_type 0x332c
-  Buffer carveout_heap_small;  // 0x1000, private_type 0x332c
-  uint32_t aie4_firmware_handle = 0;  // driver writeback at payload+0x40
 };
 
 struct CommandAperture {

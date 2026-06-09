@@ -9,6 +9,9 @@
 
 #include "iree-amd-aie/driver/amdxdna/executable_internal.h"
 #include "iree-amd-aie/driver/amdxdna/util.h"
+#include "iree-amd-aie/driver/amdxdna/xclbin_util.h"
+#include "iree-amd-aie/schemas/amdxdna_xclbin_executable_def_reader.h"
+#include "iree-amd-aie/schemas/amdxdna_xclbin_executable_def_verifier.h"
 #include "iree-amd-aie/schemas/pdi_executable_def_reader.h"
 #include "iree-amd-aie/schemas/pdi_executable_def_verifier.h"
 #include "iree/base/api.h"
@@ -16,6 +19,10 @@
 
 namespace {
 extern const iree_hal_executable_vtable_t iree_hal_amdxdna_executable_vtable;
+static const iree_string_view_t kAMDXDNAPDIExecutableFormat =
+    iree_string_view_literal("amdaie-pdi-fb");
+static const iree_string_view_t kAMDXDNAXclbinExecutableFormat =
+    iree_string_view_literal("amdaie-amdxdna-xclbin-fb");
 }  // namespace
 
 IREE_FLAG(int32_t, amdxdna_n_kernel_runs, 1,
@@ -228,44 +235,6 @@ iree_amd_aie_hal_amdxdna_native_executable_flatbuffer_verify(
       z0, iree_hal_amdxdna_verify_int32_vec_len("pdi_indices", pdi_indices_vec,
                                                 entry_point_count));
 
-  if (iree_amd_aie_hal_amdxdna_ExecutableDef_xclbin_indices_is_present(
-          executable_def) ||
-      iree_amd_aie_hal_amdxdna_ExecutableDef_xclbins_is_present(
-          executable_def)) {
-    if (!iree_amd_aie_hal_amdxdna_ExecutableDef_xclbin_indices_is_present(
-            executable_def) ||
-        !iree_amd_aie_hal_amdxdna_ExecutableDef_xclbins_is_present(
-            executable_def)) {
-      IREE_TRACE_ZONE_END(z0);
-      return iree_make_status(
-          IREE_STATUS_INVALID_ARGUMENT,
-          "xclbin_indices and xclbins must both be present or both omitted");
-    }
-    flatbuffers_int32_vec_t xclbin_indices_vec =
-        iree_amd_aie_hal_amdxdna_ExecutableDef_xclbin_indices_get(
-            executable_def);
-    IREE_RETURN_AND_END_ZONE_IF_ERROR(
-        z0, iree_hal_amdxdna_verify_int32_vec_len(
-                "xclbin_indices", xclbin_indices_vec, entry_point_count));
-    iree_amd_aie_hal_amdxdna_XclbinDef_vec_t xclbins =
-        iree_amd_aie_hal_amdxdna_ExecutableDef_xclbins_get(executable_def);
-    size_t number_xclbin =
-        iree_amd_aie_hal_amdxdna_XclbinDef_vec_len(xclbins);
-    for (size_t i = 0; i < entry_point_count; ++i) {
-      int32_t xclbin_index =
-          flatbuffers_int32_vec_at(xclbin_indices_vec, i);
-      if (xclbin_index >= 0 &&
-          static_cast<size_t>(xclbin_index) >= number_xclbin) {
-        IREE_TRACE_ZONE_END(z0);
-        return iree_make_status(
-            IREE_STATUS_INVALID_ARGUMENT,
-            "entry point %zu xclbin index %d out of range; executable only "
-            "contains %zu xclbins",
-            i, xclbin_index, number_xclbin);
-      }
-    }
-  }
-
   iree_amd_aie_hal_amdxdna_UI32Array2dDef_vec_t asm_instr_runlist_vec =
       iree_amd_aie_hal_amdxdna_ExecutableDef_asm_instr_runlists_get(
           executable_def);
@@ -398,15 +367,164 @@ iree_amd_aie_hal_amdxdna_native_executable_flatbuffer_verify(
   return iree_ok_status();
 }
 
+static iree_status_t
+iree_amd_aie_hal_amdxdna_xclbin_executable_flatbuffer_verify(
+    iree_const_byte_span_t flatbuffer_data) {
+  IREE_TRACE_ZONE_BEGIN(z0);
+
+  if (!flatbuffer_data.data || flatbuffer_data.data_length < 16) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "flatbuffer data is not present or less than 16 bytes (%zu total)",
+        flatbuffer_data.data_length);
+  }
+
+  int verify_ret =
+      iree_amd_aie_hal_amdxdna_xclbin_ExecutableDef_verify_as_root(
+          flatbuffer_data.data, flatbuffer_data.data_length);
+  if (verify_ret != flatcc_verify_ok) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "flatbuffer verification failed: %s",
+                            flatcc_verify_error_string(verify_ret));
+  }
+
+  iree_amd_aie_hal_amdxdna_xclbin_ExecutableDef_table_t executable_def =
+      iree_amd_aie_hal_amdxdna_xclbin_ExecutableDef_as_root(
+          flatbuffer_data.data);
+
+  iree_amd_aie_hal_amdxdna_xclbin_XclbinDef_vec_t xclbins =
+      iree_amd_aie_hal_amdxdna_xclbin_ExecutableDef_xclbins_get(
+          executable_def);
+  size_t number_xclbin =
+      iree_amd_aie_hal_amdxdna_xclbin_XclbinDef_vec_len(xclbins);
+  if (number_xclbin == 0) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "no xclbin present");
+  }
+
+  iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_vec_t entry_points =
+      iree_amd_aie_hal_amdxdna_xclbin_ExecutableDef_entry_points_get(
+          executable_def);
+  size_t entry_point_count =
+      iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_vec_len(entry_points);
+  if (entry_point_count == 0) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "no entry points found in the executable");
+  }
+
+  for (size_t i = 0; i < entry_point_count; ++i) {
+    iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_table_t entry_point =
+        iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_vec_at(entry_points, i);
+    flatbuffers_string_t name =
+        iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_name_get(entry_point);
+    if (!flatbuffers_string_len(name)) {
+      IREE_TRACE_ZONE_END(z0);
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "executable entry point %zu has no name", i);
+    }
+
+    int32_t pdi_index =
+        iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_pdi_index_get(
+            entry_point);
+    int32_t xclbin_index =
+        iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_xclbin_index_get(
+            entry_point);
+    if ((pdi_index < 0) != (xclbin_index < 0)) {
+      IREE_TRACE_ZONE_END(z0);
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "entry point %zu must either reference an xclbin context and PDI "
+          "index or neither",
+          i);
+    }
+    if (xclbin_index >= 0 &&
+        static_cast<size_t>(xclbin_index) >= number_xclbin) {
+      IREE_TRACE_ZONE_END(z0);
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "entry point %zu xclbin index %d out of range; executable only "
+          "contains %zu xclbins",
+          i, xclbin_index, number_xclbin);
+    }
+
+    iree_amd_aie_hal_amdxdna_xclbin_RunDef_vec_t runs =
+        iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_runs_get(entry_point);
+    size_t run_count = iree_amd_aie_hal_amdxdna_xclbin_RunDef_vec_len(runs);
+    if (run_count == 0) {
+      IREE_TRACE_ZONE_END(z0);
+      return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                              "entry point %zu has no runs", i);
+    }
+
+    size_t payload_run_count = 0;
+    for (size_t j = 0; j < run_count; ++j) {
+      iree_amd_aie_hal_amdxdna_xclbin_RunDef_table_t run =
+          iree_amd_aie_hal_amdxdna_xclbin_RunDef_vec_at(runs, j);
+      flatbuffers_uint32_vec_t control_code =
+          iree_amd_aie_hal_amdxdna_xclbin_RunDef_control_code_get(run);
+      if (!control_code || flatbuffers_uint32_vec_len(control_code) == 0) {
+        IREE_TRACE_ZONE_END(z0);
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "entry point %zu run %zu has no control code", i, j);
+      }
+      flatbuffers_uint32_vec_t patch_table =
+          iree_amd_aie_hal_amdxdna_xclbin_RunDef_patch_table_get(run);
+      if (patch_table && flatbuffers_uint32_vec_len(patch_table) % 3 != 0) {
+        IREE_TRACE_ZONE_END(z0);
+        return iree_make_status(
+            IREE_STATUS_INVALID_ARGUMENT,
+            "entry point %zu run %zu patch table length is not a multiple of 3",
+            i, j);
+      }
+      flatbuffers_uint32_vec_t data_payload =
+          iree_amd_aie_hal_amdxdna_xclbin_RunDef_data_payload_get(run);
+      if (data_payload && flatbuffers_uint32_vec_len(data_payload) != 0) {
+        if ((j & 1) != 0) {
+          IREE_TRACE_ZONE_END(z0);
+          return iree_make_status(
+              IREE_STATUS_INVALID_ARGUMENT,
+              "entry point %zu reconfiguration payload run %zu is not in an "
+              "even reconfiguration slot",
+              i, j);
+        }
+        ++payload_run_count;
+      }
+    }
+    if (payload_run_count != 0 && run_count != 2 * payload_run_count) {
+      IREE_TRACE_ZONE_END(z0);
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "entry point %zu has %zu runs but %zu reconfiguration payloads; "
+          "expected paired reconfiguration/execution runs",
+          i, run_count, payload_run_count);
+    }
+  }
+
+  IREE_TRACE_ZONE_END(z0);
+  return iree_ok_status();
+}
+
 iree_status_t iree_hal_amdxdna_native_executable_infer_format(
     iree_const_byte_span_t executable_data,
     iree_host_size_t executable_format_capacity, char* executable_format,
     iree_host_size_t* out_inferred_size) {
-  IREE_RETURN_IF_ERROR(
+  iree_string_view_t format = kAMDXDNAPDIExecutableFormat;
+  iree_status_t status =
       iree_amd_aie_hal_amdxdna_native_executable_flatbuffer_verify(
-          executable_data));
+          executable_data);
+  if (!iree_status_is_ok(status)) {
+    iree_status_free(status);
+    status = iree_amd_aie_hal_amdxdna_xclbin_executable_flatbuffer_verify(
+        executable_data);
+    if (!iree_status_is_ok(status)) return status;
+    format = kAMDXDNAXclbinExecutableFormat;
+  }
 
-  iree_string_view_t format = IREE_SV("amdaie-pdi-fb");
   if (format.size >= executable_format_capacity) {
     return iree_make_status(IREE_STATUS_OUT_OF_RANGE,
                             "executable format buffer too small");
@@ -440,6 +558,142 @@ static iree_status_t iree_amd_aie_hal_amdxdna_executable_parse_UI32Array2dDef(
   return iree_ok_status();
 }
 
+static std::vector<uint8_t> iree_hal_amdxdna_flatbuffer_string_to_bytes(
+    flatbuffers_string_t value) {
+  return std::vector<uint8_t>(value, value + flatbuffers_string_len(value));
+}
+
+static std::vector<uint32_t> iree_hal_amdxdna_flatbuffer_uint32_vec_to_vector(
+    flatbuffers_uint32_vec_t vec) {
+  if (!vec) return {};
+  size_t length = flatbuffers_uint32_vec_len(vec);
+  return std::vector<uint32_t>(vec, vec + length);
+}
+
+static iree_status_t iree_hal_amdxdna_native_xclbin_executable_create(
+    const iree_hal_executable_params_t* executable_params,
+    iree_allocator_t host_allocator, uint32_t n_kernel_runs,
+    uint32_t n_reconfigure_runs, uint32_t n_pdi_loads,
+    iree_hal_executable_t** out_executable) {
+  IREE_TRACE_ZONE_BEGIN(z0);
+
+  *out_executable = nullptr;
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_amd_aie_hal_amdxdna_xclbin_executable_flatbuffer_verify(
+              executable_params->executable_data));
+
+  iree_amd_aie_hal_amdxdna_xclbin_ExecutableDef_table_t executable_def =
+      iree_amd_aie_hal_amdxdna_xclbin_ExecutableDef_as_root(
+          executable_params->executable_data.data);
+  iree_amd_aie_hal_amdxdna_xclbin_XclbinDef_vec_t xclbins_vec =
+      iree_amd_aie_hal_amdxdna_xclbin_ExecutableDef_xclbins_get(
+          executable_def);
+  iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_vec_t entry_points_vec =
+      iree_amd_aie_hal_amdxdna_xclbin_ExecutableDef_entry_points_get(
+          executable_def);
+  iree_host_size_t entry_point_count =
+      iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_vec_len(entry_points_vec);
+
+  iree_hal_amdxdna_executable* executable = nullptr;
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(
+      z0, iree_allocator_malloc(host_allocator, sizeof(*executable),
+                                reinterpret_cast<void**>(&executable)));
+  new (executable) iree_hal_amdxdna_executable();
+
+  iree_hal_resource_initialize(&iree_hal_amdxdna_executable_vtable,
+                               &executable->resource);
+  executable->host_allocator = host_allocator;
+  executable->entry_point_count = entry_point_count;
+  executable->entry_points.resize(entry_point_count);
+
+  iree_status_t status = iree_ok_status();
+  for (iree_host_size_t entry_ordinal = 0; entry_ordinal < entry_point_count;
+       ++entry_ordinal) {
+    iree_hal_amdxdna_kernel_params* params =
+        &executable->entry_points[entry_ordinal];
+    params->n_kernel_runs = n_kernel_runs;
+    params->n_reconfigure_runs = n_reconfigure_runs;
+    params->n_pdi_loads = n_pdi_loads;
+
+    iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_table_t entry_point =
+        iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_vec_at(
+            entry_points_vec, entry_ordinal);
+    flatbuffers_string_t name =
+        iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_name_get(entry_point);
+    params->kernel_name.assign(name, name + flatbuffers_string_len(name));
+
+    int32_t xclbin_index =
+        iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_xclbin_index_get(
+            entry_point);
+    if (xclbin_index >= 0) {
+      iree_amd_aie_hal_amdxdna_xclbin_XclbinDef_table_t xclbin_def =
+          iree_amd_aie_hal_amdxdna_xclbin_XclbinDef_vec_at(xclbins_vec,
+                                                           xclbin_index);
+      params->xclbin = iree_hal_amdxdna_flatbuffer_string_to_bytes(
+          iree_amd_aie_hal_amdxdna_xclbin_XclbinDef_xclbin_get(xclbin_def));
+    }
+    int32_t pdi_index =
+        iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_pdi_index_get(
+            entry_point);
+    if (pdi_index >= 0) {
+      status = iree_hal_amdxdna_xclbin_extract_pdi(
+          iree_make_const_byte_span(params->xclbin.data(),
+                                    params->xclbin.size()),
+          static_cast<uint32_t>(pdi_index), &params->pdi);
+      if (!iree_status_is_ok(status)) goto fail;
+    }
+
+    iree_amd_aie_hal_amdxdna_xclbin_RunDef_vec_t runs =
+        iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_runs_get(entry_point);
+    size_t run_count = iree_amd_aie_hal_amdxdna_xclbin_RunDef_vec_len(runs);
+    params->asm_inst_runlist.reserve(run_count);
+    params->patch_runlist.reserve(run_count);
+    for (size_t run_ordinal = 0; run_ordinal < run_count; ++run_ordinal) {
+      iree_amd_aie_hal_amdxdna_xclbin_RunDef_table_t run =
+          iree_amd_aie_hal_amdxdna_xclbin_RunDef_vec_at(runs, run_ordinal);
+      params->asm_inst_runlist.push_back(
+          iree_hal_amdxdna_flatbuffer_uint32_vec_to_vector(
+              iree_amd_aie_hal_amdxdna_xclbin_RunDef_control_code_get(run)));
+      params->patch_runlist.push_back(
+          iree_hal_amdxdna_flatbuffer_uint32_vec_to_vector(
+              iree_amd_aie_hal_amdxdna_xclbin_RunDef_patch_table_get(run)));
+      flatbuffers_uint32_vec_t data_payload =
+          iree_amd_aie_hal_amdxdna_xclbin_RunDef_data_payload_get(run);
+      if (data_payload && flatbuffers_uint32_vec_len(data_payload) != 0) {
+        params->reconf_data_runlist.push_back(
+            iree_hal_amdxdna_flatbuffer_uint32_vec_to_vector(data_payload));
+      }
+    }
+
+    IREE_TRACE({
+      iree_amd_aie_hal_amdxdna_xclbin_FileLineLocDef_table_t source_loc =
+          iree_amd_aie_hal_amdxdna_xclbin_EntryPointDef_source_location_get(
+              entry_point);
+      if (source_loc) {
+        flatbuffers_string_t filename =
+            iree_amd_aie_hal_amdxdna_xclbin_FileLineLocDef_filename_get(
+                source_loc);
+        uint32_t line =
+            iree_amd_aie_hal_amdxdna_xclbin_FileLineLocDef_line_get(
+                source_loc);
+        params->source_filename =
+            iree_make_string_view(filename, flatbuffers_string_len(filename));
+        params->source_line = line;
+      }
+    });
+  }
+
+  *out_executable = reinterpret_cast<iree_hal_executable_t*>(executable);
+  IREE_TRACE_ZONE_END(z0);
+  return iree_ok_status();
+
+fail:
+  executable->~iree_hal_amdxdna_executable();
+  iree_allocator_free(host_allocator, executable);
+  IREE_TRACE_ZONE_END(z0);
+  return status;
+}
+
 iree_status_t iree_hal_amdxdna_native_executable_create(
     iree_hal_amdxdna_native_device_t* native_device,
     const iree_hal_executable_params_t* executable_params,
@@ -468,6 +722,14 @@ iree_status_t iree_hal_amdxdna_native_executable_create(
   *out_executable = nullptr;
   iree_hal_amdxdna_executable* executable = nullptr;
 
+  if (iree_string_view_equal(executable_params->executable_format,
+                             kAMDXDNAXclbinExecutableFormat)) {
+    IREE_TRACE_ZONE_END(z0);
+    return iree_hal_amdxdna_native_xclbin_executable_create(
+        executable_params, host_allocator, n_kernel_runs, n_reconfigure_runs,
+        n_pdi_loads, out_executable);
+  }
+
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_amd_aie_hal_amdxdna_native_executable_flatbuffer_verify(
               executable_params->executable_data));
@@ -487,16 +749,6 @@ iree_status_t iree_hal_amdxdna_native_executable_create(
       iree_amd_aie_hal_amdxdna_ExecutableDef_entry_points_get(executable_def);
   iree_amd_aie_hal_amdxdna_PdiDef_vec_t pdis_vec =
       iree_amd_aie_hal_amdxdna_ExecutableDef_pdis_get(executable_def);
-  flatbuffers_int32_vec_t xclbin_indices_vec =
-      iree_amd_aie_hal_amdxdna_ExecutableDef_xclbin_indices_is_present(
-          executable_def)
-          ? iree_amd_aie_hal_amdxdna_ExecutableDef_xclbin_indices_get(
-                executable_def)
-          : nullptr;
-  iree_amd_aie_hal_amdxdna_XclbinDef_vec_t xclbins_vec =
-      iree_amd_aie_hal_amdxdna_ExecutableDef_xclbins_is_present(executable_def)
-          ? iree_amd_aie_hal_amdxdna_ExecutableDef_xclbins_get(executable_def)
-          : nullptr;
   iree_amd_aie_hal_amdxdna_UI32Array2dDef_vec_t asm_instr_runlists_vec =
       iree_amd_aie_hal_amdxdna_ExecutableDef_asm_instr_runlists_get(
           executable_def);
@@ -549,21 +801,6 @@ iree_status_t iree_hal_amdxdna_native_executable_create(
       std::vector<uint8_t> pdiVector(pdi_fb,
                                      pdi_fb + flatbuffers_string_len(pdi_fb));
       params->pdi = pdiVector;
-    }
-
-    if (xclbin_indices_vec) {
-      int32_t xclbin_index =
-          flatbuffers_int32_vec_at(xclbin_indices_vec, entry_ordinal);
-      if (xclbin_index >= 0) {
-        iree_amd_aie_hal_amdxdna_XclbinDef_table_t xclbin_def =
-            iree_amd_aie_hal_amdxdna_XclbinDef_vec_at(xclbins_vec,
-                                                      xclbin_index);
-        flatbuffers_string_t xclbin_fb =
-            iree_amd_aie_hal_amdxdna_XclbinDef_xclbin_get(xclbin_def);
-        std::vector<uint8_t> xclbinVector(
-            xclbin_fb, xclbin_fb + flatbuffers_string_len(xclbin_fb));
-        params->xclbin = xclbinVector;
-      }
     }
 
     // Get the asm instructions runlist for the current entry point, and store

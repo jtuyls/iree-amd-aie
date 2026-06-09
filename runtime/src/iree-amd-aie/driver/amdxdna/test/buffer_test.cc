@@ -56,10 +56,9 @@ static iree_status_t CountingAllocatorCtl(void* self,
 
 TEST(BufferTest, WrapStoresHostAllocatorForDestroy) {
   CountingAllocatorState state;
-  iree_allocator_t allocator = {
-      .self = &state,
-      .ctl = CountingAllocatorCtl,
-  };
+  iree_allocator_t allocator = {};
+  allocator.self = &state;
+  allocator.ctl = CountingAllocatorCtl;
 
   iree_hal_buffer_t* buffer = nullptr;
   IREE_ASSERT_OK(iree_hal_amdxdna_buffer_wrap(
