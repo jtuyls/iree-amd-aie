@@ -6,6 +6,7 @@
 
 #include "iree-amd-aie/driver/amdxdna/buffer.h"
 
+#include <cstring>
 #include <limits>
 
 #include "iree-amd-aie/driver/amdxdna/util.h"
@@ -199,6 +200,7 @@ iree_status_t iree_hal_amdxdna_buffer_wrap(
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_allocator_malloc(host_allocator, sizeof(*buffer),
                                 reinterpret_cast<void**>(&buffer)));
+  memset(buffer, 0, sizeof(*buffer));
   iree_hal_buffer_initialize(placement, &buffer->base, allocation_size,
                              byte_offset, byte_length, memory_type,
                              allowed_access, allowed_usage,
@@ -225,7 +227,9 @@ static void iree_hal_amdxdna_buffer_destroy(iree_hal_buffer_t* base_buffer) {
                                 base_buffer);
   }
 
-  iree_hal_amdxdna_native_buffer_destroy(buffer->native_buffer);
+  if (buffer->native_buffer) {
+    iree_hal_amdxdna_native_buffer_destroy(buffer->native_buffer);
+  }
   iree_allocator_free(host_allocator, buffer);
 
   IREE_TRACE_ZONE_END(z0);
@@ -242,6 +246,19 @@ iree_hal_amdxdna_native_buffer_t* iree_hal_amdxdna_buffer_handle(
   return buffer->native_buffer;
 }
 
+iree_hal_amdxdna_native_buffer_t* iree_hal_amdxdna_buffer_steal_native_buffer(
+    iree_hal_buffer_t* base_buffer) {
+  IREE_TRACE_ZONE_BEGIN(z0);
+
+  iree_hal_amdxdna_buffer* buffer = IREE_HAL_AMDXDNA_CHECKED_VTABLE_CAST(
+      base_buffer, iree_hal_amdxdna_buffer_vtable, iree_hal_amdxdna_buffer);
+  iree_hal_amdxdna_native_buffer_t* native_buffer = buffer->native_buffer;
+  buffer->native_buffer = nullptr;
+
+  IREE_TRACE_ZONE_END(z0);
+  return native_buffer;
+}
+
 bool iree_hal_amdxdna_buffer_is_deallocated(iree_hal_buffer_t* base_buffer) {
   if (!base_buffer) return false;
   iree_hal_amdxdna_buffer* buffer = IREE_HAL_AMDXDNA_CHECKED_VTABLE_CAST(
@@ -249,8 +266,20 @@ bool iree_hal_amdxdna_buffer_is_deallocated(iree_hal_buffer_t* base_buffer) {
   return iree_atomic_load(&buffer->deallocated, iree_memory_order_acquire) != 0;
 }
 
+void iree_hal_amdxdna_buffer_mark_allocated(iree_hal_buffer_t* base_buffer) {
+  if (!base_buffer) return;
+  iree_hal_amdxdna_buffer* buffer = IREE_HAL_AMDXDNA_CHECKED_VTABLE_CAST(
+      base_buffer, iree_hal_amdxdna_buffer_vtable, iree_hal_amdxdna_buffer);
+  iree_atomic_store(&buffer->deallocated, (uint32_t)0,
+                    iree_memory_order_release);
+}
+
 void iree_hal_amdxdna_buffer_mark_deallocated(iree_hal_buffer_t* base_buffer) {
   if (!base_buffer) return;
+  // Generic IREE allocator pooling recycles the whole HAL buffer object and has
+  // no backend reset hook. Avoid leaving a one-way backend marker on objects
+  // that may be returned as fresh allocations from a pooling allocator.
+  if (base_buffer->pooling_allocator) return;
   iree_hal_amdxdna_buffer* buffer = IREE_HAL_AMDXDNA_CHECKED_VTABLE_CAST(
       base_buffer, iree_hal_amdxdna_buffer_vtable, iree_hal_amdxdna_buffer);
   iree_atomic_store(&buffer->deallocated, (uint32_t)1,

@@ -621,3 +621,14 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
       IREE_STATUS_INTERNAL, "amdxdna %.*s did not complete: ert state %u",
       static_cast<int>(label.size), label.data, packet->state);
 }
+
+iree_status_t iree_hal_amdxdna_native_queue_submit_all_and_wait(
+    iree_hal_amdxdna_native_queue_t* queue,
+    iree_hal_amdxdna_native_command_t* const* commands,
+    iree_host_size_t command_count, iree_string_view_t label) {
+  for (iree_host_size_t i = 0; i < command_count; ++i) {
+    IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_queue_submit_and_wait(
+        queue, commands[i], label));
+  }
+  return iree_ok_status();
+}

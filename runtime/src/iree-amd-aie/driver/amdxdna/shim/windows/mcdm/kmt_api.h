@@ -167,6 +167,15 @@ struct PathBChainSubmitInfo {
   uint32_t first_child_opcode = 0;
 };
 
+struct PathBPendingSubmit {
+  uint64_t fence_id = 0;
+  uint8_t* slot_cpu = nullptr;
+  uint32_t slot_offset = 0;
+  uint32_t* packet_header = nullptr;
+  Buffer exec_buffer;
+  Buffer ring;
+};
+
 bool FindNpuAdapter(const KmtApi& api, Adapter* out_adapter,
                     std::string* out_error);
 
@@ -265,6 +274,18 @@ bool SubmitAndWaitPathBChain(const KmtApi& api, const Device& device,
                              const void* ert_packet, uint32_t ert_bytes,
                              const PathBChainSubmitInfo& chain_info,
                              uint32_t* packet_header, std::string* out_error);
+
+bool SubmitPathBChain(const KmtApi& api, const Device& device,
+                      Context* context, const Buffer& exec_buffer,
+                      const void* ert_packet, uint32_t ert_bytes,
+                      const PathBChainSubmitInfo& chain_info,
+                      uint32_t* packet_header,
+                      PathBPendingSubmit* out_pending,
+                      std::string* out_error);
+
+bool WaitForPathBSubmits(const KmtApi& api, const Device& device,
+                         Context* context, PathBPendingSubmit* pending,
+                         size_t pending_count, std::string* out_error);
 
 // Stale probe path retained for diagnostics only. The working XRT IREE matmul
 // capture uses opcode 2/5/9 setup packets, not opcode 10.

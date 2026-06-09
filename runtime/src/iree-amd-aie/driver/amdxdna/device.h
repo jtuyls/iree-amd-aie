@@ -17,6 +17,7 @@
 
 struct iree_async_proactor_pool_t;
 struct iree_async_proactor_t;
+struct iree_hal_amdxdna_device_chain_command_cache_t;
 struct iree_hal_amdxdna_device_context_cache_t;
 struct iree_hal_amdxdna_native_device_t;
 
@@ -64,6 +65,12 @@ struct iree_hal_amdxdna_device {
   // Native hardware-context cache for control-packet bootstrap PDIs.
   // Implementation-private so HAL-facing code does not expose STL maps/locks.
   iree_hal_amdxdna_device_context_cache_t* pdi_context_cache;
+#if defined(_WIN32)
+  // Native parent-chain cache for Windows MCDM module-style command chains.
+  // Implementation-private and device-owned so cached command BOs cannot outlive
+  // the native device/context they belong to.
+  iree_hal_amdxdna_device_chain_command_cache_t* mcdm_chain_command_cache;
+#endif  // defined(_WIN32)
   // Maximum slots that fit in one ERT_CMD_CHAIN exec BO (constant per device).
   // Lazily computed on first flush; the chain flush splits into this many
   // slots per submitted chain. Atomic because a multi-worker submission path

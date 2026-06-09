@@ -15,6 +15,7 @@ iree_cc_test(
     iree-amd-aie::driver::amdxdna::amdxdna
     iree::base
     iree::hal
+    iree::hal::utils::caching_allocator
     iree::testing::gtest
     iree::testing::gtest_main
 )

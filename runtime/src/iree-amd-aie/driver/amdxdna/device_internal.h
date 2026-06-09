@@ -23,4 +23,12 @@ iree_status_t iree_hal_amdxdna_device_get_or_create_context(
     iree_const_byte_span_t xclbin, iree_string_view_t kernel_name,
     std::shared_ptr<iree_hal_amdxdna_native_context_t>* out_context);
 
+#if defined(_WIN32)
+// Releases the device-owned Windows MCDM parent-chain command cache. Defined by
+// direct_command_buffer.cc because the cache owns command-buffer implementation
+// details.
+void iree_hal_amdxdna_device_destroy_chain_command_cache(
+    iree_hal_amdxdna_device* device);
+#endif  // defined(_WIN32)
+
 #endif  // IREE_AMD_AIE_DRIVER_AMDXDNA_DEVICE_INTERNAL_H_

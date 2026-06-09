@@ -61,15 +61,24 @@ constexpr uint32_t kWindowsDpuRegmapWords = 17;
 constexpr uint32_t kWindowsDpuInstructionRegWord = 2;
 constexpr uint64_t kWindowsDpuInstructionApertureOffset = 0x8000;
 constexpr uint64_t kWindowsDpuAperturePacketOffset = 0;
-constexpr size_t kWindowsDpuChainCodeAlignment = 64;
+// XRT's module-runlist path presents each START_NPU child instruction stream at
+// a 0x8000-spaced aperture VA (0x04008000, 0x04010000, ...). The path-B parent
+// chain descriptor is accepted for one packed child, but multi-child START_NPU
+// chains fail unless we preserve this slot cadence.
+constexpr size_t kWindowsDpuChainCodeAlignment = 0x8000;
 constexpr uint64_t kWindowsDpuChainDescriptorApertureOffset = 0x10000;
-constexpr size_t kWindowsDpuChainDescriptorScratchSize = 0x1000;
 constexpr size_t kWindowsDpuChainDescriptorHeaderSize = 0x34;
+constexpr size_t kWindowsDpuStartNpuChainDescriptorSize = 0x3c;
+// XRT runlists are logically unbounded but internally submitted in fixed-size
+// ERT_CMD_CHAIN chunks. XRT 2.19 hardwires that native submit chunk size to 24,
+// so the Windows MCDM shim uses the same value for now. The recovered path-B
+// descriptor envelope has observed headroom up to 34 children, but 34 is not the
+// default until we can prove it is compatible with XRT's intended contract.
+// This is a per-native-submit chunk size, not a logical command-chain limit;
+// larger logical chains are split by direct_command_buffer.cc before reaching
+// this layer.
 constexpr size_t kWindowsDpuRunlistSubmitSize = 24;
 constexpr uint64_t kWindowsDpuPathBExecBoSize = 0xe0;
-constexpr uint64_t kWindowsDpuPathBChainExecBoSize =
-    sizeof(ert_packet) + sizeof(ert_cmd_chain_data) +
-    kWindowsDpuRunlistSubmitSize * sizeof(uint64_t);
 
 struct SubmitTimingStats {
   std::atomic<uint64_t> count{0};
@@ -83,7 +92,20 @@ SubmitTimingStats& submit_timing_stats() {
   return stats;
 }
 
+uint64_t submit_timing_skip_count() {
+  static uint64_t skip_count = []() -> uint64_t {
+    const char* value = std::getenv("IREE_AMDXDNA_BENCH_SUBMIT_TIMING_SKIP");
+    if (!value || !*value) return 0;
+    char* end = nullptr;
+    return static_cast<uint64_t>(std::strtoull(value, &end, 0));
+  }();
+  return skip_count;
+}
+
 void record_submit_timing(uint64_t ns) {
+  static std::atomic<uint64_t> seen{0};
+  const uint64_t seen_index = seen.fetch_add(1, std::memory_order_relaxed);
+  if (seen_index < submit_timing_skip_count()) return;
   auto& stats = submit_timing_stats();
   stats.count.fetch_add(1, std::memory_order_relaxed);
   stats.total_ns.fetch_add(ns, std::memory_order_relaxed);
@@ -187,6 +209,22 @@ bool env_flag_enabled(const char* name) {
          std::strcmp(value, "YES") == 0;
 }
 
+bool env_flag_enabled_by_default(const char* name) {
+  const char* value = std::getenv(name);
+  if (!value) return true;
+  if (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+      std::strcmp(value, "FALSE") == 0 || std::strcmp(value, "no") == 0 ||
+      std::strcmp(value, "NO") == 0) {
+    return false;
+  }
+  return true;
+}
+
+uint64_t windows_dpu_pathb_chain_exec_bo_size() {
+  return sizeof(ert_packet) + sizeof(ert_cmd_chain_data) +
+         kWindowsDpuRunlistSubmitSize * sizeof(uint64_t);
+}
+
 bool zero_instruction_size_enabled() {
   static bool enabled = env_flag_enabled("IREE_AMDXDNA_BENCH_ZERO_INSTR_SIZE");
   return enabled;
@@ -231,6 +269,36 @@ bool skip_pathb_bound_sync_enabled() {
 bool skip_pathb_exec_sync_enabled() {
   static bool enabled =
       env_flag_enabled("IREE_AMDXDNA_MCDM_SKIP_PATHB_EXEC_SYNC");
+  return enabled;
+}
+
+bool pathb_chain_sync9_enabled() {
+  static bool enabled =
+      env_flag_enabled("IREE_AMDXDNA_MCDM_CHAIN_SYNC9");
+  return enabled;
+}
+
+bool skip_clean_chain_sync_enabled() {
+  static bool enabled =
+      env_flag_enabled_by_default("IREE_AMDXDNA_MCDM_SKIP_CLEAN_CHAIN_SYNC");
+  return enabled;
+}
+
+bool partial_elf_dummy_bos_enabled() {
+  static bool enabled =
+      env_flag_enabled_by_default("IREE_AMDXDNA_MCDM_PARTIAL_ELF_DUMMY_BOS");
+  return enabled;
+}
+
+bool partial_elf_bo_table_enabled() {
+  static bool enabled =
+      env_flag_enabled_by_default("IREE_AMDXDNA_MCDM_PARTIAL_ELF_BO_TABLE");
+  return enabled;
+}
+
+bool compact_execbuf_enabled() {
+  static bool enabled =
+      env_flag_enabled_by_default("IREE_AMDXDNA_MCDM_COMPACT_EXECBUF");
   return enabled;
 }
 
@@ -476,6 +544,7 @@ struct iree_hal_amdxdna_native_device_t {
   DiagnosticStage diagnostic_stop_after = DiagnosticStage::none;
   SubmitMode submit_mode = SubmitMode::direct;
   bool pathb_context_ready = false;
+  std::vector<iree_hal_amdxdna_native_buffer_ptr> partial_elf_dummy_buffers;
 
   iree_hal_amdxdna_native_device_t(iree_allocator_t host_allocator,
                                    DiagnosticStage diagnostic_stop_after,
@@ -568,11 +637,20 @@ struct iree_hal_amdxdna_native_command_t {
   bool windows_dpu_regmap_finalized = false;
   bool pathb_code_staged = false;
   iree_device_size_t pathb_code_staged_size = 0;
+  uint64_t pathb_chain_descriptor_gpu_va = 0;
   uint32_t pathb_chain_descriptor_bytes = 0;
   uint32_t pathb_chain_first_child_opcode = 0;
+  uint64_t pathb_chain_code_used_size = 0;
+  uint64_t pathb_chain_code_aperture_offset = 0;
+  uint64_t pathb_chain_descriptor_aperture_offset = 0;
+  bool pathb_chain_allow_code_dedup = true;
+  bool pathb_chain_prepared_valid = false;
+  bool pathb_chain_code_dirty = false;
+  bool pathb_chain_descriptor_dirty = false;
+  bool pathb_chain_bound_residency_checked = false;
+  std::vector<size_t> pathb_chain_child_code_offsets;
   std::vector<iree_hal_amdxdna_native_command_t*> chain_children;
   std::vector<BoundBuffer> bound_buffers;
-  std::vector<iree_hal_amdxdna_native_buffer_ptr> partial_elf_dummy_buffers;
 
   iree_hal_amdxdna_native_command_t(
       iree_hal_amdxdna_native_device_t* device,
@@ -1113,10 +1191,11 @@ bool uses_partial_elf_npu_packet(
 iree_status_t ensure_partial_elf_dummy_buffers(
     iree_hal_amdxdna_native_command_t* command) {
   if (!uses_partial_elf_npu_packet(command) ||
-      !env_flag_enabled("IREE_AMDXDNA_MCDM_PARTIAL_ELF_DUMMY_BOS")) {
+      !partial_elf_dummy_bos_enabled()) {
     return iree_ok_status();
   }
-  while (command->partial_elf_dummy_buffers.size() < 3) {
+  auto& dummy_buffers = command->device->partial_elf_dummy_buffers;
+  while (dummy_buffers.size() < 3) {
     iree_hal_amdxdna_native_buffer_ptr dummy;
     IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_device_alloc_buffer(
         command->device, /*size=*/4,
@@ -1126,7 +1205,7 @@ iree_status_t ensure_partial_elf_dummy_buffers(
     std::memset(ptr, 0, 4);
     IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
         dummy.get(), iree_hal_amdxdna_native_sync_direction_t::host_to_device));
-    command->partial_elf_dummy_buffers.push_back(std::move(dummy));
+    dummy_buffers.push_back(std::move(dummy));
   }
   return iree_ok_status();
 }
@@ -1134,7 +1213,7 @@ iree_status_t ensure_partial_elf_dummy_buffers(
 iree_status_t maybe_write_partial_elf_bo_table(
     iree_hal_amdxdna_native_command_t* command) {
   if (!uses_partial_elf_npu_packet(command) ||
-      !env_flag_enabled("IREE_AMDXDNA_MCDM_PARTIAL_ELF_BO_TABLE")) {
+      !partial_elf_bo_table_enabled()) {
     return iree_ok_status();
   }
 
@@ -1171,11 +1250,12 @@ iree_status_t maybe_write_partial_elf_bo_table(
     words[kBoTableWordOffset + 2 * table_index + 1] =
         static_cast<uint32_t>(gpu_va >> 32);
   }
-  for (size_t i = 0; i < command->partial_elf_dummy_buffers.size() &&
+  const auto& dummy_buffers = command->device->partial_elf_dummy_buffers;
+  for (size_t i = 0; i < dummy_buffers.size() &&
                      i < kBoTableEntries - 3;
        ++i) {
     uint64_t gpu_va = iree_hal_amdxdna_native_buffer_device_address(
-        command->partial_elf_dummy_buffers[i].get());
+        dummy_buffers[i].get());
     const size_t table_index = 3 + i;
     words[kBoTableWordOffset + 2 * table_index] =
         static_cast<uint32_t>(gpu_va);
@@ -1395,9 +1475,99 @@ iree_status_t append_pathb_start_cu_chain_descriptor(
   return iree_ok_status();
 }
 
+iree_status_t append_pathb_start_npu_chain_descriptor(
+    iree_hal_amdxdna_native_command_t* child, uint8_t* descriptor_base,
+    size_t descriptor_capacity, size_t* descriptor_used) {
+  ert_start_kernel_cmd* start = command_start_packet(child);
+  if (IREE_UNLIKELY(start->opcode != ERT_START_NPU)) {
+    return iree_make_status(
+        IREE_STATUS_UNIMPLEMENTED,
+        "amdxdna Windows MCDM path-B START_NPU chain descriptor received a "
+        "non-START_NPU child");
+  }
+  ert_npu_data* npu_data = get_ert_npu_data(start);
+  if (IREE_UNLIKELY(!npu_data)) {
+    return iree_make_status(
+        IREE_STATUS_INVALID_ARGUMENT,
+        "amdxdna Windows MCDM path-B START_NPU chain child has no NPU data");
+  }
+  if (IREE_UNLIKELY(*descriptor_used > descriptor_capacity ||
+                    kWindowsDpuStartNpuChainDescriptorSize >
+                        descriptor_capacity - *descriptor_used)) {
+    return iree_make_status(
+        IREE_STATUS_RESOURCE_EXHAUSTED,
+        "amdxdna Windows MCDM path-B START_NPU chain descriptor block exceeds "
+        "0x%zx bytes",
+        descriptor_capacity);
+  }
+
+  const uint32_t* args = get_ert_regmap_begin(start);
+  const uint32_t* args_end = get_ert_regmap_end(start);
+  const ptrdiff_t arg_words = args_end >= args ? args_end - args : 0;
+  const uint32_t selector = arg_words > 0 ? args[0] : 0;
+  const uint32_t selector_hi = arg_words > 1 ? args[1] : 0;
+
+  uint32_t words[kWindowsDpuStartNpuChainDescriptorSize / sizeof(uint32_t)] =
+      {};
+  words[0] = 2;
+  words[1] = static_cast<uint32_t>(npu_data->instruction_buffer);
+  words[2] = static_cast<uint32_t>(npu_data->instruction_buffer >> 32);
+  words[7] = npu_data->instruction_buffer_size;
+  words[12] = 2;
+  words[13] = selector;
+  words[14] = selector_hi;
+
+  std::memcpy(descriptor_base + *descriptor_used, words, sizeof(words));
+  *descriptor_used += sizeof(words);
+  return iree_ok_status();
+}
+
+iree_status_t get_pathb_chain_region_sizes(
+    iree_hal_amdxdna_native_command_t* chain_command, size_t* out_code_bytes,
+    size_t* out_descriptor_bytes) {
+  size_t code_offset = 0;
+  size_t descriptor_bytes = 0;
+  for (iree_hal_amdxdna_native_command_t* child :
+       chain_command->chain_children) {
+    code_offset = align_up_size(code_offset, kWindowsDpuChainCodeAlignment);
+    code_offset += static_cast<size_t>(child->control_buffer_size);
+
+    ert_start_kernel_cmd* start = command_start_packet(child);
+    if (start->opcode == ERT_START_NPU) {
+      descriptor_bytes += kWindowsDpuStartNpuChainDescriptorSize;
+      continue;
+    }
+    if (IREE_UNLIKELY(start->opcode != ERT_START_CU)) {
+      return iree_make_status(
+          IREE_STATUS_UNIMPLEMENTED,
+          "amdxdna Windows MCDM path-B chains only support START_CU or "
+          "START_NPU children");
+    }
+    const uint32_t packet_words = 1u + start->count;
+    const uint32_t copy_start_word = 2u + start->extra_cu_masks;
+    if (IREE_UNLIKELY(packet_words < copy_start_word)) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "amdxdna Windows MCDM path-B chain child START_CU packet is too "
+          "short");
+    }
+    descriptor_bytes +=
+        kWindowsDpuChainDescriptorHeaderSize +
+        static_cast<size_t>(packet_words - copy_start_word) * sizeof(uint32_t);
+  }
+  // XRT's module-runlist aperture layout treats each child instruction stream
+  // as occupying a full 0x8000 slot. Reserve through the final slot boundary so
+  // batched parent chunks start on the same cadence and opcode-9 marker offsets
+  // include the last child slot.
+  *out_code_bytes = align_up_size(code_offset, kWindowsDpuChainCodeAlignment);
+  *out_descriptor_bytes = descriptor_bytes;
+  return iree_ok_status();
+}
+
 iree_status_t prepare_pathb_chain_code(
     iree_hal_amdxdna_native_queue_t* queue,
-    iree_hal_amdxdna_native_command_t* chain_command) {
+    iree_hal_amdxdna_native_command_t* chain_command,
+    bool sync_aperture) {
   if (IREE_UNLIKELY(!queue || !queue->context ||
                     !queue->context->has_command_aperture)) {
     return iree_make_status(
@@ -1426,88 +1596,410 @@ iree_status_t prepare_pathb_chain_code(
         "aperture GPU view");
   }
 
-  uint8_t* code = static_cast<uint8_t*>(aperture.code_cpu_ptr);
-  std::memset(code, 0, static_cast<size_t>(aperture.code_size));
-  uint8_t* descriptor_base =
-      static_cast<uint8_t*>(aperture.gpu_cpu_ptr) +
-      kWindowsDpuChainDescriptorApertureOffset;
-  const size_t descriptor_capacity = std::min<size_t>(
-      kWindowsDpuChainDescriptorScratchSize,
-      static_cast<size_t>(aperture.gpu_va_size -
-                          kWindowsDpuChainDescriptorApertureOffset));
-  std::memset(descriptor_base, 0, descriptor_capacity);
+  if (!sync_aperture && chain_command->pathb_chain_prepared_valid) {
+    if (chain_command->pathb_chain_code_dirty) {
+      if (IREE_UNLIKELY(
+              chain_command->pathb_chain_child_code_offsets.size() !=
+              chain_command->chain_children.size())) {
+        return iree_make_status(
+            IREE_STATUS_FAILED_PRECONDITION,
+            "amdxdna Windows MCDM path-B prepared chain is missing child code "
+            "offsets");
+      }
+      const uint64_t code_base_offset =
+          chain_command->pathb_chain_code_aperture_offset;
+      if (IREE_UNLIKELY(code_base_offset >= aperture.code_size)) {
+        return iree_make_status(
+            IREE_STATUS_RESOURCE_EXHAUSTED,
+            "amdxdna Windows MCDM prepared path-B chain code base offset %" PRIu64
+            " exceeds aperture code BO (%" PRIu64 " bytes)",
+            code_base_offset, aperture.code_size);
+      }
+      uint8_t* code = static_cast<uint8_t*>(aperture.code_cpu_ptr) +
+                      static_cast<size_t>(code_base_offset);
+      const size_t code_capacity =
+          static_cast<size_t>(aperture.code_size - code_base_offset);
+      for (size_t child_index = 0;
+           child_index < chain_command->chain_children.size();
+           ++child_index) {
+        iree_hal_amdxdna_native_command_t* child =
+            chain_command->chain_children[child_index];
+        ert_packet* child_packet = command_packet(child);
+        child_packet->state = ERT_CMD_STATE_NEW;
+        const size_t code_offset =
+            chain_command->pathb_chain_child_code_offsets[child_index];
+        const size_t child_code_size =
+            static_cast<size_t>(child->control_buffer_size);
+        if (IREE_UNLIKELY(code_offset > code_capacity ||
+                          child_code_size > code_capacity - code_offset)) {
+          return iree_make_status(
+              IREE_STATUS_RESOURCE_EXHAUSTED,
+              "amdxdna Windows MCDM prepared path-B chain control code "
+              "exceeds aperture code BO (%zu-byte child at offset %zu, "
+              "capacity %zu)",
+              child_code_size, code_offset, code_capacity);
+        }
+        if (IREE_UNLIKELY(!child->control_buffer ||
+                          !child->control_buffer->buffer.cpu_ptr ||
+                          child_code_size == 0)) {
+          return iree_make_status(
+              IREE_STATUS_FAILED_PRECONDITION,
+              "amdxdna Windows MCDM prepared path-B chain child has no "
+              "control-code buffer");
+        }
+        std::memcpy(code + code_offset, child->control_buffer->buffer.cpu_ptr,
+                    child_code_size);
+        if (uses_partial_elf_npu_packet(child)) {
+          ert_npu_data* npu_data =
+              get_ert_npu_data(command_start_packet(child));
+          if (IREE_UNLIKELY(!npu_data)) {
+            return iree_make_status(
+                IREE_STATUS_INTERNAL,
+                "amdxdna Windows MCDM PARTIAL_ELF prepared chain child has "
+                "no NPU data");
+          }
+          npu_data->instruction_buffer =
+              aperture.code_gpu_va + code_base_offset + code_offset;
+          npu_data->instruction_buffer_size =
+              zero_instruction_size_enabled()
+                  ? 0
+                  : static_cast<uint32_t>(child->control_buffer_size);
+          npu_data->instruction_prop_count = 0;
+          IREE_RETURN_IF_ERROR(ensure_partial_elf_dummy_buffers(child));
+          IREE_RETURN_IF_ERROR(maybe_write_partial_elf_bo_table(child));
+        }
+        IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
+            child->exec_buffer.get(),
+            iree_hal_amdxdna_native_sync_direction_t::host_to_device));
+      }
+      chain_command->pathb_chain_descriptor_dirty = false;
+      return iree_ok_status();
+    }
+    for (iree_hal_amdxdna_native_command_t* child :
+         chain_command->chain_children) {
+      command_packet(child)->state = ERT_CMD_STATE_NEW;
+      IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
+          child->exec_buffer.get(),
+          iree_hal_amdxdna_native_sync_direction_t::host_to_device));
+    }
+    chain_command->pathb_chain_descriptor_dirty = false;
+    return iree_ok_status();
+  }
 
+  const uint64_t code_base_offset =
+      chain_command->pathb_chain_code_aperture_offset;
+  if (IREE_UNLIKELY(code_base_offset >= aperture.code_size)) {
+    return iree_make_status(
+        IREE_STATUS_RESOURCE_EXHAUSTED,
+        "amdxdna Windows MCDM path-B chain code base offset %" PRIu64
+        " exceeds aperture code BO (%" PRIu64 " bytes)",
+        code_base_offset, aperture.code_size);
+  }
+  uint8_t* code = static_cast<uint8_t*>(aperture.code_cpu_ptr) +
+                  static_cast<size_t>(code_base_offset);
+  const size_t code_capacity =
+      static_cast<size_t>(aperture.code_size - code_base_offset);
   size_t code_offset = 0;
   size_t code_used = 0;
+  std::vector<size_t> child_code_offsets;
+  std::vector<bool> child_code_needs_copy;
+  struct UniqueChainCodeSlot {
+    iree_hal_amdxdna_native_command_t* child = nullptr;
+    size_t offset = 0;
+  };
+  std::vector<UniqueChainCodeSlot> unique_code_slots;
+  child_code_offsets.reserve(chain_command->chain_children.size());
+  child_code_needs_copy.reserve(chain_command->chain_children.size());
+  unique_code_slots.reserve(chain_command->chain_children.size());
+  const bool allow_code_dedup =
+      chain_command->pathb_chain_allow_code_dedup &&
+      !pathb_chain_sync9_enabled();
+  for (iree_hal_amdxdna_native_command_t* child :
+       chain_command->chain_children) {
+    const size_t child_code_size =
+        static_cast<size_t>(child->control_buffer_size);
+    bool found_duplicate_code = false;
+    if (allow_code_dedup) {
+      for (const UniqueChainCodeSlot& slot : unique_code_slots) {
+        iree_hal_amdxdna_native_command_t* previous = slot.child;
+        if (!previous ||
+            previous->control_buffer_size != child->control_buffer_size) {
+          continue;
+        }
+        if (std::memcmp(previous->control_buffer->buffer.cpu_ptr,
+                        child->control_buffer->buffer.cpu_ptr,
+                        child_code_size) != 0) {
+          continue;
+        }
+        child_code_offsets.push_back(slot.offset);
+        child_code_needs_copy.push_back(false);
+        found_duplicate_code = true;
+        break;
+      }
+    }
+    if (found_duplicate_code) continue;
+
+    code_offset = align_up_size(code_offset, kWindowsDpuChainCodeAlignment);
+    if (IREE_UNLIKELY(code_offset > code_capacity ||
+                      child_code_size > code_capacity - code_offset)) {
+      return iree_make_status(
+          IREE_STATUS_RESOURCE_EXHAUSTED,
+          "amdxdna Windows MCDM path-B chain control code exceeds aperture "
+          "code BO (%zu-byte child at offset %zu, capacity %zu)",
+          child_code_size, code_offset, code_capacity);
+    }
+    child_code_offsets.push_back(code_offset);
+    child_code_needs_copy.push_back(true);
+    unique_code_slots.push_back(UniqueChainCodeSlot{child, code_offset});
+    code_used = code_offset + child_code_size;
+    code_offset = code_used;
+  }
+  // Do not clear the full padded code range: START_NPU descriptors carry the
+  // exact instruction byte count, and XRT leaves the 0x8000-spaced gaps as
+  // allocator slack. Clearing those gaps dominated host-side chain prep.
+
+  const size_t descriptor_offset =
+      chain_command->pathb_chain_descriptor_aperture_offset
+          ? static_cast<size_t>(
+                chain_command->pathb_chain_descriptor_aperture_offset)
+          : align_up_size(
+                std::max<size_t>(
+                    static_cast<size_t>(
+                        kWindowsDpuChainDescriptorApertureOffset),
+                    static_cast<size_t>(
+                        kWindowsDpuInstructionApertureOffset +
+                        code_base_offset) +
+                        code_used),
+                0x1000);
+  if (IREE_UNLIKELY(descriptor_offset >= aperture.gpu_va_size)) {
+    return iree_make_status(
+        IREE_STATUS_RESOURCE_EXHAUSTED,
+        "amdxdna Windows MCDM path-B chain descriptor block exceeds command "
+        "aperture after %zu bytes of staged code",
+        code_used);
+  }
+  uint8_t* descriptor_base =
+      static_cast<uint8_t*>(aperture.gpu_cpu_ptr) + descriptor_offset;
+  const size_t descriptor_capacity =
+      static_cast<size_t>(aperture.gpu_va_size - descriptor_offset);
+  const size_t descriptor_clear_bytes = std::min<size_t>(
+      descriptor_capacity,
+      chain_command->chain_children.size() *
+          std::max<size_t>(kWindowsDpuStartNpuChainDescriptorSize,
+                           kWindowsDpuChainDescriptorHeaderSize +
+                               kWindowsDpuRegmapWords * sizeof(uint32_t)));
+  std::memset(descriptor_base, 0, descriptor_clear_bytes);
+
   size_t descriptor_used = 0;
+  chain_command->pathb_chain_descriptor_gpu_va = 0;
   chain_command->pathb_chain_descriptor_bytes = 0;
   chain_command->pathb_chain_first_child_opcode =
       command_packet(chain_command->chain_children.front())->opcode;
-  for (iree_hal_amdxdna_native_command_t* child :
-       chain_command->chain_children) {
-    if (IREE_UNLIKELY(!uses_windows_dpu_regmap(child))) {
+  for (size_t child_index = 0; child_index < chain_command->chain_children.size();
+       ++child_index) {
+    iree_hal_amdxdna_native_command_t* child =
+        chain_command->chain_children[child_index];
+    ert_packet* child_packet = command_packet(child);
+    child_packet->state = ERT_CMD_STATE_NEW;
+    if (IREE_UNLIKELY(child_packet->opcode !=
+                      chain_command->pathb_chain_first_child_opcode)) {
+      return iree_make_status(
+          IREE_STATUS_UNIMPLEMENTED,
+          "amdxdna Windows MCDM path-B chains do not support mixed child ERT "
+          "opcodes yet");
+    }
+    const bool is_start_cu_child = uses_windows_dpu_regmap(child);
+    const bool is_start_npu_child = uses_partial_elf_npu_packet(child);
+    if (IREE_UNLIKELY(!is_start_cu_child && !is_start_npu_child)) {
       return iree_make_status(
           IREE_STATUS_UNIMPLEMENTED,
           "amdxdna Windows MCDM path-B chains only support DPU commands");
     }
-    if (child->windows_dpu_regmap_finalized) {
+    if (is_start_cu_child && child->windows_dpu_regmap_finalized) {
       return iree_make_status(
           IREE_STATUS_FAILED_PRECONDITION,
           "amdxdna Windows MCDM path-B chain child was already finalized");
     }
-    IREE_RETURN_IF_ERROR(validate_windows_dpu_regmap_inputs(queue, child));
-    code_offset = align_up_size(code_offset, kWindowsDpuChainCodeAlignment);
+    if (IREE_UNLIKELY(!child->control_buffer ||
+                      !child->control_buffer->buffer.cpu_ptr ||
+                      child->control_buffer_size == 0)) {
+      return iree_make_status(
+          IREE_STATUS_FAILED_PRECONDITION,
+          "amdxdna Windows MCDM path-B chain child has no control-code "
+          "buffer");
+    }
+    if (IREE_UNLIKELY(child->control_buffer_size % sizeof(uint32_t) != 0)) {
+      return iree_make_status(
+          IREE_STATUS_INVALID_ARGUMENT,
+          "amdxdna Windows MCDM path-B chain child control-code size is not "
+          "word aligned");
+    }
+    code_offset = child_code_offsets[child_index];
     const size_t child_code_size =
         static_cast<size_t>(child->control_buffer_size);
-    const size_t aperture_code_size = static_cast<size_t>(aperture.code_size);
-    if (IREE_UNLIKELY(code_offset > aperture_code_size ||
-                      child_code_size > aperture_code_size - code_offset)) {
-      return iree_make_status(
-          IREE_STATUS_RESOURCE_EXHAUSTED,
-          "amdxdna Windows MCDM path-B chain control code exceeds aperture "
-          "code BO (%zu-byte child at offset %zu, capacity %" PRIu64 ")",
-          child_code_size, code_offset, aperture.code_size);
+    if (child_code_needs_copy[child_index]) {
+      std::memcpy(code + code_offset, child->control_buffer->buffer.cpu_ptr,
+                  child_code_size);
     }
-    std::memcpy(code + code_offset, child->control_buffer->buffer.cpu_ptr,
-                child_code_size);
-    IREE_RETURN_IF_ERROR(rewrite_windows_dpu_regmap_to_instruction(
-        child, aperture.code_gpu_va + code_offset));
-    IREE_RETURN_IF_ERROR(append_pathb_start_cu_chain_descriptor(
-        child, descriptor_base, descriptor_capacity, &descriptor_used));
+    const uint64_t instruction_va =
+        aperture.code_gpu_va + code_base_offset + code_offset;
+    if (is_start_cu_child) {
+      IREE_RETURN_IF_ERROR(validate_windows_dpu_regmap_inputs(queue, child));
+      IREE_RETURN_IF_ERROR(
+          rewrite_windows_dpu_regmap_to_instruction(child, instruction_va));
+      IREE_RETURN_IF_ERROR(append_pathb_start_cu_chain_descriptor(
+          child, descriptor_base, descriptor_capacity, &descriptor_used));
+    } else {
+      ert_npu_data* npu_data = get_ert_npu_data(command_start_packet(child));
+      if (IREE_UNLIKELY(!npu_data)) {
+        return iree_make_status(
+            IREE_STATUS_INTERNAL,
+            "amdxdna Windows MCDM PARTIAL_ELF chain child has no NPU data");
+      }
+      npu_data->instruction_buffer = instruction_va;
+      npu_data->instruction_buffer_size =
+          zero_instruction_size_enabled()
+              ? 0
+              : static_cast<uint32_t>(child->control_buffer_size);
+      npu_data->instruction_prop_count = 0;
+      IREE_RETURN_IF_ERROR(ensure_partial_elf_dummy_buffers(child));
+      IREE_RETURN_IF_ERROR(maybe_write_partial_elf_bo_table(child));
+      IREE_RETURN_IF_ERROR(append_pathb_start_npu_chain_descriptor(
+          child, descriptor_base, descriptor_capacity, &descriptor_used));
+    }
     IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
         child->exec_buffer.get(),
         iree_hal_amdxdna_native_sync_direction_t::host_to_device));
     trace_command_packet("chain-slot-final", child);
-    code_used = code_offset + child_code_size;
-    code_offset = code_used;
   }
 
-  flush_host_writes_to_mcdm();
-  std::string error;
-  if (!mcdm::SyncCommandApertureCode(
-          chain_command->device->api, chain_command->device->device, aperture,
-          kWindowsDpuInstructionApertureOffset, static_cast<uint64_t>(code_used),
-          &error)) {
-    return status_from_mcdm_error(
-          "amdxdna Windows MCDM path-B chain aperture code sync failed", error);
-  }
-  if (descriptor_used) {
+  if (sync_aperture) {
+    flush_host_writes_to_mcdm();
+    std::string error;
     if (!mcdm::SyncCommandApertureCode(
             chain_command->device->api, chain_command->device->device, aperture,
-            kWindowsDpuChainDescriptorApertureOffset,
-            static_cast<uint64_t>(descriptor_used), &error)) {
+            kWindowsDpuInstructionApertureOffset + code_base_offset,
+            static_cast<uint64_t>(code_used), &error)) {
       return status_from_mcdm_error(
-          "amdxdna Windows MCDM path-B chain descriptor sync failed", error);
+          "amdxdna Windows MCDM path-B chain aperture code sync failed",
+          error);
+    }
+    if (descriptor_used) {
+      if (!mcdm::SyncCommandApertureCode(
+              chain_command->device->api, chain_command->device->device,
+              aperture, static_cast<uint64_t>(descriptor_offset),
+              static_cast<uint64_t>(descriptor_used), &error)) {
+        return status_from_mcdm_error(
+            "amdxdna Windows MCDM path-B chain descriptor sync failed", error);
+      }
+    }
+    if (!mcdm::RefreshCommandApertureGpuMapping(
+            chain_command->device->api, chain_command->device->device,
+            &aperture, &error)) {
+      return status_from_mcdm_error(
+          "amdxdna Windows MCDM path-B chain aperture code relock failed",
+          error);
+    }
+  }
+  chain_command->pathb_chain_descriptor_gpu_va =
+      aperture.gpu_va + descriptor_offset;
+  chain_command->pathb_chain_descriptor_bytes =
+      static_cast<uint32_t>(descriptor_used);
+  chain_command->pathb_chain_code_used_size =
+      allow_code_dedup ? code_used
+                       : align_up_size(code_used,
+                                       kWindowsDpuChainCodeAlignment);
+  chain_command->pathb_chain_child_code_offsets = std::move(child_code_offsets);
+  chain_command->pathb_chain_prepared_valid = true;
+  chain_command->pathb_chain_code_dirty = true;
+  chain_command->pathb_chain_descriptor_dirty = true;
+  return iree_ok_status();
+}
+
+iree_status_t prepare_pathb_chain_code(
+    iree_hal_amdxdna_native_queue_t* queue,
+    iree_hal_amdxdna_native_command_t* chain_command) {
+  return prepare_pathb_chain_code(queue, chain_command, true);
+}
+
+iree_status_t sync_prepared_pathb_chain_batch(
+    iree_hal_amdxdna_native_queue_t* queue, iree_host_size_t command_count,
+    size_t code_bytes, size_t descriptor_offset, size_t descriptor_bytes) {
+  mcdm::CommandAperture& aperture = queue->context->command_aperture;
+  flush_host_writes_to_mcdm();
+  std::string error;
+  const bool use_sync9 =
+      command_count > 1 || pathb_chain_sync9_enabled();
+  if (use_sync9) {
+    size_t last_sync_offset = 0;
+    auto submit_sync9 = [&](size_t end_offset) -> iree_status_t {
+      if (!end_offset || end_offset == last_sync_offset) return iree_ok_status();
+      if (!mcdm::SubmitPathBApertureSync(
+              queue->context->device->api, queue->context->device->device,
+              &queue->context->context, aperture,
+              static_cast<uint64_t>(end_offset), /*wait_for_cpu=*/false,
+              &error)) {
+        return status_from_mcdm_error(
+            "amdxdna Windows MCDM path-B batch sync9 failed", error);
+      }
+      last_sync_offset = end_offset;
+      return iree_ok_status();
+    };
+    // XRT's module-runlist path emits opcode-9 markers at instruction-slot
+    // boundaries (0x10000, 0x18000, ...), then submits the ERT_CMD_CHAIN
+    // parents. It does not emit a marker for the parent descriptor metadata;
+    // our descriptor block is still aperture-resident, so keep the conservative
+    // invalidate/relock for that region after the instruction markers.
+    const size_t code_end = align_up_size(
+        static_cast<size_t>(kWindowsDpuInstructionApertureOffset) + code_bytes,
+        kWindowsDpuChainCodeAlignment);
+    for (size_t sync_offset = kWindowsDpuInstructionApertureOffset +
+                              kWindowsDpuChainCodeAlignment;
+         sync_offset <= code_end; sync_offset += kWindowsDpuChainCodeAlignment) {
+      IREE_RETURN_IF_ERROR(submit_sync9(sync_offset));
+    }
+    if (descriptor_bytes) {
+      if (!mcdm::SyncCommandApertureCode(
+              queue->context->device->api, queue->context->device->device,
+              aperture, static_cast<uint64_t>(descriptor_offset),
+              static_cast<uint64_t>(descriptor_bytes), &error)) {
+        return status_from_mcdm_error(
+            "amdxdna Windows MCDM path-B batch descriptor sync failed", error);
+      }
+      if (!mcdm::RefreshCommandApertureGpuMapping(
+              queue->context->device->api, queue->context->device->device,
+              &aperture, &error)) {
+        return status_from_mcdm_error(
+            "amdxdna Windows MCDM path-B batch aperture relock failed", error);
+      }
+    }
+    return iree_ok_status();
+  }
+  if (code_bytes) {
+    if (!mcdm::SyncCommandApertureCode(
+            queue->context->device->api, queue->context->device->device,
+            aperture, kWindowsDpuInstructionApertureOffset,
+            static_cast<uint64_t>(code_bytes), &error)) {
+      return status_from_mcdm_error(
+          "amdxdna Windows MCDM path-B batch aperture code sync failed",
+          error);
+    }
+  }
+  if (descriptor_bytes) {
+    if (!mcdm::SyncCommandApertureCode(
+            queue->context->device->api, queue->context->device->device,
+            aperture, static_cast<uint64_t>(descriptor_offset),
+            static_cast<uint64_t>(descriptor_bytes), &error)) {
+      return status_from_mcdm_error(
+          "amdxdna Windows MCDM path-B batch descriptor sync failed", error);
     }
   }
   if (!mcdm::RefreshCommandApertureGpuMapping(
-          chain_command->device->api, chain_command->device->device, &aperture,
-          &error)) {
+          queue->context->device->api, queue->context->device->device,
+          &aperture, &error)) {
     return status_from_mcdm_error(
-        "amdxdna Windows MCDM path-B chain aperture code relock failed", error);
+        "amdxdna Windows MCDM path-B batch aperture relock failed", error);
   }
-  chain_command->pathb_chain_descriptor_bytes =
-      static_cast<uint32_t>(descriptor_used);
   return iree_ok_status();
 }
 
@@ -2100,9 +2592,9 @@ iree_status_t iree_hal_amdxdna_native_command_create(
   uint64_t exec_buffer_size = kMaxExecBoSize;
   if (device->submit_mode == SubmitMode::pathb &&
       opcode == iree_hal_amdxdna_native_command_opcode_t::command_chain) {
-    exec_buffer_size = kWindowsDpuPathBChainExecBoSize;
+    exec_buffer_size = windows_dpu_pathb_chain_exec_bo_size();
   } else if (device->submit_mode == SubmitMode::pathb &&
-             env_flag_enabled("IREE_AMDXDNA_MCDM_COMPACT_EXECBUF")) {
+             compact_execbuf_enabled()) {
     exec_buffer_size = kWindowsDpuPathBExecBoSize;
   }
   if (device->submit_mode == SubmitMode::pathb) {
@@ -2366,6 +2858,46 @@ iree_status_t iree_hal_amdxdna_native_command_bind_buffer(
   return iree_ok_status();
 }
 
+iree_status_t iree_hal_amdxdna_native_command_reset_bound_buffers(
+    iree_hal_amdxdna_native_command_t* command) {
+  IREE_ASSERT_ARGUMENT(command);
+  command->bound_buffers.clear();
+  if (uses_partial_elf_npu_packet(command) && command->control_buffer) {
+    bind_buffer_ref(command, /*position=*/0, command->control_buffer,
+                    /*offset=*/0, command->control_buffer_size);
+  }
+  return iree_ok_status();
+}
+
+iree_status_t iree_hal_amdxdna_native_command_mark_chain_dirty(
+    iree_hal_amdxdna_native_command_t* command) {
+  IREE_ASSERT_ARGUMENT(command);
+  if (IREE_UNLIKELY(command->opcode !=
+                    iree_hal_amdxdna_native_command_opcode_t::command_chain)) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "amdxdna native command is not a chain command");
+  }
+  command->pathb_chain_prepared_valid = false;
+  command->pathb_chain_code_dirty = true;
+  command->pathb_chain_descriptor_dirty = true;
+  return iree_ok_status();
+}
+
+iree_status_t iree_hal_amdxdna_native_command_mark_chain_code_dirty(
+    iree_hal_amdxdna_native_command_t* command) {
+  IREE_ASSERT_ARGUMENT(command);
+  if (IREE_UNLIKELY(command->opcode !=
+                    iree_hal_amdxdna_native_command_opcode_t::command_chain)) {
+    return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,
+                            "amdxdna native command is not a chain command");
+  }
+  if (!command->pathb_chain_prepared_valid) {
+    command->pathb_chain_descriptor_dirty = true;
+  }
+  command->pathb_chain_code_dirty = true;
+  return iree_ok_status();
+}
+
 iree_status_t iree_hal_amdxdna_native_command_prepare_chain(
     iree_hal_amdxdna_native_command_t* command,
     iree_hal_amdxdna_native_command_t* const* commands,
@@ -2403,6 +2935,11 @@ iree_status_t iree_hal_amdxdna_native_command_prepare_chain(
   for (iree_host_size_t i = 0; i < command_count; ++i) {
     IREE_RETURN_IF_ERROR(
         materialize_deferred_buffer(commands[i]->exec_buffer.get()));
+    // Materializing a deferred exec BO replaces the temporary host-storage
+    // mapping with the real KMT allocation mapping. Refresh the cached packet
+    // pointer before any later descriptor construction reads the child.
+    commands[i]->start_packet = reinterpret_cast<ert_start_kernel_cmd*>(
+        commands[i]->exec_buffer->buffer.cpu_ptr);
     IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
         commands[i]->exec_buffer.get(),
         iree_hal_amdxdna_native_sync_direction_t::host_to_device));
@@ -2420,9 +2957,6 @@ iree_status_t iree_hal_amdxdna_native_command_prepare_chain(
     command->bound_buffers.push_back(BoundBuffer{
         i, commands[i]->exec_buffer.get(), 0,
         iree_hal_amdxdna_native_buffer_size(commands[i]->exec_buffer.get())});
-    for (const BoundBuffer& bound : commands[i]->bound_buffers) {
-      command->bound_buffers.push_back(bound);
-    }
   }
   packet->count =
       (sizeof(ert_cmd_chain_data) + command_count * sizeof(uint64_t)) /
@@ -2621,9 +3155,7 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
     trace_command_packet("pathb-before-submit", command);
     if (is_pathb_chain) {
       mcdm::PathBChainSubmitInfo chain_info = {};
-      chain_info.descriptor_gpu_va =
-          queue->context->command_aperture.gpu_va +
-          kWindowsDpuChainDescriptorApertureOffset;
+      chain_info.descriptor_gpu_va = command->pathb_chain_descriptor_gpu_va;
       chain_info.descriptor_bytes = command->pathb_chain_descriptor_bytes;
       chain_info.command_count =
           reinterpret_cast<ert_cmd_chain_data*>(packet->data)->command_count;
@@ -2715,4 +3247,259 @@ iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
   return iree_make_status(
       IREE_STATUS_INTERNAL, "amdxdna %.*s did not complete: ert state %u",
       static_cast<int>(label.size), label.data, packet->state);
+}
+
+iree_status_t iree_hal_amdxdna_native_queue_submit_all_and_wait(
+    iree_hal_amdxdna_native_queue_t* queue,
+    iree_hal_amdxdna_native_command_t* const* commands,
+    iree_host_size_t command_count, iree_string_view_t label) {
+  IREE_ASSERT_ARGUMENT(queue);
+  IREE_ASSERT_ARGUMENT(commands);
+  if (command_count == 0) return iree_ok_status();
+
+  iree_hal_amdxdna_native_device_t* device = queue->context->device;
+  if (device->submit_mode != SubmitMode::pathb) {
+    for (iree_host_size_t i = 0; i < command_count; ++i) {
+      IREE_RETURN_IF_ERROR(
+          iree_hal_amdxdna_native_queue_submit_and_wait(queue, commands[i],
+                                                        label));
+    }
+    return iree_ok_status();
+  }
+
+  for (iree_host_size_t i = 0; i < command_count; ++i) {
+    if (commands[i]->opcode !=
+        iree_hal_amdxdna_native_command_opcode_t::command_chain) {
+      for (iree_host_size_t j = 0; j < command_count; ++j) {
+        IREE_RETURN_IF_ERROR(
+            iree_hal_amdxdna_native_queue_submit_and_wait(queue, commands[j],
+                                                          label));
+      }
+      return iree_ok_status();
+    }
+  }
+
+  if (!queue->context->has_command_aperture) {
+    return iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "amdxdna Windows MCDM pathb batch submit requested without command "
+        "aperture");
+  }
+
+  mcdm::CommandAperture& aperture = queue->context->command_aperture;
+  std::vector<size_t> code_sizes(command_count);
+  std::vector<size_t> descriptor_sizes(command_count);
+  size_t code_cursor = 0;
+  for (iree_host_size_t i = 0; i < command_count; ++i) {
+    // Deduplicating identical child instruction streams within one parent chain
+    // is valid and matches the driver's per-descriptor byte-count model. Keep
+    // multi-parent batches conservative: submitting multiple parents before a
+    // wait failed when they shared compacted aperture slots, so give each child
+    // its own XRT-style 0x8000 slot until that firmware ordering rule is mapped.
+    commands[i]->pathb_chain_allow_code_dedup = command_count == 1;
+    IREE_RETURN_IF_ERROR(get_pathb_chain_region_sizes(
+        commands[i], &code_sizes[i], &descriptor_sizes[i]));
+    const size_t code_base = align_up_size(code_cursor, 0x1000);
+    commands[i]->pathb_chain_code_aperture_offset = code_base;
+    code_cursor = code_base + align_up_size(code_sizes[i], 0x1000);
+  }
+  if (IREE_UNLIKELY(code_cursor > aperture.code_size)) {
+    return iree_make_status(
+        IREE_STATUS_RESOURCE_EXHAUSTED,
+        "amdxdna Windows MCDM path-B batch chain code uses %zu bytes, "
+        "exceeding aperture code BO (%" PRIu64 " bytes)",
+        code_cursor, aperture.code_size);
+  }
+
+  size_t descriptor_cursor = align_up_size(
+      std::max<size_t>(
+          static_cast<size_t>(kWindowsDpuChainDescriptorApertureOffset),
+          static_cast<size_t>(kWindowsDpuInstructionApertureOffset) +
+              code_cursor),
+      0x1000);
+  const size_t descriptor_batch_offset = descriptor_cursor;
+  for (iree_host_size_t i = 0; i < command_count; ++i) {
+    commands[i]->pathb_chain_descriptor_aperture_offset = descriptor_cursor;
+    descriptor_cursor += align_up_size(descriptor_sizes[i], 0x1000);
+  }
+  if (IREE_UNLIKELY(descriptor_cursor > aperture.gpu_va_size)) {
+    return iree_make_status(
+        IREE_STATUS_RESOURCE_EXHAUSTED,
+        "amdxdna Windows MCDM path-B batch chain descriptors use aperture "
+        "through byte %zu, exceeding command aperture (%" PRIu64 " bytes)",
+        descriptor_cursor, aperture.gpu_va_size);
+  }
+
+  std::vector<mcdm::PathBPendingSubmit> pending(command_count);
+  std::string error;
+  const bool batch_phase_timing =
+      env_flag_enabled("IREE_AMDXDNA_MCDM_PATHB_PHASE_TIMING");
+  const uint64_t batch_total_t0 = batch_phase_timing ? now_ns() : 0;
+  uint64_t batch_prepare_ns = 0;
+  uint64_t batch_sync_ns = 0;
+  uint64_t batch_submit_ns = 0;
+  uint64_t batch_wait_ns = 0;
+  uint64_t batch_post_ns = 0;
+  size_t batch_code_sync_bytes = 0;
+  uint64_t submit_t0 = 0;
+  const bool measure_submit = submit_timing_enabled();
+  if (measure_submit) submit_t0 = now_ns();
+  uint64_t phase_t0 = batch_phase_timing ? now_ns() : 0;
+  for (iree_host_size_t command_index = 0; command_index < command_count;
+       ++command_index) {
+    iree_hal_amdxdna_native_command_t* command = commands[command_index];
+    ert_packet* packet = command_packet(command);
+    packet->state = ERT_CMD_STATE_NEW;
+
+    IREE_RETURN_IF_ERROR(finalize_windows_dpu_regmap(queue, command));
+
+    if (!command->pathb_chain_bound_residency_checked) {
+      for (size_t i = 0; i < command->bound_buffers.size(); ++i) {
+        const BoundBuffer& bound = command->bound_buffers[i];
+        if (!bound.buffer) continue;
+        IREE_RETURN_IF_ERROR(materialize_deferred_buffer(bound.buffer));
+        std::string residency_label = "batch-bound[" + std::to_string(i) + "]";
+        if (!mcdm::WaitForBufferResidency(
+                command->device->api, command->device->device,
+                queue->context->context, bound.buffer->buffer,
+                residency_label.c_str(), &error)) {
+          return status_from_mcdm_error(
+              "amdxdna Windows MCDM bound BO residency wait failed", error);
+        }
+      }
+      command->pathb_chain_bound_residency_checked = true;
+    }
+
+    IREE_RETURN_IF_ERROR(prepare_pathb_chain_code(queue, command, false));
+    if (!skip_clean_chain_sync_enabled() ||
+        command->pathb_chain_code_dirty ||
+        command->pathb_chain_descriptor_dirty) {
+      batch_code_sync_bytes = std::max<size_t>(
+          batch_code_sync_bytes,
+          static_cast<size_t>(command->pathb_chain_code_aperture_offset +
+                              command->pathb_chain_code_used_size));
+    }
+    IREE_RETURN_IF_ERROR(ensure_partial_elf_dummy_buffers(command));
+    IREE_RETURN_IF_ERROR(
+        materialize_deferred_buffer(command->exec_buffer.get()));
+    command->start_packet = reinterpret_cast<ert_start_kernel_cmd*>(
+        command->exec_buffer->buffer.cpu_ptr);
+    packet = command_packet(command);
+
+    for (size_t i = 0; i < command->bound_buffers.size(); ++i) {
+      iree_hal_amdxdna_native_buffer_t* bound =
+          command->bound_buffers[i].buffer;
+      if (!bound) continue;
+      IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
+          bound, iree_hal_amdxdna_native_sync_direction_t::host_to_device));
+    }
+    IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
+        command->exec_buffer.get(),
+        iree_hal_amdxdna_native_sync_direction_t::host_to_device));
+  }
+  if (batch_phase_timing) batch_prepare_ns = now_ns() - phase_t0;
+
+  size_t dirty_descriptor_begin = std::numeric_limits<size_t>::max();
+  size_t dirty_descriptor_end = 0;
+  for (iree_host_size_t command_index = 0; command_index < command_count;
+       ++command_index) {
+    iree_hal_amdxdna_native_command_t* command = commands[command_index];
+    if (!command->pathb_chain_descriptor_dirty) continue;
+    const size_t begin =
+        static_cast<size_t>(command->pathb_chain_descriptor_aperture_offset);
+    const size_t end =
+        begin + static_cast<size_t>(command->pathb_chain_descriptor_bytes);
+    dirty_descriptor_begin = std::min(dirty_descriptor_begin, begin);
+    dirty_descriptor_end = std::max(dirty_descriptor_end, end);
+  }
+  const size_t descriptor_sync_offset =
+      dirty_descriptor_begin == std::numeric_limits<size_t>::max()
+          ? descriptor_batch_offset
+          : dirty_descriptor_begin;
+  const size_t descriptor_sync_bytes =
+      dirty_descriptor_begin == std::numeric_limits<size_t>::max()
+          ? 0
+          : dirty_descriptor_end - dirty_descriptor_begin;
+
+  phase_t0 = batch_phase_timing ? now_ns() : 0;
+  IREE_RETURN_IF_ERROR(sync_prepared_pathb_chain_batch(
+      queue, command_count, batch_code_sync_bytes, descriptor_sync_offset,
+      descriptor_sync_bytes));
+  for (iree_host_size_t command_index = 0; command_index < command_count;
+       ++command_index) {
+    commands[command_index]->pathb_chain_code_dirty = false;
+    commands[command_index]->pathb_chain_descriptor_dirty = false;
+  }
+  if (batch_phase_timing) batch_sync_ns = now_ns() - phase_t0;
+
+  phase_t0 = batch_phase_timing ? now_ns() : 0;
+  for (iree_host_size_t command_index = 0; command_index < command_count;
+       ++command_index) {
+    iree_hal_amdxdna_native_command_t* command = commands[command_index];
+    ert_packet* packet = command_packet(command);
+    mcdm::PathBChainSubmitInfo chain_info = {};
+    chain_info.descriptor_gpu_va = command->pathb_chain_descriptor_gpu_va;
+    chain_info.descriptor_bytes = command->pathb_chain_descriptor_bytes;
+    chain_info.command_count =
+        reinterpret_cast<ert_cmd_chain_data*>(packet->data)->command_count;
+    chain_info.first_child_opcode = command->pathb_chain_first_child_opcode;
+    if (!mcdm::SubmitPathBChain(command->device->api, command->device->device,
+                                &queue->context->context,
+                                command->exec_buffer->buffer, packet,
+                                (packet->count + 1) * sizeof(uint32_t),
+                                chain_info, &packet->header,
+                                &pending[command_index], &error)) {
+      return status_from_mcdm_error(
+          "amdxdna Windows MCDM pathb chain batch submit failed", error);
+    }
+  }
+  if (batch_phase_timing) batch_submit_ns = now_ns() - phase_t0;
+
+  phase_t0 = batch_phase_timing ? now_ns() : 0;
+  if (!mcdm::WaitForPathBSubmits(device->api, device->device,
+                                 &queue->context->context, pending.data(),
+                                 pending.size(), &error)) {
+    return status_from_mcdm_error(
+        "amdxdna Windows MCDM pathb chain batch wait failed", error);
+  }
+  if (batch_phase_timing) batch_wait_ns = now_ns() - phase_t0;
+  if (measure_submit) record_submit_timing(now_ns() - submit_t0);
+
+  phase_t0 = batch_phase_timing ? now_ns() : 0;
+  for (iree_host_size_t command_index = 0; command_index < command_count;
+       ++command_index) {
+    iree_hal_amdxdna_native_command_t* command = commands[command_index];
+    ert_packet* packet = command_packet(command);
+    // The direct command-buffer chain flush invalidates the exact I/O binding
+    // ranges once after the whole group completes. Avoid invalidating every
+    // bound BO for every native parent chunk here; that duplicates work and was
+    // the dominant batched-chain host overhead.
+    queue->exec_command_count++;
+    trace_command_packet("batch-after-readback", command);
+    if (packet->state == ERT_CMD_STATE_COMPLETED) continue;
+    ert_cmd_chain_data* chain_data =
+        reinterpret_cast<ert_cmd_chain_data*>(packet->data);
+    return iree_make_status(
+        IREE_STATUS_INTERNAL,
+        "amdxdna %.*s batch command %" PRIhsz
+        " did not complete: ert state %u (error_index %u, submit_index %u)",
+        static_cast<int>(label.size), label.data, command_index,
+        packet->state, chain_data->error_index, chain_data->submit_index);
+  }
+  if (batch_phase_timing) {
+    batch_post_ns = now_ns() - phase_t0;
+    const uint64_t batch_total_ns = now_ns() - batch_total_t0;
+    std::fprintf(stderr,
+                 "[amdxdna:mcdm-batch-phase] chunks=%" PRIhsz
+                 " prepare_us=%.3f aperture_sync_us=%.3f submit_us=%.3f "
+                 "wait_us=%.3f post_sync_us=%.3f total_us=%.3f\n",
+                 command_count, static_cast<double>(batch_prepare_ns) / 1000.0,
+                 static_cast<double>(batch_sync_ns) / 1000.0,
+                 static_cast<double>(batch_submit_ns) / 1000.0,
+                 static_cast<double>(batch_wait_ns) / 1000.0,
+                 static_cast<double>(batch_post_ns) / 1000.0,
+                 static_cast<double>(batch_total_ns) / 1000.0);
+    std::fflush(stderr);
+  }
+  return iree_ok_status();
 }

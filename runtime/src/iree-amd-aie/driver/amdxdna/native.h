@@ -175,6 +175,17 @@ iree_status_t iree_hal_amdxdna_native_command_bind_buffer(
     iree_hal_amdxdna_native_buffer_t* buffer, iree_device_size_t offset,
     iree_device_size_t size);
 
+#if defined(_WIN32)
+iree_status_t iree_hal_amdxdna_native_command_reset_bound_buffers(
+    iree_hal_amdxdna_native_command_t* command);
+
+iree_status_t iree_hal_amdxdna_native_command_mark_chain_dirty(
+    iree_hal_amdxdna_native_command_t* command);
+
+iree_status_t iree_hal_amdxdna_native_command_mark_chain_code_dirty(
+    iree_hal_amdxdna_native_command_t* command);
+#endif  // defined(_WIN32)
+
 // Builds an ERT_CMD_CHAIN packet from `commands`.
 //
 // The chain packet copies each child command's exec-BO handle, but does not
@@ -188,5 +199,10 @@ iree_status_t iree_hal_amdxdna_native_command_prepare_chain(
 iree_status_t iree_hal_amdxdna_native_queue_submit_and_wait(
     iree_hal_amdxdna_native_queue_t* queue,
     iree_hal_amdxdna_native_command_t* command, iree_string_view_t label);
+
+iree_status_t iree_hal_amdxdna_native_queue_submit_all_and_wait(
+    iree_hal_amdxdna_native_queue_t* queue,
+    iree_hal_amdxdna_native_command_t* const* commands,
+    iree_host_size_t command_count, iree_string_view_t label);
 
 #endif  // IREE_AMD_AIE_DRIVER_AMDXDNA_NATIVE_H_

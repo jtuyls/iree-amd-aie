@@ -64,4 +64,30 @@ TEST_F(DirectCommandBufferTest, CreateAllowsRetainedMode) {
   iree_hal_command_buffer_release(command_buffer);
 }
 
+#if defined(_WIN32)
+TEST_F(DirectCommandBufferTest,
+       ChainCacheDoesNotDirtyCodeForIdenticalPatchedControlWords) {
+  const uint32_t cached_words[] = {0x1, 0x2, 0x3, 0x4};
+  const uint32_t fresh_same_words[] = {0x1, 0x2, 0x3, 0x4};
+
+  EXPECT_FALSE(iree_hal_amdxdna_direct_command_buffer_control_words_changed(
+      cached_words, IREE_ARRAYSIZE(cached_words), fresh_same_words,
+      IREE_ARRAYSIZE(fresh_same_words)));
+}
+
+TEST_F(DirectCommandBufferTest,
+       ChainCacheDirtiesCodeForChangedPatchedControlWords) {
+  const uint32_t cached_words[] = {0x1, 0x2, 0x3, 0x4};
+  const uint32_t fresh_changed_words[] = {0x1, 0x2, 0xfeed0000, 0x4};
+  const uint32_t fresh_short_words[] = {0x1, 0x2, 0x3};
+
+  EXPECT_TRUE(iree_hal_amdxdna_direct_command_buffer_control_words_changed(
+      cached_words, IREE_ARRAYSIZE(cached_words), fresh_changed_words,
+      IREE_ARRAYSIZE(fresh_changed_words)));
+  EXPECT_TRUE(iree_hal_amdxdna_direct_command_buffer_control_words_changed(
+      cached_words, IREE_ARRAYSIZE(cached_words), fresh_short_words,
+      IREE_ARRAYSIZE(fresh_short_words)));
+}
+#endif  // defined(_WIN32)
+
 }  // namespace

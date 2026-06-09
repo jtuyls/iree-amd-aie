@@ -104,6 +104,9 @@ iree_hal_amdxdna_device::iree_hal_amdxdna_device(
   device_allocator = nullptr;
   native_device = nullptr;
   pdi_context_cache = new iree_hal_amdxdna_device_context_cache_t();
+#if defined(_WIN32)
+  mcdm_chain_command_cache = nullptr;
+#endif  // defined(_WIN32)
 
   iree_hal_resource_initialize(&iree_hal_amdxdna_device_vtable, &resource);
   this->host_allocator = host_allocator;
@@ -117,6 +120,9 @@ iree_hal_amdxdna_device::iree_hal_amdxdna_device(
 }
 
 iree_hal_amdxdna_device::~iree_hal_amdxdna_device() {
+#if defined(_WIN32)
+  iree_hal_amdxdna_device_destroy_chain_command_cache(this);
+#endif  // defined(_WIN32)
   delete pdi_context_cache;
   pdi_context_cache = nullptr;
 }
@@ -644,6 +650,8 @@ static iree_status_t iree_hal_amdxdna_device_queue_alloca(
   IREE_RETURN_AND_END_ZONE_IF_ERROR(
       z0, iree_hal_allocator_allocate_buffer(device->device_allocator, params,
                                              allocation_size, out_buffer));
+  iree_hal_amdxdna_buffer_mark_allocated(
+      iree_hal_buffer_allocated_buffer(*out_buffer));
 
   // Tag the buffer with async placement so callers can route dealloca back to
   // this device/queue.

@@ -160,6 +160,11 @@ bool EnvFlagEnabled(const char* name) {
   return value && value[0] && value[0] != '0';
 }
 
+bool EnvFlagEnabledByDefault(const char* name) {
+  const char* value = std::getenv(name);
+  return !value || !value[0] || value[0] != '0';
+}
+
 bool TraceQhdlEnabled() {
   static bool enabled = EnvFlagEnabled(kTraceQhdlEnv);
   return enabled;
@@ -188,7 +193,7 @@ bool PathBCompletionPollFallbackEnabled() {
 
 bool TrustFenceCompletionEnabled() {
   static bool enabled =
-      EnvFlagEnabled("IREE_AMDXDNA_MCDM_TRUST_FENCE_COMPLETION");
+      EnvFlagEnabledByDefault("IREE_AMDXDNA_MCDM_TRUST_FENCE_COMPLETION");
   return enabled;
 }
 
@@ -671,6 +676,10 @@ bool CreateBuffer(const KmtApi& api, const Device& device, BufferKind kind,
   buffer.paging_fence_value = resident.PagingFenceValue;
   if (!XrtMinimalResidencyEnabled()) {
     WaitForPagingFenceCpu(api, device, resident.PagingFenceValue);
+    // The BO was made resident with MustSucceed|CantTrimFurther and the paging
+    // fence is now complete. Avoid enqueueing the same residency wait on every
+    // later submit that references this BO.
+    buffer.paging_fence_value = 0;
   }
 
   // Carveout/heap BOs are device-local firmware heaps: XRT never Lock2s them
@@ -2165,6 +2174,235 @@ bool SubmitAndWaitPathBImpl(const KmtApi& api, const Device& device,
   return true;
 }
 
+bool SubmitPathBImplNoWait(const KmtApi& api, const Device& device,
+                           Context* context, const Buffer& exec_buffer,
+                           const void* ert_packet, uint32_t ert_bytes,
+                           uint32_t command_state,
+                           const PathBChainSubmitInfo* chain_info,
+                           uint32_t* packet_header,
+                           PathBPendingSubmit* out_pending,
+                           std::string* out_error) {
+  if (!out_pending) {
+    if (out_error) *out_error = "SubmitPathB called without pending storage";
+    return false;
+  }
+  *out_pending = {};
+  if (!context || !context->hw_queue) {
+    if (out_error) *out_error = "SubmitPathB called without an HW queue";
+    return false;
+  }
+  if (!exec_buffer.allocation || !exec_buffer.gpu_va || exec_buffer.size == 0) {
+    if (out_error) *out_error = "SubmitPathB called with an invalid exec buffer";
+    return false;
+  }
+  if (ert_bytes == 0 ||
+      ert_bytes > kQhdlSubmitPrivateSize - kQhdlSubmitPacketOffset) {
+    if (out_error) {
+      std::ostringstream os;
+      os << "SubmitPathB invalid ert_bytes=" << ert_bytes;
+      *out_error = os.str();
+    }
+    return false;
+  }
+  if (chain_info) {
+    if (!chain_info->descriptor_gpu_va || !chain_info->descriptor_bytes ||
+        !chain_info->command_count) {
+      if (out_error) {
+        *out_error = "SubmitPathBChain called with incomplete chain metadata";
+      }
+      return false;
+    }
+  }
+
+  if (!EnsureStatusRing(api, device, context, out_error)) return false;
+  Buffer& ring = context->completion_ring;
+
+  uint32_t slot_offset = context->completion_ring_offset;
+  if (slot_offset + kQhdlCompletionSlotSize > ring.size) {
+    slot_offset = kQhdlCompletionSlotSize;
+  }
+  context->completion_ring_offset =
+      (slot_offset + 2u * kQhdlCompletionSlotSize > ring.size)
+          ? kQhdlCompletionSlotSize
+          : slot_offset + kQhdlCompletionSlotSize;
+  uint8_t* slot_cpu = static_cast<uint8_t*>(ring.cpu_ptr) + slot_offset;
+  InitializeCompletionSlot(slot_cpu);
+
+  const uint32_t effective_command_state =
+      chain_info ? 6u : (command_state ? command_state : 3u);
+  std::array<uint8_t, kQhdlSubmitPrivateSize> priv = {};
+  WriteU32(priv.data(), 0x00, effective_command_state);
+  WriteU64(priv.data(), 0x08, exec_buffer.allocation);
+  WriteU64(priv.data(), 0x10, ert_bytes);
+  WriteU64(priv.data(), 0x28, ring.allocation);
+  WriteU32(priv.data(), 0x30, slot_offset);
+  WriteU32(priv.data(), 0x34, kQhdlCompletionSlotSize);
+  WriteU64(priv.data(), 0x38, reinterpret_cast<uint64_t>(slot_cpu));
+  if (chain_info) {
+    WriteU64(priv.data(), 0x48, chain_info->descriptor_gpu_va);
+    WriteU32(priv.data(), 0x50, chain_info->descriptor_bytes);
+    WriteU32(priv.data(), 0x54, chain_info->command_count);
+    WriteU32(priv.data(), 0x58, chain_info->first_child_opcode);
+  }
+  std::memcpy(priv.data() + kQhdlSubmitPacketOffset, ert_packet, ert_bytes);
+
+  if (!WaitForBufferResidency(api, device, *context, exec_buffer, "pathb-exec",
+                              out_error)) {
+    return false;
+  }
+  if (!WaitForBufferResidency(api, device, *context, ring, "pathb-ring",
+                              out_error)) {
+    return false;
+  }
+
+  const bool xrt_lock_touch = XrtLockTouchEnabled();
+  if (xrt_lock_touch &&
+      !TouchBufferCpuMapping(api, device, exec_buffer, "pre-submit",
+                             out_error)) {
+    return false;
+  }
+
+  uint64_t fence_id = context->next_fence_id++;
+  D3DKMT_SUBMITCOMMANDTOHWQUEUE submit = {};
+  submit.hHwQueue = context->hw_queue;
+  submit.HwQueueProgressFenceId = fence_id;
+  submit.CommandBuffer = exec_buffer.gpu_va;
+  submit.CommandLength = static_cast<UINT>(exec_buffer.size +
+                                           kQhdlSubmitPacketOffset);
+  submit.PrivateDriverDataSize = static_cast<UINT>(priv.size());
+  submit.pPrivateDriverData = priv.data();
+  if (TraceQhdlEnabled()) {
+    std::fprintf(stderr,
+                 "[amdxdna:mcdm] pathb submit-nowait: hwq=0x%08x fence=%llu "
+                 "cmd_va=0x%llx len=%u ert_bytes=%u state=%u "
+                 "cmd_alloc=0x%08x slot_off=0x%x ring_gpu=0x%llx "
+                 "slot_gpu=0x%llx",
+                 static_cast<unsigned>(context->hw_queue),
+                 static_cast<unsigned long long>(fence_id),
+                 static_cast<unsigned long long>(exec_buffer.gpu_va),
+                 static_cast<unsigned>(submit.CommandLength), ert_bytes,
+                 effective_command_state,
+                 static_cast<unsigned>(exec_buffer.allocation),
+                 static_cast<unsigned>(slot_offset),
+                 static_cast<unsigned long long>(ring.gpu_va),
+                 static_cast<unsigned long long>(ring.gpu_va + slot_offset));
+    if (chain_info) {
+      std::fprintf(stderr,
+                   " chain_desc_va=0x%llx chain_desc_bytes=0x%x "
+                   "chain_count=%u first_child_opcode=%u",
+                   static_cast<unsigned long long>(
+                       chain_info->descriptor_gpu_va),
+                   chain_info->descriptor_bytes, chain_info->command_count,
+                   chain_info->first_child_opcode);
+    }
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+  }
+  NTSTATUS status = api.submit_command_to_hw_queue(&submit);
+  if (!CheckStatus("D3DKMTSubmitCommandToHwQueue(pathb nowait)", status,
+                   out_error)) {
+    return false;
+  }
+  if (xrt_lock_touch &&
+      !TouchBufferCpuMapping(api, device, exec_buffer, "post-submit",
+                             out_error)) {
+    return false;
+  }
+
+  out_pending->fence_id = fence_id;
+  out_pending->slot_cpu = slot_cpu;
+  out_pending->slot_offset = slot_offset;
+  out_pending->packet_header = packet_header;
+  out_pending->exec_buffer = exec_buffer;
+  out_pending->ring = ring;
+  return true;
+}
+
+bool WaitForPathBSubmits(const KmtApi& api, const Device& device,
+                         Context* context, PathBPendingSubmit* pending,
+                         size_t pending_count, std::string* out_error) {
+  if (!pending_count) return true;
+  if (!context || !context->hw_queue) {
+    if (out_error) *out_error = "WaitForPathBSubmits called without an HW queue";
+    return false;
+  }
+  if (!pending) {
+    if (out_error) *out_error = "WaitForPathBSubmits called without commands";
+    return false;
+  }
+  PathBPendingSubmit& last = pending[pending_count - 1];
+  if (!WaitForHwQueueFenceCpu(
+          api, device, *context, last.fence_id,
+          "D3DKMTWaitForSynchronizationObjectFromCpu(pathb batch)",
+          out_error)) {
+    return false;
+  }
+
+  const bool trust_fence_completion = TrustFenceCompletionEnabled();
+  for (size_t i = 0; i < pending_count; ++i) {
+    PathBPendingSubmit& p = pending[i];
+    uint32_t slot_state = 0;
+    uint32_t packet_state = p.packet_header ? *p.packet_header : 0;
+    if (trust_fence_completion) {
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      packet_state = p.packet_header ? *p.packet_header : 0;
+      std::memcpy(&slot_state, p.slot_cpu, sizeof(slot_state));
+    } else {
+      std::string command_sync_err;
+      if (!SyncBuffer(api, device, p.exec_buffer, 0, p.exec_buffer.size,
+                      &command_sync_err)) {
+        if (out_error) {
+          *out_error =
+              "pathb batch command buffer invalidate failed: " +
+              command_sync_err;
+        }
+        return false;
+      }
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      packet_state = p.packet_header ? *p.packet_header : 0;
+
+      std::string ring_sync_err;
+      if (!SyncBuffer(api, device, p.ring, 0, p.ring.size, &ring_sync_err)) {
+        if (out_error) {
+          *out_error =
+              "pathb batch completion ring invalidate failed: " +
+              ring_sync_err;
+        }
+        return false;
+      }
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      std::memcpy(&slot_state, p.slot_cpu, sizeof(slot_state));
+    }
+
+    if (p.packet_header) {
+      const uint32_t completion_state =
+          ((packet_state & 0xFu) >= 4) ? packet_state : slot_state;
+      uint32_t delta = (*p.packet_header ^ completion_state) & 0xFu;
+      *p.packet_header ^= delta;
+    }
+    if (TraceQhdlEnabled()) {
+      std::fprintf(stderr,
+                   "[amdxdna:mcdm] pathb batch completion[%zu]: "
+                   "packet_state=0x%08x slot_state=0x%08x\n",
+                   i, packet_state, slot_state);
+      std::fflush(stderr);
+    }
+    const uint32_t final_state = p.packet_header ? *p.packet_header : slot_state;
+    if ((final_state & 0xFu) < 4) {
+      if (out_error) {
+        std::ostringstream os;
+        os << "pathb batch command " << i
+           << " did not complete after final fence wait: packet_state=0x"
+           << std::hex << packet_state << " slot_state=0x" << slot_state
+           << " slot_offset=0x" << p.slot_offset;
+        *out_error = os.str();
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
 bool SubmitAndWaitPathB(const KmtApi& api, const Device& device,
                         Context* context, const Buffer& exec_buffer,
                         const void* ert_packet, uint32_t ert_bytes,
@@ -2183,6 +2421,18 @@ bool SubmitAndWaitPathBChain(const KmtApi& api, const Device& device,
   return SubmitAndWaitPathBImpl(api, device, context, exec_buffer, ert_packet,
                                 ert_bytes, 6, &chain_info, packet_header,
                                 out_error);
+}
+
+bool SubmitPathBChain(const KmtApi& api, const Device& device,
+                      Context* context, const Buffer& exec_buffer,
+                      const void* ert_packet, uint32_t ert_bytes,
+                      const PathBChainSubmitInfo& chain_info,
+                      uint32_t* packet_header,
+                      PathBPendingSubmit* out_pending,
+                      std::string* out_error) {
+  return SubmitPathBImplNoWait(api, device, context, exec_buffer, ert_packet,
+                               ert_bytes, 6, &chain_info, packet_header,
+                               out_pending, out_error);
 }
 
 void DestroyCommandAperture(const KmtApi& api, const Device& device,

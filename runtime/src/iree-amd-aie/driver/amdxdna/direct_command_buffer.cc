@@ -7,6 +7,7 @@
 #include "iree-amd-aie/driver/amdxdna/direct_command_buffer.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -28,14 +29,6 @@ static constexpr uint64_t kAmdxdnaControlCodeOpcode = 3u;
 #if defined(_WIN32)
 static bool iree_hal_amdxdna_ordered_chain_fallback_enabled() {
   const char* value = std::getenv("IREE_AMDXDNA_MCDM_ORDERED_CHAIN_FALLBACK");
-  return value &&
-         (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
-          std::strcmp(value, "TRUE") == 0 || std::strcmp(value, "yes") == 0 ||
-          std::strcmp(value, "YES") == 0);
-}
-
-static bool iree_hal_amdxdna_mcdm_single_partial_elf_enabled() {
-  const char* value = std::getenv("IREE_AMDXDNA_MCDM_SINGLE_PARTIAL_ELF");
   return value &&
          (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
           std::strcmp(value, "TRUE") == 0 || std::strcmp(value, "yes") == 0 ||
@@ -72,6 +65,12 @@ static iree_status_t iree_hal_amdxdna_mcdm_read_context_xclbin_override(
 }
 #endif  // defined(_WIN32)
 
+static bool iree_hal_amdxdna_patch_table_is_valid(
+    const std::vector<uint32_t>* patch_table) {
+  return patch_table && !patch_table->empty() &&
+         (patch_table->size() % 3 == 0);
+}
+
 enum class iree_hal_amdxdna_chain_flush_mode {
   disabled,
   ert_chain,
@@ -100,6 +99,12 @@ iree_hal_amdxdna_select_chain_flush_mode(
 struct iree_hal_amdxdna_chain_cmd {
   iree_hal_amdxdna_native_buffer_ptr ctrl_code;
   iree_hal_amdxdna_native_command_ptr command;
+#if defined(_WIN32)
+  std::vector<uint32_t> ctrl_words;
+  std::vector<iree_hal_amdxdna_native_buffer_t*> binding_buffers;
+  std::vector<iree_device_size_t> binding_offsets;
+  std::vector<iree_device_size_t> binding_lengths;
+#endif  // defined(_WIN32)
 };
 
 // A contiguous run of dispatches that share one native queue. Flushed as one
@@ -117,6 +122,12 @@ struct iree_hal_amdxdna_chain_group {
   // I/O binding refs: their BOs are bound for residency and their exact ranges
   // are synced device->host after the chain completes.
   std::vector<iree_hal_buffer_ref_t> binding_refs;
+#if defined(_WIN32)
+  // True for Windows MCDM module-style START_NPU/PARTIAL_ELF child packets.
+  // These children carry their own BO tables, so the parent chain follows XRT's
+  // runlist binding model instead of binding every dereferenced BO itself.
+  bool windows_partial_elf = false;
+#endif  // defined(_WIN32)
 };
 
 // Accumulates sub-commands across dispatches so a whole command buffer flushes
@@ -166,6 +177,184 @@ bool iree_hal_amdxdna_single_command_cache_matches(
          cache.binding_buffers == binding_buffers &&
          cache.binding_offsets == binding_offsets &&
          cache.binding_lengths == binding_lengths;
+}
+
+struct iree_hal_amdxdna_chain_command_cache_entry {
+  iree_hal_amdxdna_chain_group group;
+  uint32_t max_slots = 0;
+  std::vector<iree_hal_amdxdna_native_command_ptr> chains;
+  uint64_t last_use = 0;
+};
+
+struct iree_hal_amdxdna_chain_command_cache_stats_t {
+  uint64_t hits = 0;
+  uint64_t updates = 0;
+  uint64_t misses = 0;
+  uint64_t evictions = 0;
+};
+
+size_t iree_hal_amdxdna_chain_command_cache_capacity() {
+  const char* value =
+      std::getenv("IREE_AMDXDNA_MCDM_CHAIN_COMMAND_CACHE_CAPACITY");
+  if (!value || !value[0]) return 4;
+  char* end = nullptr;
+  unsigned long parsed = std::strtoul(value, &end, 0);
+  if (end == value || parsed == 0) return 4;
+  return static_cast<size_t>(parsed);
+}
+
+struct iree_hal_amdxdna_device_chain_command_cache_t {
+  std::mutex mutex;
+  std::vector<iree_hal_amdxdna_chain_command_cache_entry> entries;
+  iree_hal_amdxdna_chain_command_cache_stats_t stats;
+  uint64_t use_clock = 0;
+
+  ~iree_hal_amdxdna_device_chain_command_cache_t() {
+    if (!std::getenv("IREE_AMDXDNA_BENCH_SUBMIT_TIMING") &&
+        !std::getenv("IREE_AMDXDNA_MCDM_CHAIN_CACHE_STATS")) {
+      return;
+    }
+    if (!stats.hits && !stats.updates && !stats.misses) return;
+    std::fprintf(stderr,
+                 "[amdxdna:mcdm-chain-cache] hits=%llu updates=%llu "
+                 "misses=%llu evictions=%llu entries=%zu capacity=%zu\n",
+                 static_cast<unsigned long long>(stats.hits),
+                 static_cast<unsigned long long>(stats.updates),
+                 static_cast<unsigned long long>(stats.misses),
+                 static_cast<unsigned long long>(stats.evictions),
+                 entries.size(),
+                 iree_hal_amdxdna_chain_command_cache_capacity());
+    std::fflush(stderr);
+  }
+};
+
+std::mutex& iree_hal_amdxdna_chain_command_cache_init_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+iree_hal_amdxdna_device_chain_command_cache_t*
+iree_hal_amdxdna_get_chain_command_cache(iree_hal_amdxdna_device* device) {
+  if (device->mcdm_chain_command_cache) {
+    return device->mcdm_chain_command_cache;
+  }
+  std::lock_guard<std::mutex> lock(
+      iree_hal_amdxdna_chain_command_cache_init_mutex());
+  if (!device->mcdm_chain_command_cache) {
+    device->mcdm_chain_command_cache =
+        new iree_hal_amdxdna_device_chain_command_cache_t();
+  }
+  return device->mcdm_chain_command_cache;
+}
+
+void iree_hal_amdxdna_device_destroy_chain_command_cache(
+    iree_hal_amdxdna_device* device) {
+  delete device->mcdm_chain_command_cache;
+  device->mcdm_chain_command_cache = nullptr;
+}
+
+bool iree_hal_amdxdna_direct_command_buffer_control_words_changed(
+    const uint32_t* cached_words, iree_host_size_t cached_word_count,
+    const uint32_t* fresh_words, iree_host_size_t fresh_word_count) {
+  if (cached_word_count != fresh_word_count) return true;
+  if (cached_word_count == 0) return false;
+  return std::memcmp(cached_words, fresh_words,
+                     cached_word_count * sizeof(uint32_t)) != 0;
+}
+
+bool iree_hal_amdxdna_chain_cmd_signature_matches(
+    const iree_hal_amdxdna_chain_cmd& lhs,
+    const iree_hal_amdxdna_chain_cmd& rhs) {
+  return lhs.ctrl_words == rhs.ctrl_words &&
+         lhs.binding_buffers == rhs.binding_buffers &&
+         lhs.binding_offsets == rhs.binding_offsets &&
+         lhs.binding_lengths == rhs.binding_lengths;
+}
+
+bool iree_hal_amdxdna_chain_cmd_shape_matches(
+    const iree_hal_amdxdna_chain_cmd& lhs,
+    const iree_hal_amdxdna_chain_cmd& rhs) {
+  return lhs.ctrl_words.size() == rhs.ctrl_words.size() &&
+         lhs.binding_buffers.size() == rhs.binding_buffers.size() &&
+         lhs.binding_offsets == rhs.binding_offsets &&
+         lhs.binding_lengths == rhs.binding_lengths;
+}
+
+bool iree_hal_amdxdna_chain_command_cache_matches(
+    const iree_hal_amdxdna_chain_command_cache_entry& cache,
+    const iree_hal_amdxdna_chain_group& group, uint32_t max_slots) {
+  if (cache.chains.empty() || cache.max_slots != max_slots ||
+      cache.group.queue != group.queue ||
+#if defined(_WIN32)
+      cache.group.windows_partial_elf != group.windows_partial_elf ||
+#endif  // defined(_WIN32)
+      cache.group.cmds.size() != group.cmds.size() ||
+      !cache.group.reconf_buffers.empty() || !group.reconf_buffers.empty()) {
+    return false;
+  }
+  for (size_t i = 0; i < group.cmds.size(); ++i) {
+    if (!iree_hal_amdxdna_chain_cmd_signature_matches(cache.group.cmds[i],
+                                                      group.cmds[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool iree_hal_amdxdna_chain_command_cache_shape_matches(
+    const iree_hal_amdxdna_chain_command_cache_entry& cache,
+    const iree_hal_amdxdna_chain_group& group, uint32_t max_slots) {
+  if (cache.group.cmds.empty() || cache.max_slots != max_slots ||
+      cache.group.queue != group.queue ||
+#if defined(_WIN32)
+      cache.group.windows_partial_elf != group.windows_partial_elf ||
+#endif  // defined(_WIN32)
+      cache.group.cmds.size() != group.cmds.size() ||
+      !cache.group.reconf_buffers.empty() || !group.reconf_buffers.empty()) {
+    return false;
+  }
+  for (size_t i = 0; i < group.cmds.size(); ++i) {
+    if (!iree_hal_amdxdna_chain_cmd_shape_matches(cache.group.cmds[i],
+                                                  group.cmds[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+iree_status_t iree_hal_amdxdna_update_cached_chain_cmd(
+    iree_hal_amdxdna_chain_cmd& cached,
+    const iree_hal_amdxdna_chain_cmd& fresh, bool* out_code_changed) {
+  if (out_code_changed) *out_code_changed = false;
+  if (!iree_hal_amdxdna_chain_cmd_shape_matches(cached, fresh)) {
+    return iree_make_status(
+        IREE_STATUS_FAILED_PRECONDITION,
+        "amdxdna Windows MCDM cached chain command shape changed");
+  }
+  const bool code_changed =
+      iree_hal_amdxdna_direct_command_buffer_control_words_changed(
+          cached.ctrl_words.data(), cached.ctrl_words.size(),
+          fresh.ctrl_words.data(), fresh.ctrl_words.size());
+  if (code_changed) {
+    void* ctrl_ptr = nullptr;
+    IREE_RETURN_IF_ERROR(
+        iree_hal_amdxdna_native_buffer_map(cached.ctrl_code.get(), &ctrl_ptr));
+    std::memcpy(ctrl_ptr, fresh.ctrl_words.data(),
+                fresh.ctrl_words.size() * sizeof(uint32_t));
+    cached.ctrl_words = fresh.ctrl_words;
+  }
+  IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_reset_bound_buffers(
+      cached.command.get()));
+  for (size_t i = 0; i < fresh.binding_buffers.size(); ++i) {
+    IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_bind_buffer(
+        cached.command.get(), /*position=*/i + 1, fresh.binding_buffers[i],
+        fresh.binding_offsets[i], fresh.binding_lengths[i]));
+  }
+  cached.binding_buffers = fresh.binding_buffers;
+  cached.binding_offsets = fresh.binding_offsets;
+  cached.binding_lengths = fresh.binding_lengths;
+  if (out_code_changed) *out_code_changed = code_changed;
+  return iree_ok_status();
 }
 #endif  // defined(_WIN32)
 
@@ -632,8 +821,14 @@ iree_status_t iree_hal_amdxdna_make_npu_cmd(
     iree_hal_amdxdna_direct_command_buffer* command_buffer,
     iree_hal_amdxdna_native_cu_index_t cu_idx, std::vector<uint32_t>& txn,
     const std::vector<uint32_t>& patches, const uint64_t* args,
-    size_t arg_count, iree_const_byte_span_t constants,
+    iree_hal_amdxdna_native_buffer_t* const* arg_buffers,
+    const iree_device_size_t* arg_offsets,
+    const iree_device_size_t* arg_lengths, size_t arg_count,
+    iree_const_byte_span_t constants, bool use_windows_partial_elf,
     iree_hal_amdxdna_chain_cmd* out_cmd) {
+#if !defined(_WIN32)
+  (void)use_windows_partial_elf;
+#endif  // !defined(_WIN32)
   size_t bytes = txn.size() * sizeof(uint32_t);
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_device_alloc_buffer(
       command_buffer->device->native_device, bytes,
@@ -651,12 +846,28 @@ iree_status_t iree_hal_amdxdna_make_npu_cmd(
         IREE_STATUS_INTERNAL,
         "amdxdna cmd-chain: invalid host patch table for control code");
   }
+#if defined(_WIN32)
+  out_cmd->ctrl_words.assign(dst, dst + txn.size());
+  if (arg_count) {
+    out_cmd->binding_buffers.assign(arg_buffers, arg_buffers + arg_count);
+    out_cmd->binding_offsets.assign(arg_offsets, arg_offsets + arg_count);
+    out_cmd->binding_lengths.assign(arg_lengths, arg_lengths + arg_count);
+  }
+#endif  // defined(_WIN32)
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_buffer_sync_all(
       out_cmd->ctrl_code.get(),
       iree_hal_amdxdna_native_sync_direction_t::host_to_device));
+  const iree_hal_amdxdna_native_command_opcode_t command_opcode =
+#if defined(_WIN32)
+      use_windows_partial_elf
+          ? iree_hal_amdxdna_native_command_opcode_t::start_npu_partial_elf
+          : iree_hal_amdxdna_native_command_opcode_t::start_npu;
+#else
+      iree_hal_amdxdna_native_command_opcode_t::start_npu;
+#endif  // defined(_WIN32)
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_create(
-      command_buffer->device->native_device,
-      iree_hal_amdxdna_native_command_opcode_t::start_npu, &out_cmd->command));
+      command_buffer->device->native_device, command_opcode,
+      &out_cmd->command));
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_set_cu_index(
       out_cmd->command.get(), cu_idx));
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_add_control_buffer(
@@ -664,15 +875,28 @@ iree_status_t iree_hal_amdxdna_make_npu_cmd(
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_add_arg_32(
       out_cmd->command.get(), kAie2ExecBufferKernelOpTxn));
 #if defined(_WIN32)
-  // Windows MCDM contexts are created from an xclbin DPU kernel with an
-  // explicit argument ABI. The control code is still host-patched above, but
-  // the ERT_START_NPU child packet must also carry each runtime data VA so the
-  // MCDM backend can rewrite it to the xclbin ABI before submission. Reconfig
-  // TXNs have one sequence/MC argument; execute TXNs usually have ifm/param/ofm.
-  for (size_t i = 0; i < arg_count; ++i) {
-    IREE_RETURN_IF_ERROR(
-        iree_hal_amdxdna_native_command_add_arg_64(out_cmd->command.get(),
-                                                   args[i]));
+  if (command_opcode ==
+      iree_hal_amdxdna_native_command_opcode_t::start_npu_partial_elf) {
+    if (IREE_UNLIKELY(arg_count && (!arg_buffers || !arg_offsets ||
+                                    !arg_lengths))) {
+      return iree_make_status(
+          IREE_STATUS_FAILED_PRECONDITION,
+          "amdxdna Windows MCDM PARTIAL_ELF cmd-chain child is missing BO "
+          "bindings for its runtime args");
+    }
+    for (size_t i = 0; i < arg_count; ++i) {
+      IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_bind_buffer(
+          out_cmd->command.get(), /*position=*/i + 1, arg_buffers[i],
+          arg_offsets[i], arg_lengths[i]));
+    }
+  } else {
+    // Windows MCDM non-ELF/TXN DPU kernels expose an xclbin XML register map.
+    // In that path the runtime data VAs are regular START_CU register args.
+    for (size_t i = 0; i < arg_count; ++i) {
+      IREE_RETURN_IF_ERROR(
+          iree_hal_amdxdna_native_command_add_arg_64(out_cmd->command.get(),
+                                                     args[i]));
+    }
   }
 #endif  // defined(_WIN32)
   return iree_ok_status();
@@ -692,7 +916,7 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
     iree_hal_amdxdna_native_queue_t* queue,
     iree_hal_amdxdna_native_cu_index_t cu_idx,
     iree_hal_amdxdna_kernel_params& kernel_params,
-    iree_const_byte_span_t constants) {
+    iree_const_byte_span_t constants, bool use_windows_partial_elf) {
   IREE_TRACE_ZONE_BEGIN(z0);
 
   // The chained path host-patches I/O addresses using the compiler-emitted
@@ -713,6 +937,10 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
   // Binding device addresses (exec args). For control packets the reconfig arg
   // is the per-reconfiguration data buffer (built below).
   std::vector<uint64_t> binding_addrs(bindings.count);
+  std::vector<iree_hal_amdxdna_native_buffer_t*> binding_buffers(
+      bindings.count);
+  std::vector<iree_device_size_t> binding_offsets(bindings.count);
+  std::vector<iree_device_size_t> binding_lengths(bindings.count);
   for (iree_host_size_t j = 0; j < bindings.count; ++j) {
     iree_hal_amdxdna_native_buffer_t* native_buffer =
         iree_hal_amdxdna_buffer_handle(
@@ -722,30 +950,44 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
     // Match the normal ERT_START_CU path: a binding may reference a subspan of
     // its allocated root BO, so host-patched DDR addresses must include both
     // offsets in addition to the BO base address.
-    binding_addrs[j] =
-        iree_hal_amdxdna_native_buffer_device_address(native_buffer) +
+    binding_buffers[j] = native_buffer;
+    binding_offsets[j] =
         iree_hal_buffer_byte_offset(bindings.values[j].buffer) +
         bindings.values[j].offset;
+    binding_lengths[j] = bindings.values[j].length;
+    binding_addrs[j] =
+        iree_hal_amdxdna_native_buffer_device_address(native_buffer) +
+        binding_offsets[j];
   }
 
   // Append to the current group, opening a new one when the native queue
   // changes (a chain runs on a single native context/queue).
   auto& groups = command_buffer->chain_accum.groups;
-  if (groups.empty() || groups.back().queue != queue) {
+  if (groups.empty() || groups.back().queue != queue
+#if defined(_WIN32)
+      || groups.back().windows_partial_elf != use_windows_partial_elf
+#endif  // defined(_WIN32)
+  ) {
     groups.emplace_back();
     groups.back().context = std::move(context);
     groups.back().queue = queue;
+#if defined(_WIN32)
+    groups.back().windows_partial_elf = use_windows_partial_elf;
+#endif  // defined(_WIN32)
   }
   iree_hal_amdxdna_chain_group& group = groups.back();
 
   // `run_idx` indexes both asm_inst_runlist and the parallel patch_runlist.
   auto emit = [&](size_t run_idx, const uint64_t* args,
+                  iree_hal_amdxdna_native_buffer_t* const* arg_buffers,
+                  const iree_device_size_t* arg_offsets,
+                  const iree_device_size_t* arg_lengths,
                   size_t arg_count) -> iree_status_t {
     iree_hal_amdxdna_chain_cmd cmd;
     IREE_RETURN_IF_ERROR(iree_hal_amdxdna_make_npu_cmd(
         command_buffer, cu_idx, kernel_params.asm_inst_runlist[run_idx],
-        kernel_params.patch_runlist[run_idx], args, arg_count, constants,
-        &cmd));
+        kernel_params.patch_runlist[run_idx], args, arg_buffers, arg_offsets,
+        arg_lengths, arg_count, constants, use_windows_partial_elf, &cmd));
     group.cmds.push_back(std::move(cmd));
     return iree_ok_status();
   };
@@ -757,7 +999,9 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
   if (num_reconfigurations == 0) {
     for (uint32_t r = 0; r < kernel_params.n_kernel_runs; r++) {
       IREE_RETURN_AND_END_ZONE_IF_ERROR(
-          z0, emit(/*run_idx=*/0, binding_addrs.data(), bindings.count));
+          z0, emit(/*run_idx=*/0, binding_addrs.data(),
+                   binding_buffers.data(), binding_offsets.data(),
+                   binding_lengths.data(), bindings.count));
     }
   } else {
     for (size_t i = 0; i < num_reconfigurations; i++) {
@@ -779,17 +1023,25 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
           z0, iree_hal_amdxdna_native_buffer_sync_all(
                   seq_buffer.get(),
                   iree_hal_amdxdna_native_sync_direction_t::host_to_device));
-      uint64_t reconf_arg =
-          iree_hal_amdxdna_native_buffer_device_address(seq_buffer.get());
       group.reconf_buffers.push_back(std::move(seq_buffer));
+      iree_hal_amdxdna_native_buffer_t* reconf_buffer =
+          group.reconf_buffers.back().get();
+      uint64_t reconf_arg =
+          iree_hal_amdxdna_native_buffer_device_address(reconf_buffer);
+      const iree_device_size_t reconf_offset = 0;
+      const iree_device_size_t reconf_length =
+          static_cast<iree_device_size_t>(seq_bytes);
       for (uint32_t r = 0; r < kernel_params.n_reconfigure_runs; r++) {
         IREE_RETURN_AND_END_ZONE_IF_ERROR(
-            z0, emit(/*run_idx=*/2 * i, &reconf_arg, /*arg_count=*/1));
+            z0, emit(/*run_idx=*/2 * i, &reconf_arg, &reconf_buffer,
+                     &reconf_offset, &reconf_length, /*arg_count=*/1));
       }
       for (uint32_t r = 0; r < kernel_params.n_kernel_runs; r++) {
         IREE_RETURN_AND_END_ZONE_IF_ERROR(
             z0,
-            emit(/*run_idx=*/2 * i + 1, binding_addrs.data(), bindings.count));
+            emit(/*run_idx=*/2 * i + 1, binding_addrs.data(),
+                 binding_buffers.data(), binding_offsets.data(),
+                 binding_lengths.data(), bindings.count));
       }
     }
   }
@@ -803,13 +1055,14 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
   return iree_ok_status();
 }
 
-// Submit a contiguous span [begin, end) of a group's sub-commands as one
-// ERT_CMD_CHAIN on `queue`, binding the group's referenced buffers for
-// residency.
-static iree_status_t iree_hal_amdxdna_submit_chain(
+// Build a native ERT_CMD_CHAIN for a contiguous span [begin, end) of a group's
+// sub-commands, binding the group's referenced buffers for residency. The
+// caller owns submission so Windows can submit all chunks before waiting,
+// matching XRT's public runlist scheduler.
+static iree_status_t iree_hal_amdxdna_prepare_chain(
     iree_hal_amdxdna_native_device_t* native_device,
-    iree_hal_amdxdna_native_queue_t* queue, iree_hal_amdxdna_chain_group& group,
-    size_t begin, size_t end) {
+    iree_hal_amdxdna_chain_group& group, size_t begin, size_t end,
+    iree_hal_amdxdna_native_command_ptr* out_chain) {
   size_t n = end - begin;
   iree_hal_amdxdna_native_command_ptr chain;
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_create(
@@ -823,17 +1076,23 @@ static iree_status_t iree_hal_amdxdna_submit_chain(
   IREE_RETURN_IF_ERROR(iree_hal_amdxdna_native_command_prepare_chain(
       chain.get(), commands.data(), commands.size()));
 
-  // Register every BO the firmware dereferences (control code + control-packet
-  // data + I/O bindings) as arg BOs on the submitted chain so the driver keeps
-  // them resident; the sub-command slots reference them only by address. (The
-  // driver de-duplicates repeated handles, so binding the whole group's BOs on
-  // each chunk is a harmless residency superset.)
-  //
-  // The native backend exposes the maximum arg-buffer bindings per submitted
-  // command. Per-chunk worst case = n control-code buffers +
-  // group.reconf_buffers.size() + group.binding_refs.size() (post-dedup the
-  // backend may see fewer, but we count the pre-dedup total since bind
-  // positions are explicit).
+#if defined(_WIN32)
+  const bool xrt_style_parent_chain = group.windows_partial_elf;
+#else
+  const bool xrt_style_parent_chain = false;
+#endif  // defined(_WIN32)
+  if (xrt_style_parent_chain) {
+    *out_chain = std::move(chain);
+    return iree_ok_status();
+  }
+
+  // Legacy/non-Windows chain paths register every BO the firmware dereferences
+  // (control code + control-packet data + I/O bindings) as arg BOs on the
+  // submitted chain so the driver keeps them resident; the sub-command slots
+  // reference them only by address. Windows MCDM partial-ELF chains intentionally
+  // skip this superset above and match XRT runlist parent bindings: the parent
+  // binds child exec BOs only, while each child command BO carries its own BO
+  // table.
   const size_t arg_bo_ceiling =
       iree_hal_amdxdna_native_command_arg_binding_capacity();
   size_t arg_total =
@@ -865,6 +1124,17 @@ static iree_status_t iree_hal_amdxdna_submit_chain(
         iree_hal_amdxdna_native_buffer_size(native_buffer)));
   }
 
+  *out_chain = std::move(chain);
+  return iree_ok_status();
+}
+
+static iree_status_t iree_hal_amdxdna_submit_chain(
+    iree_hal_amdxdna_native_device_t* native_device,
+    iree_hal_amdxdna_native_queue_t* queue, iree_hal_amdxdna_chain_group& group,
+    size_t begin, size_t end) {
+  iree_hal_amdxdna_native_command_ptr chain;
+  IREE_RETURN_IF_ERROR(iree_hal_amdxdna_prepare_chain(
+      native_device, group, begin, end, &chain));
   return iree_hal_amdxdna_native_queue_submit_and_wait(
       queue, chain.get(), IREE_SV("ERT_CMD_CHAIN"));
 }
@@ -952,13 +1222,146 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_flush_chains(
   iree_status_t status = iree_ok_status();
   for (iree_hal_amdxdna_chain_group& group : groups) {
     if (flush_mode == iree_hal_amdxdna_chain_flush_mode::ert_chain) {
-      for (size_t begin = 0;
-           begin < group.cmds.size() && iree_status_is_ok(status);
-           begin += max_slots) {
-        size_t end = std::min(begin + max_slots, group.cmds.size());
-        status =
-            iree_hal_amdxdna_submit_chain(command_buffer->device->native_device,
-                                          group.queue, group, begin, end);
+#if defined(_WIN32)
+      std::unique_lock<std::mutex> chain_cache_lock;
+      iree_hal_amdxdna_chain_command_cache_entry* chain_cache = nullptr;
+      iree_hal_amdxdna_chain_command_cache_stats_t* chain_cache_stats =
+          nullptr;
+      if (group.windows_partial_elf && group.reconf_buffers.empty()) {
+        iree_hal_amdxdna_device_chain_command_cache_t* device_chain_cache =
+            iree_hal_amdxdna_get_chain_command_cache(command_buffer->device);
+        chain_cache_lock =
+            std::unique_lock<std::mutex>(device_chain_cache->mutex);
+        chain_cache_stats = &device_chain_cache->stats;
+        auto rebuild_cached_parent_chains = [&]() -> iree_status_t {
+          chain_cache->chains.clear();
+          for (size_t begin = 0; begin < chain_cache->group.cmds.size();
+               begin += max_slots) {
+            size_t end =
+                std::min<size_t>(begin + max_slots,
+                                 chain_cache->group.cmds.size());
+            iree_hal_amdxdna_native_command_ptr chain;
+            IREE_RETURN_IF_ERROR(iree_hal_amdxdna_prepare_chain(
+                command_buffer->device->native_device, chain_cache->group,
+                begin, end, &chain));
+            chain_cache->chains.push_back(std::move(chain));
+          }
+          return iree_ok_status();
+        };
+        auto touch_chain_cache_entry = [&]() {
+          chain_cache->last_use = ++device_chain_cache->use_clock;
+        };
+        bool exact_cache_hit = false;
+        for (iree_hal_amdxdna_chain_command_cache_entry& entry :
+             device_chain_cache->entries) {
+          if (iree_hal_amdxdna_chain_command_cache_matches(entry, group,
+                                                           max_slots)) {
+            chain_cache = &entry;
+            exact_cache_hit = true;
+            break;
+          }
+        }
+        if (chain_cache) {
+          chain_cache_stats->hits++;
+          touch_chain_cache_entry();
+        } else if (device_chain_cache->entries.size() >=
+                   iree_hal_amdxdna_chain_command_cache_capacity()) {
+          for (iree_hal_amdxdna_chain_command_cache_entry& entry :
+               device_chain_cache->entries) {
+            if (iree_hal_amdxdna_chain_command_cache_shape_matches(
+                    entry, group, max_slots)) {
+              chain_cache = &entry;
+              break;
+            }
+          }
+        }
+        if (chain_cache && !exact_cache_hit) {
+          chain_cache_stats->updates++;
+          touch_chain_cache_entry();
+          bool code_changed = false;
+          for (size_t i = 0; i < group.cmds.size() &&
+                             iree_status_is_ok(status);
+               ++i) {
+            bool cmd_code_changed = false;
+            status = iree_hal_amdxdna_update_cached_chain_cmd(
+                chain_cache->group.cmds[i], group.cmds[i], &cmd_code_changed);
+            code_changed |= cmd_code_changed;
+          }
+          if (code_changed) {
+            for (iree_hal_amdxdna_native_command_ptr& chain :
+                 chain_cache->chains) {
+              if (!iree_status_is_ok(status)) break;
+              status = iree_hal_amdxdna_native_command_mark_chain_code_dirty(
+                  chain.get());
+            }
+          }
+        } else if (!chain_cache) {
+          chain_cache_stats->misses++;
+          const size_t cache_capacity =
+              iree_hal_amdxdna_chain_command_cache_capacity();
+          if (device_chain_cache->entries.size() < cache_capacity) {
+            device_chain_cache->entries.emplace_back();
+            chain_cache = &device_chain_cache->entries.back();
+          } else {
+            auto victim_it = std::min_element(
+                device_chain_cache->entries.begin(),
+                device_chain_cache->entries.end(),
+                [](const iree_hal_amdxdna_chain_command_cache_entry& lhs,
+                   const iree_hal_amdxdna_chain_command_cache_entry& rhs) {
+                  return lhs.last_use < rhs.last_use;
+                });
+            chain_cache_stats->evictions++;
+            chain_cache = &*victim_it;
+          }
+          chain_cache->chains.clear();
+          chain_cache->group.context = group.context;
+          chain_cache->group.queue = group.queue;
+#if defined(_WIN32)
+          chain_cache->group.windows_partial_elf = group.windows_partial_elf;
+#endif  // defined(_WIN32)
+          chain_cache->group.cmds = std::move(group.cmds);
+          chain_cache->group.reconf_buffers.clear();
+          chain_cache->group.binding_refs.clear();
+          chain_cache->max_slots = max_slots;
+          touch_chain_cache_entry();
+          if (iree_status_is_ok(status)) {
+            status = rebuild_cached_parent_chains();
+          }
+        }
+        if (iree_status_is_ok(status) && !chain_cache->chains.empty()) {
+          std::vector<iree_hal_amdxdna_native_command_t*> chain_ptrs;
+          chain_ptrs.reserve(chain_cache->chains.size());
+          for (iree_hal_amdxdna_native_command_ptr& chain :
+               chain_cache->chains) {
+            chain_ptrs.push_back(chain.get());
+          }
+          status = iree_hal_amdxdna_native_queue_submit_all_and_wait(
+              group.queue, chain_ptrs.data(), chain_ptrs.size(),
+              IREE_SV("ERT_CMD_CHAIN"));
+        }
+      } else
+#endif  // defined(_WIN32)
+      {
+        std::vector<iree_hal_amdxdna_native_command_ptr> chains;
+        for (size_t begin = 0;
+             begin < group.cmds.size() && iree_status_is_ok(status);
+             begin += max_slots) {
+          size_t end = std::min(begin + max_slots, group.cmds.size());
+          iree_hal_amdxdna_native_command_ptr chain;
+          status = iree_hal_amdxdna_prepare_chain(
+              command_buffer->device->native_device, group, begin, end, &chain);
+          if (iree_status_is_ok(status)) chains.push_back(std::move(chain));
+        }
+        if (iree_status_is_ok(status) && !chains.empty()) {
+          std::vector<iree_hal_amdxdna_native_command_t*> chain_ptrs;
+          chain_ptrs.reserve(chains.size());
+          for (iree_hal_amdxdna_native_command_ptr& chain : chains) {
+            chain_ptrs.push_back(chain.get());
+          }
+          status = iree_hal_amdxdna_native_queue_submit_all_and_wait(
+              group.queue, chain_ptrs.data(), chain_ptrs.size(),
+              IREE_SV("ERT_CMD_CHAIN"));
+        }
       }
 #if defined(_WIN32)
     } else if (flush_mode ==
@@ -1001,7 +1404,7 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_normal_run(
     iree_hal_amdxdna_native_cu_index_t cu_idx, uint32_t n_kernel_runs,
     std::vector<uint32_t>& asm_inst,
     const std::vector<uint32_t>* patch_table,
-    iree_const_byte_span_t constants) {
+    iree_const_byte_span_t constants, bool use_single_partial_elf) {
   IREE_TRACE_ZONE_BEGIN(z0);
 
   // Check if the kernel should be executed.
@@ -1009,14 +1412,6 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_normal_run(
     IREE_TRACE_ZONE_END(z0);
     return iree_ok_status();
   }
-
-#if defined(_WIN32)
-  const bool use_single_partial_elf =
-      iree_hal_amdxdna_mcdm_single_partial_elf_enabled() && patch_table &&
-      !patch_table->empty() && (patch_table->size() % 3 == 0);
-#else
-  const bool use_single_partial_elf = false;
-#endif
 
   std::vector<uint64_t> binding_addrs;
   std::vector<iree_hal_amdxdna_native_buffer_t*> binding_buffers;
@@ -1328,10 +1723,8 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
 #if defined(_WIN32)
   const bool use_windows_single_partial_elf_context =
       num_reconfigurations == 0 &&
-      iree_hal_amdxdna_mcdm_single_partial_elf_enabled() &&
-      single_patch_table && !single_patch_table->empty() &&
-      (single_patch_table->size() % 3 == 0) &&
-      (!kernel_params.pdi.empty() || !kernel_params.xclbin.empty());
+      xclbin_span.data_length > 0 &&
+      iree_hal_amdxdna_patch_table_is_valid(single_patch_table);
 #else
   const bool use_windows_single_partial_elf_context = false;
 #endif  // defined(_WIN32)
@@ -1393,7 +1786,7 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
     IREE_RETURN_AND_END_ZONE_IF_ERROR(
         z0, iree_hal_amdxdna_direct_command_buffer_accumulate_chained(
                 bindings, command_buffer, context, queue, cu_idx, kernel_params,
-                constants));
+                constants, use_windows_single_partial_elf_context));
     IREE_TRACE_ZONE_END(z0);
     return iree_ok_status();
   }
@@ -1404,7 +1797,8 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
         z0, iree_hal_amdxdna_direct_command_buffer_normal_run(
                 bindings, command_buffer, queue, cu_idx,
                 kernel_params.n_kernel_runs, kernel_params.asm_inst_runlist[0],
-                single_patch_table, constants));
+                single_patch_table, constants,
+                use_windows_single_partial_elf_context));
   } else {
     for (size_t i = 0; i < num_reconfigurations; i++) {
       // Reconfigure the device.
@@ -1425,7 +1819,7 @@ static iree_status_t iree_hal_amdxdna_direct_command_buffer_dispatch(
                   bindings, command_buffer, queue, cu_idx,
                   kernel_params.n_kernel_runs,
                   kernel_params.asm_inst_runlist[run_idx], patch_table,
-                  constants));
+                  constants, /*use_single_partial_elf=*/false));
     }
   }
 
